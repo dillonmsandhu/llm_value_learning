@@ -32,6 +32,11 @@ class ReasoningDAGExactValue:
     Exact analytical dynamic programming solver for the Procedural Reasoning DAG.
     Computes ground-truth value functions V*(prompt_idx, t, milestone, is_derailed)
     via backward induction across all problems and depth layers in milliseconds.
+    Supports problem-dependent difficulty spectrum theta in [0, 1] governing:
+      - required milestones M(theta)
+      - advance probability p_advance(theta)
+      - recovery probability p_recover(theta)
+      - blunder probability p_blunder(theta)
     """
 
     def __init__(
@@ -40,10 +45,7 @@ class ReasoningDAGExactValue:
         num_milestones: int = 4,
         max_steps: int = 16,
         num_actions: int = 8,
-        p_advance: float = 0.65,
-        p_blunder: float = 0.15,
-        p_recover: float = 0.35,
-        p_neutral: float = 0.15,
+        difficulties: Any = None,
         gamma: float = 1.0,
         seed: int = 42,
     ):
@@ -51,20 +53,38 @@ class ReasoningDAGExactValue:
         self.num_milestones = int(num_milestones)
         self.max_steps = int(max_steps)
         self.num_actions = int(num_actions)
-        self.p_advance = float(p_advance)
-        self.p_blunder = float(p_blunder)
-        self.p_recover = float(p_recover)
-        self.p_neutral = float(p_neutral)
         self.gamma = float(gamma)
 
-        # 1. Procedural generation of problem tables
+        # 1. Unified Difficulty Spectrum Parameterization: theta in [0, 1]
+        # theta = 0: trivial (Pass@1 ~ 85%), theta = 1: competition hard (Pass@1 ~ 1%)
+        if difficulties is None:
+            thetas = jnp.full(self.num_problems, 0.5, dtype=jnp.float32)
+        elif isinstance(difficulties, (int, float)):
+            thetas = jnp.full(self.num_problems, float(difficulties), dtype=jnp.float32)
+        elif str(difficulties) == "spectrum":
+            if self.num_problems == 1:
+                thetas = jnp.array([0.5], dtype=jnp.float32)
+            else:
+                thetas = jnp.linspace(0.0, 1.0, self.num_problems, dtype=jnp.float32)
+        else:
+            thetas = jnp.asarray(difficulties, dtype=jnp.float32)
+
+        self.thetas = thetas
+        min_m = min(3, self.num_milestones)
+        self.required_milestones = jnp.round(min_m + self.thetas * (self.num_milestones - min_m)).astype(jnp.int32)
+        self.p_advance = 0.80 - self.thetas * 0.55
+        self.p_recover = 0.50 - self.thetas * 0.40
+        self.p_blunder = 0.10 + self.thetas * 0.55
+        self.p_neutral = jnp.maximum(0.02, 1.0 - self.p_advance - self.p_blunder)
+
+        # 2. Procedural generation of problem tables
         # Action (num_actions - 1) is universally designated as the Meta Self-Correction / Verification operator
         self.correction_action = self.num_actions - 1
         num_standard_actions = self.num_actions - 1
 
         # For each problem and milestone, we define 2 valid advance tokens (allowing reconverging paths)
         rng = jax.random.PRNGKey(seed)
-        rng, p_rng, d_rng = jax.random.split(rng, 3)
+        rng, p_rng = jax.random.split(rng)
 
         def _make_problem_routes(k):
             keys = jax.random.split(k, self.num_milestones)
@@ -91,7 +111,7 @@ class ReasoningDAGExactValue:
         self.prompt_len = 3  # [BOS, prompt_token, SEP]
         self.max_seq_len = self.prompt_len + self.max_steps
 
-        # 2. Precompute Exact Backward Induction Table:
+        # 3. Precompute Exact Backward Induction Table:
         # Table shape: (num_problems, max_steps + 1, num_milestones + 1, 2)
         # where last dim is is_derailed in {0, 1}
         self.V_table = self.solve_backward_induction()
@@ -108,47 +128,36 @@ class ReasoningDAGExactValue:
         v_table = jnp.zeros((P, T + 1, M + 1, 2), dtype=jnp.float32)
 
         # Terminal boundary at t = T:
-        # Reward is 1.0 iff milestone >= M and is_derailed == 0
+        # Reward is 1.0 iff milestone >= required_milestones[p] and is_derailed == 0
         terminal_rewards = jnp.zeros((P, M + 1, 2), dtype=jnp.float32)
-        terminal_rewards = terminal_rewards.at[:, M, 0].set(1.0)
+        for p in range(P):
+            terminal_rewards = terminal_rewards.at[p, int(self.required_milestones[p]):, 0].set(1.0)
         v_table = v_table.at[:, T, :, :].set(terminal_rewards)
 
         # Backward sweep: t = T - 1 down to 0
         for t in range(T - 1, -1, -1):
             for m in range(M + 1):
                 for d in range(2):
-                    # Next state values under each scenario:
                     v_next_layer = v_table[:, t + 1, :, :]  # (P, M+1, 2)
 
                     if d == 0:  # On track
-                        if m < M:
-                            # 1. Valid advance: moves to m + 1, remains d = 0
-                            v_advance = v_next_layer[:, m + 1, 0]
-                            # 2. Blunder: stays at m, moves to d = 1
-                            v_blunder = v_next_layer[:, m, 1]
-                            # 3. Neutral: stays at m, remains d = 0
-                            v_neutral = v_next_layer[:, m, 0]
-                            # 4. Self-correction when on-track: redundant check, stays at m, d = 0
-                            v_correct = v_next_layer[:, m, 0]
+                        v_advance = v_next_layer[:, min(m + 1, M), 0]
+                        v_blunder = v_next_layer[:, m, 1]
+                        v_neutral = v_next_layer[:, m, 0]
 
-                            expected_v = (
-                                self.p_advance * v_advance
-                                + self.p_blunder * v_blunder
-                                + self.p_neutral * v_neutral
-                                + (1.0 - self.p_advance - self.p_blunder - self.p_neutral) * v_correct
-                            )
-                        else:
-                            # Already achieved M milestones and on-track!
-                            # Staying on-track maintains 1.0, blundering risks losing it
-                            v_stay = v_next_layer[:, M, 0]
-                            v_blunder = v_next_layer[:, M, 1]
-                            expected_v = (1.0 - self.p_blunder) * v_stay + self.p_blunder * v_blunder
+                        expected_v_not_reached = (
+                            self.p_advance * v_advance
+                            + self.p_blunder * v_blunder
+                            + self.p_neutral * v_neutral
+                        )
+                        expected_v_reached = (
+                            (1.0 - self.p_blunder) * v_neutral
+                            + self.p_blunder * v_blunder
+                        )
+                        expected_v = jnp.where(m < self.required_milestones, expected_v_not_reached, expected_v_reached)
                     else:  # Derailed (d == 1)
-                        # 1. Successful recovery via self-correction: returns to d = 0 at current m
                         v_recover = v_next_layer[:, m, 0]
-                        # 2. Compounding error / false advance: stays at d = 1
                         v_stay_derailed = v_next_layer[:, m, 1]
-
                         expected_v = (
                             self.p_recover * v_recover
                             + (1.0 - self.p_recover) * v_stay_derailed
@@ -167,7 +176,7 @@ class ReasoningDAGEnv:
     """
     Procedural Reasoning Directed Acyclic Graph (DAG) Environment.
     Simulates multi-problem chain-of-thought reasoning with multiple valid solution paths,
-    blunder states, and self-correction / verification reconvergence.
+    blunder states, self-correction / verification reconvergence, and problem difficulty spectrum.
     """
 
     def __init__(
@@ -176,6 +185,7 @@ class ReasoningDAGEnv:
         num_milestones: int = 4,
         max_steps: int = 16,
         num_actions: int = 8,
+        difficulties: Any = None,
         seed: int = 42,
     ):
         self.evaluator = ReasoningDAGExactValue(
@@ -183,12 +193,18 @@ class ReasoningDAGEnv:
             num_milestones=num_milestones,
             max_steps=max_steps,
             num_actions=num_actions,
+            difficulties=difficulties,
             seed=seed,
         )
         self.num_problems = self.evaluator.num_problems
         self.num_milestones = self.evaluator.num_milestones
         self.max_steps = self.evaluator.max_steps
         self.num_actions = self.evaluator.num_actions
+        self.thetas = self.evaluator.thetas
+        self.required_milestones = self.evaluator.required_milestones
+        self.p_advance = self.evaluator.p_advance
+        self.p_recover = self.evaluator.p_recover
+        self.p_blunder = self.evaluator.p_blunder
         self.vocab_size = self.evaluator.vocab_size
         self.max_seq_len = self.evaluator.max_seq_len
         self.prompt_len = self.evaluator.prompt_len
@@ -221,14 +237,18 @@ class ReasoningDAGEnv:
     def sample_base_action(self, rng: jax.random.PRNGKey, state: DAGState, params: DAGEnvParams = None) -> jnp.ndarray:
         """
         Samples an action from the base model policy pi_0(a | s).
-        Models realistic base LLM sampling with valid advances, blunders, and self-corrections.
+        Models realistic base LLM sampling with valid advances, blunders, and self-corrections
+        under problem-specific difficulty theta.
         """
-        params = params if params is not None else DAGEnvParams()
         rng, choice_rng, act_rng = jax.random.split(rng, 3)
 
         curr_m = jnp.minimum(state.milestone, self.num_milestones - 1)
         valid_acts = self.valid_advance_actions[state.prompt_idx, curr_m]      # shape (2,)
         blunder_acts = self.blunder_actions[state.prompt_idx, curr_m]          # shape (num_actions - 3,)
+
+        p_adv = self.p_advance[state.prompt_idx]
+        p_blund = self.p_blunder[state.prompt_idx]
+        p_rec = self.p_recover[state.prompt_idx]
 
         r = jax.random.uniform(choice_rng)
         rand_valid_idx = jax.random.randint(act_rng, shape=(), minval=0, maxval=valid_acts.shape[0])
@@ -240,13 +260,13 @@ class ReasoningDAGEnv:
 
         def _sample_on_track():
             return jnp.where(
-                r < params.p_advance,
+                r < p_adv,
                 pick_advance,
-                jnp.where(r < params.p_advance + params.p_blunder, pick_blunder, pick_correction),
+                jnp.where(r < p_adv + p_blund, pick_blunder, pick_correction),
             )
 
         def _sample_derailed():
-            return jnp.where(r < params.p_recover, pick_correction, pick_blunder)
+            return jnp.where(r < p_rec, pick_correction, pick_blunder)
 
         action = jnp.where(state.is_derailed == 0, _sample_on_track(), _sample_derailed())
         return action
@@ -267,13 +287,13 @@ class ReasoningDAGEnv:
         is_advance_action = self.valid_advance_mask[state.prompt_idx, curr_m, action]
         is_correction_action = (action == self.correction_action)
 
-        # Transition logic (branchless JAX arithmetic):
+        # Transition logic:
         # 1. If on-track (d == 0):
-        #    - advance action -> milestone increments (if not yet at max)
+        #    - advance action -> milestone increments (if not yet at problem-specific target)
         #    - correction action -> neutral verification (milestone stays, stays on track)
         #    - other action -> enters error state (is_derailed becomes 1)
         new_milestone_on_track = jnp.where(
-            is_advance_action & (state.milestone < self.num_milestones),
+            is_advance_action & (state.milestone < self.required_milestones[state.prompt_idx]),
             state.milestone + 1,
             state.milestone,
         )
@@ -302,9 +322,9 @@ class ReasoningDAGEnv:
         # Check termination:
         done = (new_step_count >= self.max_steps)
 
-        # Terminal reward at t = T: 1.0 iff all milestones completed and on-track!
+        # Terminal reward at t = T: 1.0 iff required milestones completed and on-track!
         reward = jnp.where(
-            done & (new_milestone >= self.num_milestones) & (new_derailed == 0),
+            done & (new_milestone >= self.required_milestones[state.prompt_idx]) & (new_derailed == 0),
             1.0,
             0.0,
         )

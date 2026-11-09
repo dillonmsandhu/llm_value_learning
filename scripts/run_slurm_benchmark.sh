@@ -14,8 +14,9 @@
 #   1. Standard Monte Carlo Critic (K=1)
 #   2. Vine-Target Critic (K=2)
 #   3. Vine-Target Critic (K=4)
-#   4. Fitted Backward Induction FBI (lambda=0.0)
-#   5. Fitted Backward Induction FBI (lambda=0.5)
+#   4. Batched Fitted Backward Induction FBI (lambda=0.0)
+#   5. Staged Fitted Backward Induction FBI (lambda=0.0)
+#   6. Batched Fitted Backward Induction FBI (lambda=0.5)
 #
 # Metrics Evaluated:
 #   - MSVE vs Gradient Updates, Sample Budget, Wall-Clock Compute
@@ -58,14 +59,15 @@ ENV_TYPE="${ENV_TYPE:-single_dag}"       # 'single_dag' (1 large problem), 'dag'
 TOTAL_TRANSITIONS="${TOTAL_TRANSITIONS:-250000}"
 N_SEEDS="${N_SEEDS:-5}"
 MASTER_SEED="${MASTER_SEED:-42}"
-ALGOS="${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.5}"
+ALGOS="${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0}"
 OUT_DIR="${OUT_DIR:-results}"
 
 # Large Reasoning DAG Hyperparameters
-NUM_PROBLEMS="${NUM_PROBLEMS:-20}"
+NUM_PROBLEMS="${NUM_PROBLEMS:-10}"
 NUM_MILESTONES="${NUM_MILESTONES:-6}"
 MAX_STEPS="${MAX_STEPS:-24}"
 NUM_ACTIONS="${NUM_ACTIONS:-8}"
+DIFFICULTY="${DIFFICULTY:-0.5}"
 
 # Large Tree MRP Hyperparameters
 DEPTH="${DEPTH:-7}"
@@ -101,6 +103,7 @@ $PYTHON run_benchmark.py \
     --num_milestones "$NUM_MILESTONES" \
     --max_steps "$MAX_STEPS" \
     --num_actions "$NUM_ACTIONS" \
+    --difficulty "$DIFFICULTY" \
     --depth "$DEPTH" \
     --p "$P_SUCCESS"
 

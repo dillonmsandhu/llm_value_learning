@@ -28,6 +28,7 @@ default_config = {
     "K_BRANCHES": 4,
     "LMBDA": 0.0,          # FBI(lambda): 0.0 = pure 1-step FBI, 1.0 = penultimate-anchored MC, (0,1) = hybrid
     "STAGE_STEPS": 4,      # Inner gradient steps per backward depth stage so V_phi fits t+1 before t queries it
+    "MINIBATCH_SIZE": 64,  # Active-pool minibatch size per stage gradient step (avoids masked full-batch wasted FLOPs)
     "NUM_ENVS": 64,
     "TOTAL_TIMESTEPS": 120000,
     "LR": 1e-3,
@@ -133,6 +134,7 @@ def make_train(config: dict):
     k_branches = int(config.get("K_BRANCHES", 4))
     lmbda = float(config.get("LMBDA", 0.0))
     stage_steps = int(config.get("STAGE_STEPS", 4))
+    minibatch_size = int(config.get("MINIBATCH_SIZE", 64))
     num_envs = int(config["NUM_ENVS"])
 
     # 1. Environment & Evaluator
@@ -224,16 +226,17 @@ def make_train(config: dict):
             leaf_states = base_states[depth]
             leaf_rewards = leaf_reward_table[leaf_states]  # (num_envs,)
 
-            # --- STEP B: SAMPLE K 1-STEP BRANCHES FOR EACH VISITED STATE ---
-            def _branch_level(d, carry_rng):
-                carry_rng, branch_rng = jax.random.split(carry_rng)
-                curr_s_level = base_states[d]  # (num_envs,)
+            # --- STEP B: SAMPLE K 1-STEP BRANCHES FOR EACH VISITED STATE (VMAPPED) ---
+            rng, branch_rng = jax.random.split(rng)
+            level_keys = jax.random.split(branch_rng, depth)
 
+            def _branch_level(d, level_key):
+                curr_s_level = base_states[d]  # (num_envs,)
                 branch_s_idx = jnp.repeat(curr_s_level, k_branches)
                 branch_time = jnp.full(num_envs * k_branches, d, dtype=jnp.int32)
                 branch_in_state = TabularState(s_idx=branch_s_idx, time=branch_time)
 
-                step_keys = jax.random.split(branch_rng, num_envs * k_branches)
+                step_keys = jax.random.split(level_key, num_envs * k_branches)
                 actions = jnp.zeros(num_envs * k_branches, dtype=jnp.int32)
                 b_next_obs, b_next_s, _, _, _ = jax.vmap(
                     env.step, in_axes=(0, 0, 0, None)
@@ -241,18 +244,16 @@ def make_train(config: dict):
 
                 b_next_obs = b_next_obs.reshape(num_envs, k_branches, -1)
                 b_next_s_idx = b_next_s.s_idx.reshape(num_envs, k_branches)
-                return carry_rng, (b_next_obs, b_next_s_idx)
+                return b_next_obs, b_next_s_idx
 
-            # Branch from levels 0 through depth - 1
-            branch_rng = rng
-            all_branch_obs = []
-            all_branch_s_idx = []
-            for d in range(depth):
-                branch_rng, (b_obs, b_s) = _branch_level(d, branch_rng)
-                all_branch_obs.append(b_obs)
-                all_branch_s_idx.append(b_s)
+            # Parallelize 1-step branching across all depths 0 .. depth - 1:
+            # all_branch_obs:   (depth, num_envs, k_branches, obs_dim)
+            # all_branch_s_idx: (depth, num_envs, k_branches)
+            all_branch_obs, all_branch_s_idx = jax.vmap(_branch_level)(
+                jnp.arange(depth, dtype=jnp.int32), level_keys
+            )
 
-            # --- STEP C: INTERLEAVED BACKWARD FITTING WITH REPLAY ANCHORING ---
+            # --- STEP C: INTERLEAVED BACKWARD FITTING WITH REPLAY ANCHORING (XLA SCAN) ---
             targets = jnp.zeros((depth + 1, num_envs), dtype=jnp.float32)
 
             # 1. Terminal Boundary: leaf states (d = depth)
@@ -263,6 +264,7 @@ def make_train(config: dict):
             penultimate_leaf_obs = all_branch_obs[depth - 1].reshape(-1, base_obs.shape[-1])  # (num_envs * k_branches, obs_dim)
             penultimate_rewards = leaf_reward_table[penultimate_leaf_branches]  # (num_envs, k_branches)
             flat_penult_leaf_rewards = penultimate_rewards.reshape(-1)
+            num_penult_leaves = flat_penult_leaf_rewards.shape[0]
             y_penultimate = jnp.mean(penultimate_rewards, axis=-1)  # (num_envs,)
             targets = targets.at[depth - 1].set(y_penultimate)
 
@@ -273,67 +275,85 @@ def make_train(config: dict):
             delta_penult = y_penultimate - v_penult
             gae_adv = delta_penult  # (num_envs,) GAE accumulator initialized at penultimate step
 
-            # Helper for running `stage_steps` gradient updates on active levels + terminal branch endpoints
-            def _fit_stage(curr_state, active_mask, curr_targets):
-                def _single_grad_step(st, _):
+            # Fast XLA active-pool minibatch fitting stage:
+            # Samples static-shape minibatches strictly from already-resolved levels [min_level .. depth]
+            # (zero wasted FLOPs on unresolved masked levels).
+            def _fit_stage(curr_state, min_level, curr_targets, stage_rng):
+                def _single_grad_step(carry, _):
+                    st, k = carry
+                    k, k_lvl, k_env, k_leaf = jax.random.split(k, 4)
+
+                    # Sample minibatch strictly from active levels [min_level, depth]
+                    mb_levels = jax.random.randint(k_lvl, (minibatch_size,), minval=min_level, maxval=depth + 1)
+                    mb_envs = jax.random.randint(k_env, (minibatch_size,), minval=0, maxval=num_envs)
+                    mb_trunk_obs = base_obs[mb_levels, mb_envs]
+                    mb_trunk_targets = curr_targets[mb_levels, mb_envs]
+
+                    # Sample minibatch from terminal leaf branch endpoints
+                    mb_leaf_idx = jax.random.randint(k_leaf, (minibatch_size,), minval=0, maxval=num_penult_leaves)
+                    mb_leaf_obs = penultimate_leaf_obs[mb_leaf_idx]
+                    mb_leaf_targets = flat_penult_leaf_rewards[mb_leaf_idx]
+
+                    # Unified single forward pass over trunk + leaf anchor minibatches
+                    combined_obs = jnp.concatenate([mb_trunk_obs, mb_leaf_obs], axis=0)
+
                     def loss_fn(p):
-                        # Trunk states in active_mask
-                        flat_base_obs = base_obs.reshape(-1, base_obs.shape[-1])
-                        flat_preds = network.apply(p, flat_base_obs, method=network.value)
-                        preds = flat_preds.reshape(depth + 1, num_envs)
-                        sq_err = jnp.square(preds - curr_targets)
-                        weighted_err = sq_err * active_mask[:, None]
-                        trunk_loss = 0.5 * jnp.sum(weighted_err) / (jnp.sum(active_mask) * num_envs + 1e-8)
+                        combined_preds = network.apply(p, combined_obs, method=network.value)
+                        trunk_preds = combined_preds[:minibatch_size]
+                        leaf_preds = combined_preds[minibatch_size:]
 
-                        # Also supervise the K branched leaf endpoints (exact ground truth rewards)
-                        leaf_branch_preds = network.apply(p, penultimate_leaf_obs, method=network.value)
-                        leaf_branch_loss = 0.5 * jnp.mean(jnp.square(leaf_branch_preds - flat_penult_leaf_rewards))
-
-                        loss = trunk_loss + 0.25 * leaf_branch_loss
-                        return loss
+                        trunk_loss = 0.5 * jnp.mean(jnp.square(trunk_preds - mb_trunk_targets))
+                        leaf_branch_loss = 0.5 * jnp.mean(jnp.square(leaf_preds - mb_leaf_targets))
+                        return trunk_loss + 0.25 * leaf_branch_loss
 
                     loss_val, grads = jax.value_and_grad(loss_fn)(st.params)
                     new_st = st.apply_gradients(grads=grads)
-                    return new_st, loss_val
+                    return (new_st, k), loss_val
 
-                new_state, losses = jax.lax.scan(_single_grad_step, curr_state, None, length=stage_steps)
+                (new_state, _), losses = jax.lax.scan(_single_grad_step, (curr_state, stage_rng), None, length=stage_steps)
                 return new_state, losses[-1]
 
             # Initial cumulative buffer D_fit: terminal leaves (depth) and penultimate anchors (depth - 1)
-            active_mask = jnp.zeros(depth + 1, dtype=jnp.float32)
-            active_mask = active_mask.at[depth].set(1.0).at[depth - 1].set(1.0)
-            train_state, loss_penult = _fit_stage(train_state, active_mask, targets)
+            rng, penult_fit_rng, scan_fit_rng = jax.random.split(rng, 3)
+            train_state, loss_penult = _fit_stage(train_state, jnp.int32(depth - 1), targets, penult_fit_rng)
 
-            # 3. Inductive Lookaheads backward via Formulation B (Branched GAE Accumulator):
-            # For t = depth - 2 down to 0:
-            #   delta_t = (1/K) sum sg(V_phi(s_{t+1}^{(k)})) - sg(V_phi(s_t))
-            #   gae_adv_t = delta_t + (gamma * lambda) * gae_adv_{t+1}
-            #   y(s_t) = sg(V_phi(s_t)) + gae_adv_t
-            loss_t = loss_penult
-            for t in range(depth - 2, -1, -1):
+            # 3. Inductive Lookaheads backward via jax.lax.scan (t = depth - 2 down to 0):
+            def _backward_stage_step(carry, t):
+                curr_train_state, curr_targets, curr_gae_adv, curr_rng = carry
+                curr_rng, stage_k = jax.random.split(curr_rng)
+
                 next_branch_obs = all_branch_obs[t]  # (num_envs, k_branches, obs_dim)
                 flat_next_branch_obs = next_branch_obs.reshape(-1, next_branch_obs.shape[-1])
-                flat_v_next = network.apply(train_state.params, flat_next_branch_obs, method=network.value)
-                v_next = jax.lax.stop_gradient(flat_v_next.reshape(num_envs, k_branches))
+                # Single fused forward pass for both current trunk state and K 1-step children
+                eval_obs_t = jnp.concatenate([base_obs[t], flat_next_branch_obs], axis=0)
+                eval_v_t = jax.lax.stop_gradient(
+                    network.apply(curr_train_state.params, eval_obs_t, method=network.value)
+                )
+                v_curr_t = eval_v_t[:num_envs]
+                v_next = eval_v_t[num_envs:].reshape(num_envs, k_branches)
                 v_branch_t = jnp.mean(v_next, axis=-1)  # (num_envs,)
-
-                v_curr_t = jax.lax.stop_gradient(
-                    network.apply(train_state.params, base_obs[t], method=network.value)
-                )  # (num_envs,) baseline prediction at current trunk state
 
                 # Branched Bellman residual: delta_t = E_{a~pi}[V(s')] - V(s)
                 delta_t = v_branch_t - v_curr_t
 
                 # GAE accumulator: A_t^(lambda) = delta_t + gamma * lambda * A_{t+1}^(lambda)
-                gae_adv = delta_t + (gamma * lmbda) * gae_adv
+                next_gae_adv = delta_t + (gamma * lmbda) * curr_gae_adv
 
-                # Target: y(s_t) = V(s_t) + A_t^(lambda) = v_branch_t + (gamma * lambda) * gae_adv_{t+1}
-                y_t = v_curr_t + gae_adv
-                targets = targets.at[t].set(y_t)
+                # Target: y(s_t) = V(s_t) + A_t^(lambda)
+                y_t = v_curr_t + next_gae_adv
+                curr_targets = curr_targets.at[t].set(y_t)
 
-                # Cumulative Replay Anchoring: add level t to buffer and update
-                active_mask = active_mask.at[t].set(1.0)
-                train_state, loss_t = _fit_stage(train_state, active_mask, targets)
+                # Cumulative Replay Anchoring: active levels are now [t .. depth]
+                curr_train_state, stage_loss = _fit_stage(curr_train_state, t, curr_targets, stage_k)
+                return (curr_train_state, curr_targets, next_gae_adv, curr_rng), stage_loss
+
+            backward_levels = jnp.arange(depth - 2, -1, -1, dtype=jnp.int32)
+            (train_state, targets, gae_adv, _), stage_losses = jax.lax.scan(
+                _backward_stage_step,
+                (train_state, targets, gae_adv, scan_fit_rng),
+                backward_levels,
+            )
+            loss_t = stage_losses[-1] if depth >= 2 else loss_penult
 
             # --- STEP D: EVALUATION METRICS ---
             all_preds = network.apply(train_state.params, all_state_obs, method=network.value)

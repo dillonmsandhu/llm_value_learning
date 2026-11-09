@@ -30,7 +30,7 @@ ENV_TYPE=${1:-single_dag}
 TOTAL_TRANSITIONS=${2:-250000}
 N_SEEDS=${3:-5}
 OUT_DIR=${4:-"results"}
-ALGOS=${5:-"mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.5"}
+ALGOS=${5:-"mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0"}
 MASTER_SEED=${6:-42}
 
 # Python interpreter discovery

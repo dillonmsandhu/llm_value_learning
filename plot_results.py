@@ -20,11 +20,15 @@ plt.rcParams.update({
 })
 
 METHOD_COLORS = {
-    "Standard MC": "#1f77b4",          # Blue
-    "Vine-Target (K=2)": "#ff7f0e",    # Orange
-    "Vine-Target (K=4)": "#d62728",    # Red
-    "FBI (lam=0.0)": "#2ca02c",        # Green
-    "FBI (lam=0.5)": "#9467bd",        # Purple
+    "Standard MC": "#1f77b4",              # Blue
+    "Vine-Target (K=2)": "#ff7f0e",        # Orange
+    "Vine-Target (K=4)": "#d62728",        # Red
+    "Batched FBI (lam=0.0)": "#2ca02c",    # Green
+    "Batched FBI (lam=0.5)": "#9467bd",    # Purple
+    "Staged FBI (lam=0.0)": "#17becf",     # Cyan
+    "Staged FBI (lam=0.5)": "#e377c2",     # Magenta
+    "FBI (lam=0.0)": "#2ca02c",
+    "FBI (lam=0.5)": "#9467bd",
     "Standard MC (K=1)": "#1f77b4",
     "FBI (K=4, lam=0.0)": "#2ca02c",
     "FBI (K=4, lam=0.5)": "#9467bd",
@@ -331,6 +335,114 @@ def compute_and_save_auc_summary(
     return table_str
 
 
+def plot_difficulty_breakdown(
+    results: Dict[str, Any],
+    save_dir: str,
+    prefix: str = "benchmark",
+) -> None:
+    """
+    Plots Value Error (MSVE) and Advantage Cosine Similarity as a function of
+    Problem Difficulty theta in [0, 1] (or Problem Index 0 .. P-1).
+    Demonstrates where Standard MC degrades on hard/needle-in-haystack problems,
+    and how Vine-Target and FBI maintain value accuracy.
+    """
+    if "thetas" not in results or "methods" not in results:
+        return
+    thetas = np.asarray(results["thetas"])
+    if len(thetas) <= 1:
+        # Single problem, difficulty curve not applicable
+        return
+
+    num_problems = len(thetas)
+    prob_indices = np.arange(num_problems)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), dpi=300)
+    fig.suptitle("Value Accuracy & Advantage Alignment vs. Problem Difficulty Index", y=0.98)
+
+    ax_msve = axes[0]
+    ax_adv = axes[1]
+
+    methods = list(results["methods"].keys())
+    breakdown_rows = []
+
+    for idx, name in enumerate(methods):
+        data = results["methods"][name]
+        color = get_color(name, idx)
+
+        if "msve_per_problem" not in data or "adv_cos_per_problem" not in data:
+            continue
+
+        msve_p = np.asarray(data["msve_per_problem"])        # (n_seeds, num_problems)
+        adv_p = np.asarray(data["adv_cos_per_problem"])       # (n_seeds, num_problems)
+
+        mean_msve = np.mean(msve_p, axis=0)
+        sem_msve = np.std(msve_p, axis=0) / np.sqrt(msve_p.shape[0])
+
+        mean_adv = np.mean(adv_p, axis=0)
+        sem_adv = np.std(adv_p, axis=0) / np.sqrt(adv_p.shape[0])
+
+        # Plot MSVE vs Problem Index / theta
+        ax_msve.plot(prob_indices, mean_msve, "o-", label=name, color=color, lw=2.0, ms=5)
+        ax_msve.fill_between(prob_indices, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.18)
+
+        # Plot Adv Cos vs Problem Index / theta
+        ax_adv.plot(prob_indices, mean_adv, "o-", label=name, color=color, lw=2.0, ms=5)
+        ax_adv.fill_between(prob_indices, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.18)
+
+        for p in range(num_problems):
+            breakdown_rows.append({
+                "Algorithm": name,
+                "Problem_Index": p,
+                "Difficulty_Theta": f"{thetas[p]:.3f}",
+                "MSVE_Mean": f"{mean_msve[p]:.4e}",
+                "MSVE_SEM": f"{sem_msve[p]:.4e}",
+                "AdvCos_Mean": f"{mean_adv[p]:.4f}",
+                "AdvCos_SEM": f"{sem_adv[p]:.4f}",
+            })
+
+    # Formatting
+    ax_msve.set_yscale("log")
+    ax_msve.set_xlabel("Problem Index (Increasing Difficulty $\\theta: 0 \\to 1$)")
+    ax_msve.set_ylabel("Final Mean Squared Value Error (MSVE)")
+    ax_msve.set_title("MSVE vs. Problem Difficulty")
+    ax_msve.grid(True, which="both", ls="--", lw=0.5, alpha=0.6)
+    ax_msve.legend(loc="upper left", framealpha=0.9)
+
+    ax_adv.set_xlabel("Problem Index (Increasing Difficulty $\\theta: 0 \\to 1$)")
+    ax_adv.set_ylabel(r"Advantage Cosine Similarity $\cos(\hat{\mathbf{A}}, \mathbf{A}^*)$")
+    ax_adv.set_title("Advantage Alignment vs. Problem Difficulty")
+    ax_adv.set_ylim(-0.2, 1.05)
+    ax_adv.axhline(1.0, color="gray", ls=":", lw=1.0)
+    ax_adv.grid(True, ls="--", lw=0.5, alpha=0.6)
+
+    # Add secondary x-axis with theta values
+    ax_msve_top = ax_msve.secondary_xaxis("top")
+    ax_msve_top.set_xticks(prob_indices)
+    ax_msve_top.set_xticklabels([f"$\\theta$={t:.2f}" for t in thetas], fontsize=8, rotation=35)
+
+    ax_adv_top = ax_adv.secondary_xaxis("top")
+    ax_adv_top.set_xticks(prob_indices)
+    ax_adv_top.set_xticklabels([f"$\\theta$={t:.2f}" for t in thetas], fontsize=8, rotation=35)
+
+    plt.tight_layout()
+    pdf_path = os.path.join(save_dir, f"{prefix}_difficulty_breakdown.pdf")
+    png_path = os.path.join(save_dir, f"{prefix}_difficulty_breakdown.png")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    plt.savefig(png_path, bbox_inches="tight", dpi=300)
+    plt.close()
+    print(f"[Plotting] Saved difficulty breakdown plots to:\n  - {pdf_path}\n  - {png_path}")
+
+    # Save CSV
+    if breakdown_rows:
+        csv_path = os.path.join(save_dir, f"{prefix}_difficulty_breakdown.csv")
+        headers = list(breakdown_rows[0].keys())
+        with open(csv_path, "w") as f:
+            f.write(",".join(headers) + "\n")
+            for r in breakdown_rows:
+                f.write(",".join([str(r[h]) for h in headers]) + "\n")
+        print(f"[Summary] Saved difficulty breakdown metrics table to: {csv_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Consolidated Plotting for Value Benchmark Suite")
     parser.add_argument("--data_path", type=str, required=True, help="Path to benchmark_results.pkl")
@@ -347,6 +459,7 @@ def main():
     plot_comparison_curves(results, save_dir, prefix=args.prefix)
     plot_scatter_true_vs_estimated(results, save_dir, prefix=args.prefix)
     compute_and_save_auc_summary(results, save_dir, prefix=args.prefix)
+    plot_difficulty_breakdown(results, save_dir, prefix=args.prefix)
 
 
 if __name__ == "__main__":

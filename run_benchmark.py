@@ -33,51 +33,67 @@ class StepData(NamedTuple):
 # -----------------------------------------------------------------------------
 # Evaluation Dataset Construction
 # -----------------------------------------------------------------------------
-def build_dag_eval_set(env: ReasoningDAGEnv, num_samples: int = 512, seed: int = 12345):
+def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed: int = 12345):
     """
-    Constructs a diverse, fixed evaluation dataset for ReasoningDAGEnv covering
-    different problems, steps, milestones, and derailment conditions.
+    Constructs a balanced evaluation dataset for ReasoningDAGEnv covering
+    each problem index (difficulty tier) equally, spanning steps, milestones, and derailment conditions.
     """
-    rng = jax.random.PRNGKey(seed)
-    num_rollouts = max(64, num_samples // env.max_steps + 1)
-    rng, r_key = jax.random.split(rng)
-    obs, state = jax.vmap(env.reset)(jax.random.split(r_key, num_rollouts))
+    P = env.num_problems
+    num_rollouts = max(4, samples_per_problem // env.max_steps + 1)
 
-    all_obs = [obs]
-    all_states = [state]
+    all_prompts, all_m, all_d, all_steps, all_hist, all_done = [], [], [], [], [], []
 
-    curr_state = state
-    for _ in range(env.max_steps):
-        rng, k1, k2 = jax.random.split(rng, 3)
-        actions = jax.vmap(env.sample_base_action)(jax.random.split(k1, num_rollouts), curr_state)
-        next_obs, next_state, r, d, _ = jax.vmap(env.step)(jax.random.split(k2, num_rollouts), curr_state, actions)
-        all_obs.append(next_obs)
-        all_states.append(next_state)
-        curr_state = next_state
+    for p in range(P):
+        rng = jax.random.PRNGKey(seed + p * 1000)
+        def reset_prob(k):
+            history, s = env.reset(k)
+            history = history.at[1].set(env.evaluator.PROMPT_TOKEN_OFFSET + p)
+            s = s._replace(prompt_idx=jnp.array(p, dtype=jnp.int32), history_tokens=history)
+            return history, s
 
-    # Flatten across rollouts and time steps
-    flat_obs = jnp.concatenate(all_obs, axis=0)[:num_samples]
-    
-    # Flatten states
-    flat_prompt = jnp.concatenate([st.prompt_idx for st in all_states], axis=0)[:num_samples]
-    flat_milestone = jnp.concatenate([st.milestone for st in all_states], axis=0)[:num_samples]
-    flat_derailed = jnp.concatenate([st.is_derailed for st in all_states], axis=0)[:num_samples]
-    flat_steps = jnp.concatenate([st.step_count for st in all_states], axis=0)[:num_samples]
-    flat_history = flat_obs
-    flat_done = jnp.concatenate([st.done for st in all_states], axis=0)[:num_samples]
+        obs, state = jax.vmap(reset_prob)(jax.random.split(rng, num_rollouts))
+        p_states = [state]
+        curr_state = state
+        for _ in range(env.max_steps):
+            rng, k1, k2 = jax.random.split(rng, 3)
+            actions = jax.vmap(env.sample_base_action)(jax.random.split(k1, num_rollouts), curr_state)
+            next_obs, next_state, r, d, _ = jax.vmap(env.step)(jax.random.split(k2, num_rollouts), curr_state, actions)
+            p_states.append(next_state)
+            curr_state = next_state
+
+        flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_m = jnp.concatenate([st.milestone for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_d = jnp.concatenate([st.is_derailed for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_s = jnp.concatenate([st.step_count for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_h = jnp.concatenate([st.history_tokens for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)[:samples_per_problem]
+
+        all_prompts.append(flat_p_prompt)
+        all_m.append(flat_p_m)
+        all_d.append(flat_p_d)
+        all_steps.append(flat_p_s)
+        all_hist.append(flat_p_h)
+        all_done.append(flat_p_done)
+
+    flat_prompt = jnp.concatenate(all_prompts, axis=0)
+    flat_milestone = jnp.concatenate(all_m, axis=0)
+    flat_derailed = jnp.concatenate(all_d, axis=0)
+    flat_steps = jnp.concatenate(all_steps, axis=0)
+    flat_obs = jnp.concatenate(all_hist, axis=0)
+    flat_done = jnp.concatenate(all_done, axis=0)
+    num_samples = flat_obs.shape[0]
 
     eval_state = DAGState(
         prompt_idx=flat_prompt,
         milestone=flat_milestone,
         is_derailed=flat_derailed,
         step_count=flat_steps,
-        history_tokens=flat_history,
+        history_tokens=flat_obs,
         done=flat_done,
     )
 
     exact_v = jax.vmap(env.evaluator.get_exact_value)(eval_state)
 
-    # Precompute 1-step exact advantage targets for each action a in [0..num_actions-1]
     def _action_target(a):
         act_arr = jnp.full(num_samples, a, dtype=jnp.int32)
         step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
@@ -87,21 +103,21 @@ def build_dag_eval_set(env: ReasoningDAGEnv, num_samples: int = 512, seed: int =
 
     all_acts = jnp.arange(env.num_actions)
     next_obs_all, r_all, v_next_all = jax.vmap(_action_target)(all_acts)
-    # v_next_all shape: (num_actions, num_samples)
-    true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]  # shape: (num_actions, num_samples)
+    true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]
 
-    # Pre-concatenate into a single token array for 10x faster single-pass evaluation
     all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
 
     return {
         "eval_obs": flat_obs,
         "eval_state": eval_state,
         "exact_v": exact_v,
-        "true_adv": true_adv,                 # (num_actions, num_samples)
-        "next_obs_all": next_obs_all,         # (num_actions, num_samples, max_seq_len)
-        "all_eval_tokens": all_eval_tokens,   # (num_samples + num_actions * num_samples, max_seq_len)
-        "r_all": r_all,                       # (num_actions, num_samples)
+        "true_adv": true_adv,
+        "next_obs_all": next_obs_all,
+        "all_eval_tokens": all_eval_tokens,
+        "r_all": r_all,
         "num_actions": env.num_actions,
+        "prompts": flat_prompt,
+        "num_problems": P,
     }
 
 
@@ -131,20 +147,23 @@ def build_tree_eval_set(env: TreeMRP):
         "left_c": left_c,
         "right_c": right_c,
         "parents": parents,
+        "num_problems": 1,
     }
 
 
 # -----------------------------------------------------------------------------
 # Metric Evaluation Functions
 # -----------------------------------------------------------------------------
-def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any], gamma: float = 1.0) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Evaluates MSVE and Advantage Cosine Similarity on ReasoningDAGEnv using a single batched forward pass."""
+def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any], gamma: float = 1.0):
+    """Evaluates MSVE and Advantage Cosine Similarity on ReasoningDAGEnv, globally and per-problem."""
     all_eval_tokens = eval_set["all_eval_tokens"]
     exact_v = eval_set["exact_v"]
     true_adv = eval_set["true_adv"]
     r_all = eval_set["r_all"]
     N = eval_set["eval_obs"].shape[0]
     num_actions = eval_set["num_actions"]
+    prompts = eval_set.get("prompts", None)
+    P = eval_set.get("num_problems", 1)
 
     # Single unified forward pass for both current and next state observations
     all_v = network.apply(params, all_eval_tokens, method=network.value)
@@ -160,10 +179,28 @@ def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict
     norm_pred = jnp.linalg.norm(pred_adv)
     adv_cos_sim = dot / (norm_true * norm_pred + 1e-8)
 
-    return msve, adv_cos_sim, v_pred
+    # Per-problem breakdown across difficulty tiers
+    if prompts is not None and P > 1:
+        def _prob_metrics(p):
+            mask = (prompts == p)
+            msve_p = jnp.sum(jnp.square(v_pred - exact_v) * mask) / jnp.maximum(1.0, jnp.sum(mask))
+            true_p = jnp.where(mask[None, :], true_adv, 0.0)
+            pred_p = jnp.where(mask[None, :], pred_adv, 0.0)
+            dot_p = jnp.sum(true_p * pred_p)
+            norm_t = jnp.linalg.norm(true_p)
+            norm_pr = jnp.linalg.norm(pred_p)
+            adv_p = dot_p / (norm_t * norm_pr + 1e-8)
+            return msve_p, adv_p
+
+        msve_per_prob, adv_per_prob = jax.vmap(_prob_metrics)(jnp.arange(P))
+    else:
+        msve_per_prob = msve[None]
+        adv_per_prob = adv_cos_sim[None]
+
+    return msve, adv_cos_sim, v_pred, msve_per_prob, adv_per_prob
 
 
-def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any]) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any]):
     """Evaluates MSVE and Advantage Cosine Similarity on TreeMRP."""
     eval_obs = eval_set["eval_obs"]
     exact_v = eval_set["exact_v"]
@@ -178,6 +215,17 @@ def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dic
     v_p = v_pred[parents]
     pred_adv_l = v_pred[left_c] - v_p
     pred_adv_r = v_pred[right_c] - v_p
+    pred_adv = jnp.stack([pred_adv_l, pred_adv_r], axis=0)
+
+    dot = jnp.sum(true_adv * pred_adv)
+    norm_true = jnp.linalg.norm(true_adv)
+    norm_pred = jnp.linalg.norm(pred_adv)
+    adv_cos_sim = dot / (norm_true * norm_pred + 1e-8)
+
+    msve_per_prob = msve[None]
+    adv_per_prob = adv_cos_sim[None]
+
+    return msve, adv_cos_sim, v_pred, msve_per_prob, adv_per_prob
     pred_adv = jnp.stack([pred_adv_l, pred_adv_r], axis=0)
 
     dot = jnp.sum(true_adv * pred_adv)
@@ -214,9 +262,12 @@ def make_train_loop(
     # Parse algo parameters
     is_mc = (algo == "mc")
     is_vine = algo.startswith("vine")
-    is_fbi = algo.startswith("fbi")
+    is_fbi_staged = algo.startswith("fbi_staged")
+    is_fbi_batched = algo.startswith("fbi") and not is_fbi_staged
+    is_fbi = is_fbi_staged or is_fbi_batched
     k_branches = 4
     lmbda = 0.0
+    stage_steps = int(cfg.get("STAGE_STEPS", 4))
 
     if is_vine:
         k_branches = int(algo.split("_k")[1])
@@ -264,11 +315,10 @@ def make_train_loop(
         def _update_step(runner_state, update_idx):
             train_state, env_state, last_obs, rng, snap_1_val, snap_4_val = runner_state
 
-            # --- A. Collect Primary Base Trajectory ---
+            # --- A. Collect Primary Base Trajectory (Pure Environment Rollout, Zero Network Calls) ---
             def _step_fn(carry, _):
                 st, o, k = carry
                 k, act_k, step_k = jax.random.split(k, 3)
-                v_curr = network.apply(train_state.params, o, method=network.value)
 
                 if is_dag:
                     a = jax.vmap(env.sample_base_action)(jax.random.split(act_k, num_envs), st)
@@ -279,7 +329,7 @@ def make_train_loop(
                         jax.random.split(step_k, num_envs), st, a, None
                     )
 
-                step_data = StepData(obs=o, action=a, reward=r, done=d, value=v_curr)
+                step_data = StepData(obs=o, action=a, reward=r, done=d, value=jnp.zeros(num_envs, dtype=jnp.float32))
                 return (next_st, next_o, k), (step_data, st)
 
             (env_state, last_obs, rng), (traj_batch, visited_states) = jax.lax.scan(
@@ -344,9 +394,10 @@ def make_train_loop(
                 v_keys = jax.random.split(v_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
                 targets = jax.vmap(jax.vmap(_vine_rollout))(visited_states, v_keys)
 
-            elif is_fbi:
-                # 1-step branching target: v_branch(s_t) = (1/K) sum [r + gamma * V(s')]
-                def _branch_1step(state, r_key):
+            elif is_fbi_batched:
+                # Synchronous / Batched 1-step branching target:
+                # 1. Sample K 1-step branches across all (T, B) states in parallel
+                def _sample_branch_1step(state, r_key):
                     ak, sk = jax.random.split(r_key)
                     if is_dag:
                         fork_st = DAGState(
@@ -358,27 +409,37 @@ def make_train_loop(
                             done=jnp.repeat(state.done, k_branches),
                         )
                         a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
-                        next_o, next_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
+                        next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     else:
                         fork_st = TabularState(
                             s_idx=jnp.repeat(state.s_idx, k_branches),
                             time=jnp.repeat(state.time, k_branches),
                         )
                         a = jnp.zeros(k_branches, dtype=jnp.int32)
-                        next_o, next_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+                        next_o, _, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
                             jax.random.split(sk, k_branches), fork_st, a, None
                         )
-
-                    v_next = network.apply(train_state.params, next_o, method=network.value)
-                    branch_ret = r + gamma * (1.0 - d.astype(jnp.float32)) * v_next
-                    return jnp.mean(branch_ret)
+                    return next_o, r, d
 
                 rng, b_rng = jax.random.split(rng)
                 b_keys = jax.random.split(b_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
-                v_branch = jax.vmap(jax.vmap(_branch_1step))(visited_states, b_keys)
+                b_next_obs, b_rew, b_done = jax.vmap(jax.vmap(_sample_branch_1step))(visited_states, b_keys)
+
+                # 2. Single fused forward pass over all T * B trunk observations + T * B * K branch observations
+                n_trunk = num_steps * num_envs
+                flat_trunk_obs = traj_batch.obs.reshape(n_trunk, -1)
+                flat_b_next_obs = b_next_obs.reshape(n_trunk * k_branches, -1)
+                all_fbi_obs = jnp.concatenate([flat_trunk_obs, flat_b_next_obs], axis=0)
+
+                all_fbi_v = jax.lax.stop_gradient(
+                    network.apply(train_state.params, all_fbi_obs, method=network.value)
+                )
+                v_base = all_fbi_v[:n_trunk].reshape(num_steps, num_envs)
+                v_next = all_fbi_v[n_trunk:].reshape(num_steps, num_envs, k_branches)
+                branch_ret = b_rew + gamma * (1.0 - b_done.astype(jnp.float32)) * v_next
+                v_branch = jnp.mean(branch_ret, axis=-1)
 
                 # Formulation B: GAE over branched residuals
-                v_base = jax.lax.stop_gradient(traj_batch.value)
                 delta_branch = v_branch - v_base
 
                 def _gae_back(next_adv, data):
@@ -392,39 +453,123 @@ def make_train_loop(
                 )
                 targets = v_base + gae_adv
 
-            # --- C. Critic Network Update (MSE Loss) ---
-            obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
-            targets_flat = targets.reshape(-1)
-            total_samples = obs_flat.shape[0]
-            n_minibatches = total_samples // minibatch_size
+            elif is_fbi_staged:
+                # Staged / Sequential FBI (XLA-optimized with jax.lax.scan & active-pool minibatching):
+                # 1. Sample K 1-step branches from all visited states in parallel
+                def _sample_branch_env_step(state, r_key):
+                    ak, sk = jax.random.split(r_key)
+                    if is_dag:
+                        fork_st = DAGState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            milestone=jnp.repeat(state.milestone, k_branches),
+                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+                            step_count=jnp.repeat(state.step_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
+                        )
+                        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
+                        next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
+                    else:
+                        fork_st = TabularState(
+                            s_idx=jnp.repeat(state.s_idx, k_branches),
+                            time=jnp.repeat(state.time, k_branches),
+                        )
+                        a = jnp.zeros(k_branches, dtype=jnp.int32)
+                        next_o, _, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+                            jax.random.split(sk, k_branches), fork_st, a, None
+                        )
+                    return next_o, r, d
 
-            def _update_epoch(carry, _):
-                ts, k = carry
-                k, shuff_k = jax.random.split(k)
-                perm = jax.random.permutation(shuff_k, total_samples)
-                shuff_obs = obs_flat[perm].reshape(n_minibatches, minibatch_size, *obs_flat.shape[1:])
-                shuff_targets = targets_flat[perm].reshape(n_minibatches, minibatch_size)
+                rng, b_rng, stage_scan_rng = jax.random.split(rng, 3)
+                b_keys = jax.random.split(b_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
+                # Shapes: b_next_obs (T, B, K, obs_dim), b_rew (T, B, K), b_done (T, B, K)
+                b_next_obs, b_rew, b_done = jax.vmap(jax.vmap(_sample_branch_env_step))(visited_states, b_keys)
 
-                def _step_mb(t_state, mb):
-                    m_obs, m_targ = mb
-                    def _loss(p):
-                        preds = network.apply(p, m_obs, method=network.value)
-                        return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+                # 2. Reverse backward induction scan (t = num_steps - 1 down to 0) with cumulative active-pool fitting
+                def _staged_backward_step(carry, t):
+                    curr_ts, curr_targets, next_adv, k_rng = carry
+                    k_rng, stage_k = jax.random.split(k_rng)
 
-                    loss, grads = jax.value_and_grad(_loss)(t_state.params)
-                    t_state = t_state.apply_gradients(grads=grads)
-                    return t_state, loss
+                    # Single fused forward pass for current trunk state and K 1-step children using just-updated critic
+                    flat_next_o = b_next_obs[t].reshape(num_envs * k_branches, -1)
+                    eval_obs_t = jnp.concatenate([traj_batch.obs[t], flat_next_o], axis=0)
+                    eval_v_t = jax.lax.stop_gradient(
+                        network.apply(curr_ts.params, eval_obs_t, method=network.value)
+                    )
+                    v_curr_t = eval_v_t[:num_envs]
+                    v_next = eval_v_t[num_envs:].reshape(num_envs, k_branches)
+                    r_t = b_rew[t]
+                    d_t = b_done[t].astype(jnp.float32)
+                    v_branch_t = jnp.mean(r_t + gamma * (1.0 - d_t) * v_next, axis=-1)
+                    delta_t = v_branch_t - v_curr_t
+                    trunk_d_t = traj_batch.done[t].astype(jnp.float32)
+                    curr_adv = delta_t + (gamma * lmbda) * (1.0 - trunk_d_t) * next_adv
+                    y_t = v_curr_t + curr_adv
+                    curr_targets = curr_targets.at[t].set(y_t)
 
-                ts, _ = jax.lax.scan(_step_mb, ts, (shuff_obs, shuff_targets))
-                return (ts, k), None
+                    # Run `stage_steps` minibatch gradient steps sampled strictly from active levels [t .. num_steps - 1]
+                    def _stage_mb_step(mb_carry, _):
+                        ts_inner, k_in = mb_carry
+                        k_in, k_lvl, k_env = jax.random.split(k_in, 3)
+                        mb_levels = jax.random.randint(k_lvl, (minibatch_size,), minval=t, maxval=num_steps)
+                        mb_envs = jax.random.randint(k_env, (minibatch_size,), minval=0, maxval=num_envs)
+                        m_obs = traj_batch.obs[mb_levels, mb_envs]
+                        m_targ = curr_targets[mb_levels, mb_envs]
 
-            (train_state, rng), _ = jax.lax.scan(_update_epoch, (train_state, rng), None, length=num_epochs)
+                        def _loss(p):
+                            preds = network.apply(p, m_obs, method=network.value)
+                            return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+
+                        loss_val, grads = jax.value_and_grad(_loss)(ts_inner.params)
+                        ts_inner = ts_inner.apply_gradients(grads=grads)
+                        return (ts_inner, k_in), loss_val
+
+                    (curr_ts, _), _ = jax.lax.scan(_stage_mb_step, (curr_ts, stage_k), None, length=stage_steps)
+                    return (curr_ts, curr_targets, curr_adv, k_rng), None
+
+                init_targets = jnp.zeros((num_steps, num_envs), dtype=jnp.float32)
+                init_adv = jnp.zeros(num_envs, dtype=jnp.float32)
+                rev_levels = jnp.arange(num_steps - 1, -1, -1, dtype=jnp.int32)
+                (train_state, targets, _, _), _ = jax.lax.scan(
+                    _staged_backward_step,
+                    (train_state, init_targets, init_adv, stage_scan_rng),
+                    rev_levels,
+                )
+
+            # --- C. Critic Network Update (MSE Loss for non-staged methods) ---
+            if not is_fbi_staged:
+                obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
+                targets_flat = targets.reshape(-1)
+                total_samples = obs_flat.shape[0]
+                n_minibatches = total_samples // minibatch_size
+
+                def _update_epoch(carry, _):
+                    ts, k = carry
+                    k, shuff_k = jax.random.split(k)
+                    perm = jax.random.permutation(shuff_k, total_samples)
+                    shuff_obs = obs_flat[perm].reshape(n_minibatches, minibatch_size, *obs_flat.shape[1:])
+                    shuff_targets = targets_flat[perm].reshape(n_minibatches, minibatch_size)
+
+                    def _step_mb(t_state, mb):
+                        m_obs, m_targ = mb
+                        def _loss(p):
+                            preds = network.apply(p, m_obs, method=network.value)
+                            return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+
+                        loss, grads = jax.value_and_grad(_loss)(t_state.params)
+                        t_state = t_state.apply_gradients(grads=grads)
+                        return t_state, loss
+
+                    ts, _ = jax.lax.scan(_step_mb, ts, (shuff_obs, shuff_targets))
+                    return (ts, k), None
+
+                (train_state, rng), _ = jax.lax.scan(_update_epoch, (train_state, rng), None, length=num_epochs)
 
             # --- D. Evaluation across Fixed Eval Set ---
             if is_dag:
-                msve, adv_cos, v_eval_preds = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
+                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
             else:
-                msve, adv_cos, v_eval_preds = evaluate_tree_metrics(network, train_state.params, eval_set)
+                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_tree_metrics(network, train_state.params, eval_set)
 
             # Record snapshots at 1/5 and 4/5
             snap_1_val = jnp.where(update_idx == u_snap_1, v_eval_preds, snap_1_val)
@@ -433,6 +578,8 @@ def make_train_loop(
             metrics_step = {
                 "msve": msve,
                 "advantage_cosine_sim": adv_cos,
+                "msve_per_problem": msve_per_prob,
+                "adv_cos_per_problem": adv_per_prob,
             }
 
             return (train_state, env_state, last_obs, rng, snap_1_val, snap_4_val), metrics_step
@@ -485,23 +632,30 @@ def run_benchmark(
     print("=" * 85)
 
     # 1. Initialize Environment & Precompute Exact Evaluator
-    is_dag_family = (env_type in ("dag", "single_dag"))
+    is_dag_family = (env_type in ("dag", "single_dag", "dag_spectrum"))
     if is_dag_family:
         if env_type == "single_dag":
-            dag_params = dag_params or {"num_problems": 1, "num_milestones": 8, "max_steps": 32, "num_actions": 8}
-            env_title = f"Single Large Reasoning DAG (M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+            dag_params = dag_params or {"num_problems": 1, "num_milestones": 8, "max_steps": 32, "num_actions": 8, "difficulty": 0.5}
+            diff_val = dag_params.get("difficulty", 0.5)
+            env_title = f"Single Large Reasoning DAG (Difficulty theta={diff_val}, M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+            difficulties = diff_val
+            num_probs = 1
         else:
-            dag_params = dag_params or {"num_problems": 20, "num_milestones": 6, "max_steps": 24, "num_actions": 8}
-            env_title = f"Multi-Problem Reasoning DAG (P={dag_params['num_problems']}, M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+            dag_params = dag_params or {"num_problems": 10, "num_milestones": 6, "max_steps": 24, "num_actions": 8}
+            num_probs = dag_params.get("num_problems", 10)
+            env_title = f"Difficulty Spectrum Reasoning DAG (P={num_probs}, M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+            difficulties = "spectrum"
 
         env = ReasoningDAGEnv(
-            num_problems=dag_params["num_problems"],
+            num_problems=num_probs,
             num_milestones=dag_params["num_milestones"],
             max_steps=dag_params["max_steps"],
             num_actions=dag_params["num_actions"],
+            difficulties=difficulties,
             seed=master_seed,
         )
-        eval_set = build_dag_eval_set(env, num_samples=128, seed=master_seed)
+        samples_per_p = max(8, 256 // num_probs)
+        eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
         num_steps = env.max_steps
     else:
         tree_params = tree_params or {"depth": 7, "p": 0.8, "cluster_size": 2}
@@ -520,6 +674,7 @@ def run_benchmark(
         "env_type": env_type,
         "env_title": env_title,
         "eval_true_values": np.asarray(eval_set["exact_v"]),
+        "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
         "methods": {},
     }
 
@@ -527,8 +682,12 @@ def run_benchmark(
         "mc": "Standard MC (K=1)",
         "vine_k2": "Vine-Target (K=2)",
         "vine_k4": "Vine-Target (K=4)",
-        "fbi_lam0.0": "FBI (lam=0.0)",
-        "fbi_lam0.5": "FBI (lam=0.5)",
+        "fbi_lam0.0": "Batched FBI (lam=0.0)",
+        "fbi_lam0.5": "Batched FBI (lam=0.5)",
+        "fbi_batched_lam0.0": "Batched FBI (lam=0.0)",
+        "fbi_batched_lam0.5": "Batched FBI (lam=0.5)",
+        "fbi_staged_lam0.0": "Staged FBI (lam=0.0)",
+        "fbi_staged_lam0.5": "Staged FBI (lam=0.5)",
     }
 
     # 2. Iterate Over Algorithms
@@ -590,6 +749,12 @@ def run_benchmark(
         snap_1 = np.asarray(out["snap_1_5"])           # shape: (n_seeds, num_eval_states)
         snap_4 = np.asarray(out["snap_4_5"])
 
+        # Per-problem final MSVE and AdvCos across difficulty tiers
+        msve_p_arr = np.asarray(out["metrics"]["msve_per_problem"])      # (n_seeds, num_updates, P)
+        adv_p_arr = np.asarray(out["metrics"]["adv_cos_per_problem"])    # (n_seeds, num_updates, P)
+        final_msve_p = msve_p_arr[:, -1, :]                              # (n_seeds, P)
+        final_adv_p = adv_p_arr[:, -1, :]                                # (n_seeds, P)
+
         x_updates = np.arange(1, num_updates + 1)
         x_samples = x_updates * trans_per_update
         # Linear wall-clock interpolation per update
@@ -601,6 +766,8 @@ def run_benchmark(
             "x_wallclock": x_wallclock,
             "msve": msve_arr,
             "advantage_cosine_sim": adv_cos_arr,
+            "msve_per_problem": final_msve_p,
+            "adv_cos_per_problem": final_adv_p,
             "scatter_snapshots": {
                 "1_5": snap_1,
                 "4_5": snap_4,
@@ -617,6 +784,7 @@ def run_benchmark(
     plot_results.plot_comparison_curves(results, save_dir, prefix="benchmark")
     plot_results.plot_scatter_true_vs_estimated(results, save_dir, prefix="benchmark")
     plot_results.compute_and_save_auc_summary(results, save_dir, prefix="benchmark")
+    plot_results.plot_difficulty_breakdown(results, save_dir, prefix="benchmark")
 
     return results
 
@@ -636,6 +804,7 @@ def main():
     parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 6 for dag)")
     parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 24 for dag)")
     parser.add_argument("--num_actions", type=int, default=8, help="DAG: Number of discrete actions")
+    parser.add_argument("--difficulty", type=float, default=0.5, help="DAG: Difficulty theta in [0, 1] for single_dag (default: 0.5)")
 
     # Tree params
     parser.add_argument("--depth", type=int, default=7, help="Tree: Depth of binary tree")
@@ -663,6 +832,7 @@ def main():
         "num_milestones": num_mile,
         "max_steps": max_st,
         "num_actions": args.num_actions,
+        "difficulty": args.difficulty,
     }
     tree_params = {
         "depth": args.depth,
