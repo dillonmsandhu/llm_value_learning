@@ -2,11 +2,11 @@
 #SBATCH --job-name=vine_value_bench
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:a5000:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
 
 # ==============================================================================
 # Comprehensive Value Learning Benchmark: SLURM Task
