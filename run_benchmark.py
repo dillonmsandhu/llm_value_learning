@@ -1,0 +1,686 @@
+from __future__ import annotations
+import os
+import sys
+import time
+import argparse
+import pickle
+import datetime
+from typing import Tuple, Dict, Any, List, NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax.training.train_state import TrainState
+
+from transformer import TransformerCritic
+from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
+from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState
+import plot_results
+
+
+# -----------------------------------------------------------------------------
+# Data Structures
+# -----------------------------------------------------------------------------
+class StepData(NamedTuple):
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    done: jnp.ndarray
+    value: jnp.ndarray
+
+
+# -----------------------------------------------------------------------------
+# Evaluation Dataset Construction
+# -----------------------------------------------------------------------------
+def build_dag_eval_set(env: ReasoningDAGEnv, num_samples: int = 512, seed: int = 12345):
+    """
+    Constructs a diverse, fixed evaluation dataset for ReasoningDAGEnv covering
+    different problems, steps, milestones, and derailment conditions.
+    """
+    rng = jax.random.PRNGKey(seed)
+    num_rollouts = max(64, num_samples // env.max_steps + 1)
+    rng, r_key = jax.random.split(rng)
+    obs, state = jax.vmap(env.reset)(jax.random.split(r_key, num_rollouts))
+
+    all_obs = [obs]
+    all_states = [state]
+
+    curr_state = state
+    for _ in range(env.max_steps):
+        rng, k1, k2 = jax.random.split(rng, 3)
+        actions = jax.vmap(env.sample_base_action)(jax.random.split(k1, num_rollouts), curr_state)
+        next_obs, next_state, r, d, _ = jax.vmap(env.step)(jax.random.split(k2, num_rollouts), curr_state, actions)
+        all_obs.append(next_obs)
+        all_states.append(next_state)
+        curr_state = next_state
+
+    # Flatten across rollouts and time steps
+    flat_obs = jnp.concatenate(all_obs, axis=0)[:num_samples]
+    
+    # Flatten states
+    flat_prompt = jnp.concatenate([st.prompt_idx for st in all_states], axis=0)[:num_samples]
+    flat_milestone = jnp.concatenate([st.milestone for st in all_states], axis=0)[:num_samples]
+    flat_derailed = jnp.concatenate([st.is_derailed for st in all_states], axis=0)[:num_samples]
+    flat_steps = jnp.concatenate([st.step_count for st in all_states], axis=0)[:num_samples]
+    flat_history = flat_obs
+    flat_done = jnp.concatenate([st.done for st in all_states], axis=0)[:num_samples]
+
+    eval_state = DAGState(
+        prompt_idx=flat_prompt,
+        milestone=flat_milestone,
+        is_derailed=flat_derailed,
+        step_count=flat_steps,
+        history_tokens=flat_history,
+        done=flat_done,
+    )
+
+    exact_v = jax.vmap(env.evaluator.get_exact_value)(eval_state)
+
+    # Precompute 1-step exact advantage targets for each action a in [0..num_actions-1]
+    def _action_target(a):
+        act_arr = jnp.full(num_samples, a, dtype=jnp.int32)
+        step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
+        next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
+        v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
+        return next_o, r, v_next
+
+    all_acts = jnp.arange(env.num_actions)
+    next_obs_all, r_all, v_next_all = jax.vmap(_action_target)(all_acts)
+    # v_next_all shape: (num_actions, num_samples)
+    true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]  # shape: (num_actions, num_samples)
+
+    # Pre-concatenate into a single token array for 10x faster single-pass evaluation
+    all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
+
+    return {
+        "eval_obs": flat_obs,
+        "eval_state": eval_state,
+        "exact_v": exact_v,
+        "true_adv": true_adv,                 # (num_actions, num_samples)
+        "next_obs_all": next_obs_all,         # (num_actions, num_samples, max_seq_len)
+        "all_eval_tokens": all_eval_tokens,   # (num_samples + num_actions * num_samples, max_seq_len)
+        "r_all": r_all,                       # (num_actions, num_samples)
+        "num_actions": env.num_actions,
+    }
+
+
+def build_tree_eval_set(env: TreeMRP):
+    """
+    Builds exact evaluation set for TreeMRP over all 2^(D+1)-1 states.
+    """
+    evaluator = env.evaluator
+    num_states = evaluator.num_states
+    v_true_all = evaluator.solve_backward_induction()[:num_states]
+    eval_obs = evaluator.obs_stack[:num_states]
+
+    num_internal = evaluator.leaf_offset
+    parents = jnp.arange(num_internal, dtype=jnp.int32)
+    left_c = 2 * parents + 1
+    right_c = 2 * parents + 2
+
+    true_adv_left = v_true_all[left_c] - v_true_all[parents]
+    true_adv_right = v_true_all[right_c] - v_true_all[parents]
+    true_adv = jnp.stack([true_adv_left, true_adv_right], axis=0) # (2, num_internal)
+
+    return {
+        "eval_obs": eval_obs,
+        "exact_v": v_true_all,
+        "true_adv": true_adv,
+        "num_internal": num_internal,
+        "left_c": left_c,
+        "right_c": right_c,
+        "parents": parents,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Metric Evaluation Functions
+# -----------------------------------------------------------------------------
+def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any], gamma: float = 1.0) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Evaluates MSVE and Advantage Cosine Similarity on ReasoningDAGEnv using a single batched forward pass."""
+    all_eval_tokens = eval_set["all_eval_tokens"]
+    exact_v = eval_set["exact_v"]
+    true_adv = eval_set["true_adv"]
+    r_all = eval_set["r_all"]
+    N = eval_set["eval_obs"].shape[0]
+    num_actions = eval_set["num_actions"]
+
+    # Single unified forward pass for both current and next state observations
+    all_v = network.apply(params, all_eval_tokens, method=network.value)
+    v_pred = all_v[:N]
+    v_next_pred = all_v[N:].reshape(num_actions, N)
+
+    msve = jnp.mean(jnp.square(v_pred - exact_v))
+    pred_adv = r_all + gamma * v_next_pred - v_pred[None, :]
+
+    # Advantage Cosine Similarity across all (action, state) pairs
+    dot = jnp.sum(true_adv * pred_adv)
+    norm_true = jnp.linalg.norm(true_adv)
+    norm_pred = jnp.linalg.norm(pred_adv)
+    adv_cos_sim = dot / (norm_true * norm_pred + 1e-8)
+
+    return msve, adv_cos_sim, v_pred
+
+
+def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dict[str, Any]) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Evaluates MSVE and Advantage Cosine Similarity on TreeMRP."""
+    eval_obs = eval_set["eval_obs"]
+    exact_v = eval_set["exact_v"]
+    true_adv = eval_set["true_adv"] # (2, num_internal)
+    parents = eval_set["parents"]
+    left_c = eval_set["left_c"]
+    right_c = eval_set["right_c"]
+
+    v_pred = network.apply(params, eval_obs, method=network.value)
+    msve = jnp.mean(jnp.square(v_pred - exact_v))
+
+    v_p = v_pred[parents]
+    pred_adv_l = v_pred[left_c] - v_p
+    pred_adv_r = v_pred[right_c] - v_p
+    pred_adv = jnp.stack([pred_adv_l, pred_adv_r], axis=0)
+
+    dot = jnp.sum(true_adv * pred_adv)
+    norm_true = jnp.linalg.norm(true_adv)
+    norm_pred = jnp.linalg.norm(pred_adv)
+    adv_cos_sim = dot / (norm_true * norm_pred + 1e-8)
+
+    return msve, adv_cos_sim, v_pred
+
+
+# -----------------------------------------------------------------------------
+# Training Functions for Algorithms
+# -----------------------------------------------------------------------------
+def make_train_loop(
+    algo: str,
+    env_type: str,
+    env: Any,
+    eval_set: Dict[str, Any],
+    cfg: Dict[str, Any],
+):
+    """
+    Constructs a compiled training function for:
+      - algo in ['mc', 'vine_k2', 'vine_k4', 'fbi_lam0.0', 'fbi_lam0.5']
+      - env_type in ['dag', 'tree']
+    """
+    gamma = float(cfg.get("GAMMA", 1.0))
+    num_envs = int(cfg.get("NUM_ENVS", 64))
+    num_steps = int(cfg.get("NUM_STEPS", 24))
+    num_updates = int(cfg.get("NUM_UPDATES", 100))
+    num_epochs = int(cfg.get("NUM_EPOCHS", 4))
+    minibatch_size = int(cfg.get("MINIBATCH_SIZE", 64))
+    lr = float(cfg.get("LR", 1e-3))
+
+    # Parse algo parameters
+    is_mc = (algo == "mc")
+    is_vine = algo.startswith("vine")
+    is_fbi = algo.startswith("fbi")
+    k_branches = 4
+    lmbda = 0.0
+
+    if is_vine:
+        k_branches = int(algo.split("_k")[1])
+    elif is_fbi:
+        lmbda = float(algo.split("_lam")[1])
+
+    is_dag = (env_type == "dag")
+    vocab_size = env.vocab_size if is_dag else 4
+    max_seq_len = env.max_seq_len if is_dag else (env.evaluator.depth + 4)
+    pad_token_id = 0 if is_dag else 2
+    add_bos = False if is_dag else True
+
+    network = TransformerCritic(
+        vocab_size=vocab_size,
+        d_model=cfg.get("D_MODEL", 64),
+        n_heads=cfg.get("N_HEADS", 4),
+        n_layers=cfg.get("N_LAYERS", 2),
+        final_hidden_dim=cfg.get("FINAL_HIDDEN_DIM", 32),
+        max_len=max_seq_len,
+        pad_token_id=pad_token_id,
+        add_bos=add_bos,
+    )
+
+    optimizer = optax.adamw(learning_rate=lr, weight_decay=cfg.get("WEIGHT_DECAY", 0.01))
+
+    # Snapshots indices
+    u_snap_1 = max(1, int(round(0.2 * num_updates)))
+    u_snap_4 = max(1, int(round(0.8 * num_updates)))
+
+    def train_seed(rng: jax.random.PRNGKey):
+        rng, init_rng, reset_rng = jax.random.split(rng, 3)
+
+        # 1. Initialize Network & Optimizer State
+        dummy_obs = eval_set["eval_obs"][:1]
+        params = network.init(init_rng, dummy_obs)
+        train_state = TrainState.create(apply_fn=network.apply, params=params, tx=optimizer)
+
+        # 2. Reset Environments
+        reset_keys = jax.random.split(reset_rng, num_envs)
+        if is_dag:
+            last_obs, env_state = jax.vmap(env.reset)(reset_keys)
+        else:
+            last_obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_keys, None)
+
+        def _update_step(runner_state, update_idx):
+            train_state, env_state, last_obs, rng, snap_1_val, snap_4_val = runner_state
+
+            # --- A. Collect Primary Base Trajectory ---
+            def _step_fn(carry, _):
+                st, o, k = carry
+                k, act_k, step_k = jax.random.split(k, 3)
+                v_curr = network.apply(train_state.params, o, method=network.value)
+
+                if is_dag:
+                    a = jax.vmap(env.sample_base_action)(jax.random.split(act_k, num_envs), st)
+                    next_o, next_st, r, d, _ = jax.vmap(env.step)(jax.random.split(step_k, num_envs), st, a)
+                else:
+                    a = jnp.zeros(num_envs, dtype=jnp.int32)
+                    next_o, next_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+                        jax.random.split(step_k, num_envs), st, a, None
+                    )
+
+                step_data = StepData(obs=o, action=a, reward=r, done=d, value=v_curr)
+                return (next_st, next_o, k), (step_data, st)
+
+            (env_state, last_obs, rng), (traj_batch, visited_states) = jax.lax.scan(
+                _step_fn, (env_state, last_obs, rng), None, length=num_steps
+            )
+
+            # --- B. Compute Targets ---
+            if is_mc:
+                # Backward Monte Carlo return: G_t = r_t + gamma * (1 - d_{t+1}) * G_{t+1}
+                def _mc_back(next_g, data):
+                    r, d = data
+                    g = r + gamma * (1.0 - d.astype(jnp.float32)) * next_g
+                    return g, g
+
+                _, targets = jax.lax.scan(
+                    _mc_back, jnp.zeros(num_envs, dtype=jnp.float32),
+                    (traj_batch.reward, traj_batch.done), reverse=True
+                )
+            elif is_vine:
+                # Fork K rollouts to horizon T for each visited state
+                def _vine_rollout(state, r_key):
+                    def _fork_step(carry, _):
+                        st, k = carry
+                        k, ak, sk = jax.random.split(k, 3)
+                        if is_dag:
+                            a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
+                            _, n_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
+                        else:
+                            a = jnp.zeros(k_branches, dtype=jnp.int32)
+                            _, n_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+                                jax.random.split(sk, k_branches), st, a, None
+                            )
+                        return (n_st, k), (r, d)
+
+                    # Repeat state k_branches times
+                    if is_dag:
+                        fork_st = DAGState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            milestone=jnp.repeat(state.milestone, k_branches),
+                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+                            step_count=jnp.repeat(state.step_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
+                        )
+                    else:
+                        fork_st = TabularState(
+                            s_idx=jnp.repeat(state.s_idx, k_branches),
+                            time=jnp.repeat(state.time, k_branches),
+                        )
+
+                    _, (r_seq, d_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
+
+                    def _back_return(next_g, rd):
+                        r, d = rd
+                        g = r + gamma * (1.0 - d.astype(jnp.float32)) * next_g
+                        return g, g
+
+                    _, ret_seq = jax.lax.scan(_back_return, jnp.zeros(k_branches, dtype=jnp.float32), (r_seq, d_seq), reverse=True)
+                    return jnp.mean(ret_seq[0])
+
+                rng, v_rng = jax.random.split(rng)
+                v_keys = jax.random.split(v_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
+                targets = jax.vmap(jax.vmap(_vine_rollout))(visited_states, v_keys)
+
+            elif is_fbi:
+                # 1-step branching target: v_branch(s_t) = (1/K) sum [r + gamma * V(s')]
+                def _branch_1step(state, r_key):
+                    ak, sk = jax.random.split(r_key)
+                    if is_dag:
+                        fork_st = DAGState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            milestone=jnp.repeat(state.milestone, k_branches),
+                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+                            step_count=jnp.repeat(state.step_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
+                        )
+                        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
+                        next_o, next_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
+                    else:
+                        fork_st = TabularState(
+                            s_idx=jnp.repeat(state.s_idx, k_branches),
+                            time=jnp.repeat(state.time, k_branches),
+                        )
+                        a = jnp.zeros(k_branches, dtype=jnp.int32)
+                        next_o, next_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
+                            jax.random.split(sk, k_branches), fork_st, a, None
+                        )
+
+                    v_next = network.apply(train_state.params, next_o, method=network.value)
+                    branch_ret = r + gamma * (1.0 - d.astype(jnp.float32)) * v_next
+                    return jnp.mean(branch_ret)
+
+                rng, b_rng = jax.random.split(rng)
+                b_keys = jax.random.split(b_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
+                v_branch = jax.vmap(jax.vmap(_branch_1step))(visited_states, b_keys)
+
+                # Formulation B: GAE over branched residuals
+                v_base = jax.lax.stop_gradient(traj_batch.value)
+                delta_branch = v_branch - v_base
+
+                def _gae_back(next_adv, data):
+                    delta, d = data
+                    adv = delta + (gamma * lmbda) * (1.0 - d.astype(jnp.float32)) * next_adv
+                    return adv, adv
+
+                _, gae_adv = jax.lax.scan(
+                    _gae_back, jnp.zeros(num_envs, dtype=jnp.float32),
+                    (delta_branch, traj_batch.done), reverse=True
+                )
+                targets = v_base + gae_adv
+
+            # --- C. Critic Network Update (MSE Loss) ---
+            obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
+            targets_flat = targets.reshape(-1)
+            total_samples = obs_flat.shape[0]
+            n_minibatches = total_samples // minibatch_size
+
+            def _update_epoch(carry, _):
+                ts, k = carry
+                k, shuff_k = jax.random.split(k)
+                perm = jax.random.permutation(shuff_k, total_samples)
+                shuff_obs = obs_flat[perm].reshape(n_minibatches, minibatch_size, *obs_flat.shape[1:])
+                shuff_targets = targets_flat[perm].reshape(n_minibatches, minibatch_size)
+
+                def _step_mb(t_state, mb):
+                    m_obs, m_targ = mb
+                    def _loss(p):
+                        preds = network.apply(p, m_obs, method=network.value)
+                        return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+
+                    loss, grads = jax.value_and_grad(_loss)(t_state.params)
+                    t_state = t_state.apply_gradients(grads=grads)
+                    return t_state, loss
+
+                ts, _ = jax.lax.scan(_step_mb, ts, (shuff_obs, shuff_targets))
+                return (ts, k), None
+
+            (train_state, rng), _ = jax.lax.scan(_update_epoch, (train_state, rng), None, length=num_epochs)
+
+            # --- D. Evaluation across Fixed Eval Set ---
+            if is_dag:
+                msve, adv_cos, v_eval_preds = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
+            else:
+                msve, adv_cos, v_eval_preds = evaluate_tree_metrics(network, train_state.params, eval_set)
+
+            # Record snapshots at 1/5 and 4/5
+            snap_1_val = jnp.where(update_idx == u_snap_1, v_eval_preds, snap_1_val)
+            snap_4_val = jnp.where(update_idx == u_snap_4, v_eval_preds, snap_4_val)
+
+            metrics_step = {
+                "msve": msve,
+                "advantage_cosine_sim": adv_cos,
+            }
+
+            return (train_state, env_state, last_obs, rng, snap_1_val, snap_4_val), metrics_step
+
+        num_eval_states = eval_set["eval_obs"].shape[0]
+        init_snap_1 = jnp.zeros(num_eval_states, dtype=jnp.float32)
+        init_snap_4 = jnp.zeros(num_eval_states, dtype=jnp.float32)
+
+        init_runner = (train_state, env_state, last_obs, rng, init_snap_1, init_snap_4)
+        update_indices = jnp.arange(1, num_updates + 1)
+        (final_train_state, _, _, _, snap_1, snap_4), metrics = jax.lax.scan(
+            _update_step, init_runner, update_indices
+        )
+
+        return {
+            "metrics": metrics,
+            "snap_1_5": snap_1,
+            "snap_4_5": snap_4,
+        }
+
+    return train_seed
+
+
+# -----------------------------------------------------------------------------
+# Main Benchmark Suite Runner
+# -----------------------------------------------------------------------------
+def run_benchmark(
+    env_type: str = "dag",
+    total_transitions_budget: int = 200000,
+    n_seeds: int = 5,
+    master_seed: int = 42,
+    algos: List[str] = None,
+    save_dir: str = "results/benchmark",
+    dag_params: Dict[str, Any] = None,
+    tree_params: Dict[str, Any] = None,
+):
+    """
+    Executes the comprehensive Value Learning & Advantage Alignment benchmark suite.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.5"]
+
+    print("=" * 85)
+    print(f"BENCHMARK SUITE: VALUE LEARNING & ADVANTAGE ALIGNMENT")
+    print(f"  Target Environment: {env_type.upper()}")
+    print(f"  Total Transitions:  {total_transitions_budget:,}")
+    print(f"  Seeds:              {n_seeds} (Master Seed: {master_seed})")
+    print(f"  Algorithms:         {algos}")
+    print(f"  Save Directory:     {save_dir}")
+    print("=" * 85)
+
+    # 1. Initialize Environment & Precompute Exact Evaluator
+    is_dag_family = (env_type in ("dag", "single_dag"))
+    if is_dag_family:
+        if env_type == "single_dag":
+            dag_params = dag_params or {"num_problems": 1, "num_milestones": 8, "max_steps": 32, "num_actions": 8}
+            env_title = f"Single Large Reasoning DAG (M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+        else:
+            dag_params = dag_params or {"num_problems": 20, "num_milestones": 6, "max_steps": 24, "num_actions": 8}
+            env_title = f"Multi-Problem Reasoning DAG (P={dag_params['num_problems']}, M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+
+        env = ReasoningDAGEnv(
+            num_problems=dag_params["num_problems"],
+            num_milestones=dag_params["num_milestones"],
+            max_steps=dag_params["max_steps"],
+            num_actions=dag_params["num_actions"],
+            seed=master_seed,
+        )
+        eval_set = build_dag_eval_set(env, num_samples=128, seed=master_seed)
+        num_steps = env.max_steps
+    else:
+        tree_params = tree_params or {"depth": 7, "p": 0.8, "cluster_size": 2}
+        env = TreeMRP(
+            depth=tree_params["depth"],
+            p=tree_params["p"],
+            cluster_size=tree_params["cluster_size"],
+            gamma=1.0,
+        )
+        eval_set = build_tree_eval_set(env)
+        env_title = f"Single Large Tree MRP (Depth={tree_params['depth']}, p={tree_params['p']}, States={env.evaluator.num_states})"
+        num_steps = tree_params["depth"] + 1
+
+    num_envs = 64
+    results: Dict[str, Any] = {
+        "env_type": env_type,
+        "env_title": env_title,
+        "eval_true_values": np.asarray(eval_set["exact_v"]),
+        "methods": {},
+    }
+
+    ALGO_NAMES = {
+        "mc": "Standard MC (K=1)",
+        "vine_k2": "Vine-Target (K=2)",
+        "vine_k4": "Vine-Target (K=4)",
+        "fbi_lam0.0": "FBI (lam=0.0)",
+        "fbi_lam0.5": "FBI (lam=0.5)",
+    }
+
+    # 2. Iterate Over Algorithms
+    for algo in algos:
+        display_name = ALGO_NAMES.get(algo, algo)
+
+        # Compute exact transition sample cost per update
+        if algo == "mc":
+            trans_per_update = num_envs * num_steps
+        elif algo.startswith("vine"):
+            k = int(algo.split("_k")[1])
+            # Primary + sum_{t=0}^{T-1} k * (T - t)
+            fork_trans = sum(k * (num_steps - t) for t in range(num_steps))
+            trans_per_update = num_envs * (num_steps + fork_trans)
+        elif algo.startswith("fbi"):
+            k = 4
+            # Primary + 1-step branching (num_steps * k)
+            trans_per_update = num_envs * num_steps * (1 + k)
+        else:
+            trans_per_update = num_envs * num_steps
+
+        num_updates = max(10, total_transitions_budget // trans_per_update)
+        actual_total_transitions = num_updates * trans_per_update
+
+        print(f"\n--- Running: {display_name} ---")
+        print(f"  Transitions per update: {trans_per_update} | Updates: {num_updates} | Total transitions: {actual_total_transitions:,}")
+
+        cfg = {
+            "GAMMA": 1.0,
+            "NUM_ENVS": num_envs,
+            "NUM_STEPS": num_steps,
+            "NUM_UPDATES": num_updates,
+            "NUM_EPOCHS": 4,
+            "MINIBATCH_SIZE": 64,
+            "LR": 1e-3,
+            "D_MODEL": 64,
+            "N_HEADS": 4,
+            "N_LAYERS": 2,
+            "FINAL_HIDDEN_DIM": 32,
+        }
+
+        train_fn = make_train_loop(algo, "dag" if is_dag_family else "tree", env, eval_set, cfg)
+        vmapped_train = jax.jit(jax.vmap(train_fn))
+
+        rng = jax.random.PRNGKey(master_seed)
+        seed_keys = jax.random.split(rng, n_seeds)
+
+        # Measure wall-clock compute time accurately
+        print("  Compiling & Executing on Device...")
+        t0 = time.perf_counter()
+        out = vmapped_train(seed_keys)
+        # Block device execution
+        _ = jax.block_until_ready(out["metrics"]["msve"])
+        elapsed = time.perf_counter() - t0
+        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / num_updates:.4f} s/update).")
+
+        msve_arr = np.asarray(out["metrics"]["msve"]) # shape: (n_seeds, num_updates)
+        adv_cos_arr = np.asarray(out["metrics"]["advantage_cosine_sim"])
+        snap_1 = np.asarray(out["snap_1_5"])           # shape: (n_seeds, num_eval_states)
+        snap_4 = np.asarray(out["snap_4_5"])
+
+        x_updates = np.arange(1, num_updates + 1)
+        x_samples = x_updates * trans_per_update
+        # Linear wall-clock interpolation per update
+        x_wallclock = np.linspace(elapsed / num_updates, elapsed, num_updates)
+
+        results["methods"][display_name] = {
+            "x_updates": x_updates,
+            "x_samples": x_samples,
+            "x_wallclock": x_wallclock,
+            "msve": msve_arr,
+            "advantage_cosine_sim": adv_cos_arr,
+            "scatter_snapshots": {
+                "1_5": snap_1,
+                "4_5": snap_4,
+            },
+        }
+
+    # 3. Save Benchmark Data
+    pkl_path = os.path.join(save_dir, "benchmark_results.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(results, f)
+    print(f"\n[Benchmark] Saved raw benchmark results to: {pkl_path}")
+
+    # 4. Generate Publication Figures & AUC Summary
+    plot_results.plot_comparison_curves(results, save_dir, prefix="benchmark")
+    plot_results.plot_scatter_true_vs_estimated(results, save_dir, prefix="benchmark")
+    plot_results.compute_and_save_auc_summary(results, save_dir, prefix="benchmark")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
+    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "tree"], help="Environment type: single_dag (single large DAG), dag (multi-problem DAG), tree (binary tree MRP)")
+    parser.add_argument("--total_transitions", type=int, default=150000, help="Total transition budget")
+    parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
+    parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
+    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.5", help="Comma-separated algos")
+    parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
+    parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")
+    
+    # DAG params
+    parser.add_argument("--num_problems", type=int, default=None, help="DAG: Number of problems (defaults: 1 for single_dag, 20 for dag)")
+    parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 6 for dag)")
+    parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 24 for dag)")
+    parser.add_argument("--num_actions", type=int, default=8, help="DAG: Number of discrete actions")
+
+    # Tree params
+    parser.add_argument("--depth", type=int, default=7, help="Tree: Depth of binary tree")
+    parser.add_argument("--p", type=float, default=0.8, help="Tree: Transition probability")
+
+    args = parser.parse_args()
+
+    sweep_id = args.sweep_id or os.environ.get("SLURM_ARRAY_JOB_ID") or datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    save_dir = os.path.join(args.out_dir, f"benchmark_{args.env_type}_{sweep_id}")
+
+    algo_list = [a.strip() for a in args.algos.split(",") if a.strip()]
+
+    # Set smart defaults based on env_type
+    if args.env_type == "single_dag":
+        num_prob = args.num_problems if args.num_problems is not None else 1
+        num_mile = args.num_milestones if args.num_milestones is not None else 8
+        max_st = args.max_steps if args.max_steps is not None else 32
+    else:
+        num_prob = args.num_problems if args.num_problems is not None else 20
+        num_mile = args.num_milestones if args.num_milestones is not None else 6
+        max_st = args.max_steps if args.max_steps is not None else 24
+
+    dag_params = {
+        "num_problems": num_prob,
+        "num_milestones": num_mile,
+        "max_steps": max_st,
+        "num_actions": args.num_actions,
+    }
+    tree_params = {
+        "depth": args.depth,
+        "p": args.p,
+        "cluster_size": 2,
+    }
+
+    run_benchmark(
+        env_type=args.env_type,
+        total_transitions_budget=args.total_transitions,
+        n_seeds=args.n_seeds,
+        master_seed=args.master_seed,
+        algos=algo_list,
+        save_dir=save_dir,
+        dag_params=dag_params,
+        tree_params=tree_params,
+    )
+
+
+if __name__ == "__main__":
+    main()

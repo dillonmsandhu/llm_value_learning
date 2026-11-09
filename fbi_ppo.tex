@@ -1,0 +1,260 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!70!black
+}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\sg}{\text{sg}}
+\newcommand{\Vmc}{\hat{V}_{\text{MC}}}
+\newcommand{\Vinterp}{\hat{V}_{\text{interp}}}
+\newcommand{\piref}{\pi_{\text{ref}}}
+\newcommand{\DKL}{\mathbb{D}_{\text{KL}}}
+
+\title{\textbf{Scalable Step-Level Value Estimation for LLM Reasoning:\\1-Step Fitted Backward Induction and Fitted Vine Interpolation}}
+\author{\textbf{Technical Note}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Reinforcement learning (RL) for multi-step large language model (LLM) reasoning requires assigning credit to intermediate reasoning steps when only sparse, terminal correctness feedback ($R \in \{0, 1\}$) is available. Standard Proximal Policy Optimization (PPO) trains a parametric value network (critic) on single-trajectory rollouts, which struggles due to high-variance binary returns and noisy single-sample bootstrapping. Conversely, critic-free rollout methods like \textsc{VinePPO} estimate state values via auxiliary Monte Carlo rollouts to termination from every step, incurring quadratic decoding cost $\mathcal{O}(K \cdot T^2)$ in the number of reasoning steps $T$.
+
+This note presents two practical critic-assisted approaches that reduce the rollout cost of \textsc{VinePPO} while producing step-level value estimates $\hat{V}(s_t)$ for standard PPO on the base trajectory:
+\begin{enumerate}
+    \item \textbf{Variant 1: 1-Step Fitted Backward Induction ($\text{FBI}(\lambda)$)}, which replaces full-horizon rollouts at early steps with 1-step branched Bellman expectations ($\mathcal{O}(K \cdot T)$ auxiliary steps), anchored by terminal Monte Carlo completions at the final step and optionally interpolated with downstream Monte Carlo targets via $\lambda \in [0, 1]$.
+    \item \textbf{Variant 2: Fitted Vine Interpolation and Subsampling}, which fits $V_\phi$ directly to unbiased $\Vmc(s_t)$ targets (avoiding bootstrapping drift), tracks the critic's out-of-sample error $\sigma^2_{\text{critic}}$ against $\Vmc$ online, and uses precision-weighted shrinkage and checkpoint subsampling to reduce rollout cost to $p \cdot \mathcal{O}(K \cdot T^2)$.
+\end{enumerate}
+\end{abstract}
+
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Step-Level MDP for Reasoning}
+We formulate multi-step reasoning as a finite-horizon Markov Decision Process (MDP) over discrete reasoning steps (e.g., paragraphs or equations) rather than individual tokens. Given a prompt $x \sim \mathcal{D}$, an autoregressive policy $\pi_\theta$ generates a base trajectory of $T$ steps:
+\begin{equation}
+    \tau = (s_0, a_0, s_1, a_1, \dots, s_{T-1}, a_{T-1}, s_T),
+\end{equation}
+where $s_0 = x$, each action $a_t \sim \pi_\theta(\cdot \mid s_t)$ is a reasoning step, and state transitions are deterministic prefix concatenations $s_{t+1} = (s_t, a_t)$. At termination $s_T$, the environment provides a binary correctness reward $R(s_T) \in \{0, 1\}$, with intermediate rewards $r_t = 0$ for $t < T$. The true state value under policy $\pi_\theta$ is the probability of reaching a correct final answer from prefix $s_t$:
+\begin{equation}
+    v^{\pi_\theta}(s_t) = \E_{\tau \sim \pi_\theta}\!\left[ R(s_T) \mid s_t \right] \in [0, 1].
+\end{equation}
+
+\subsection{The Trade-Off Between Standard PPO and VinePPO}
+To compute step-level advantages $\hat{A}(s_t, a_t) = \hat{V}(s_{t+1}) - \hat{V}(s_t)$ along the base trajectory $\tau$, standard PPO and \textsc{VinePPO} sit at opposite extremes of the compute--variance trade-off:
+\begin{enumerate}
+    \item \textbf{Standard PPO Critic ($\mathcal{O}(T)$ rollout cost):} Fits a parametric critic $V_\phi(s_t)$ using only the single sampled trajectory $\tau$. With $\lambda = 1$ (Monte Carlo), each state regresses against a single binary outcome $R(s_T) \in \{0, 1\}$, which has maximal Bernoulli variance $v(1-v) \le 0.25$. With $\lambda < 1$ (TD bootstrapping), the target $V_\phi(s_{t+1})$ relies on a single noisy action realization $a_t$ and can drift when downstream value estimates are inaccurate.
+    \item \textbf{\textsc{VinePPO} ($\mathcal{O}(K \cdot T^2)$ rollout cost):} Bypasses a parametric critic entirely. At every intermediate state $s_t$, it samples $K$ independent rollouts all the way to termination and averages their terminal rewards:
+    \begin{equation}
+        \Vmc(s_t) = \frac{1}{K} \sum_{k=1}^K R\!\left(\tau_{t \to \text{term}}^{(k)}\right).
+        \label{eq:vmc}
+    \end{equation}
+    While $\Vmc(s_t)$ is unbiased ($\E[\Vmc(s_t)] = v^{\pi_\theta}(s_t)$) with sampling variance $\frac{v(1-v)}{K}$, running $K$ full completions from each of the $T$ steps requires $\sum_{t=0}^{T-1} K(T - t) = K\frac{T(T+1)}{2} = \mathcal{O}(K \cdot T^2)$ auxiliary steps.
+\end{enumerate}
+
+In both variants below, we follow \textsc{VinePPO} in using auxiliary rollouts strictly to obtain step-level value estimates $\hat{V}(s_t)$ along the base trajectory $\tau$. The policy $\pi_\theta$ is then updated on the base trajectory using the standard clipped PPO objective:
+\begin{equation}
+    \mathcal{L}_{\text{PPO}}(\theta) = \E_{\tau} \left[ \sum_{t=0}^{T-1} \min\!\left( \rho_t(\theta) \hat{A}(s_t, a_t), \, \text{clip}(\rho_t(\theta), 1-\epsilon_{\text{clip}}, 1+\epsilon_{\text{clip}}) \hat{A}(s_t, a_t) \right) \right],
+    \label{eq:ppo_actor}
+\end{equation}
+where $\hat{A}(s_t, a_t) = \hat{V}(s_{t+1}) - \hat{V}(s_t)$ (or GAE over step TD residuals) and $\rho_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\text{old}}(a_t \mid s_t)}$.
+
+\section{Variant 1: 1-Step Fitted Backward Induction (FBI)}
+\label{sec:fbi}
+
+Variant 1 replaces full-horizon auxiliary rollouts at early steps with 1-step branched lookahead backed by a learned critic $V_\phi$, reducing auxiliary decoding complexity to $\mathcal{O}(K \cdot T)$.
+
+\subsection{\texorpdfstring{1-Step Lookahead Targets ($K' = 1$)}{1-Step Lookahead Targets (K' = 1)}}
+Along a base trajectory $\tau = (s_0, a_0, \dots, s_T)$, we construct targets $y(s_t)$ for each state $s_t$:
+\begin{itemize}
+    \item \textbf{Terminal Boundary ($t = T$):} The completed base trajectory has ground-truth value $y(s_T) = R(s_T) \in \{0, 1\}$.
+    \item \textbf{Monte Carlo Anchor ($t = T - 1$):} At the penultimate state $s_{T-1}$, rollouts to completion are short. We sample $K$ completions $\tau_{T-1 \to \text{term}}^{(1..K)} \sim \pi_\theta(\cdot \mid s_{T-1})$ to termination and compute the Monte Carlo average:
+    \begin{equation}
+        y(s_{T-1}) = \frac{1}{K} \sum_{k=1}^K R\!\left(\tau_{T-1 \to \text{term}}^{(k)}\right).
+        \label{eq:mc_anchor}
+    \end{equation}
+    \item \textbf{1-Step Inductive Lookahead ($t < T - 1$):} At earlier states, we sample $K$ \emph{single-step} continuations $a_t^{(1..K)} \sim \pi_\theta(\cdot \mid s_t)$, yielding next states $s_{t+1}^{(k)} = (s_t, a_t^{(k)})$, and average their values:
+    \begin{equation}
+        y(s_t) = \frac{1}{K} \sum_{k=1}^K v_{\text{next}}\!\left(s_{t+1}^{(k)}\right), \quad \text{where } v_{\text{next}}(s') = \begin{cases} R(s') & \text{if } s' \text{ is terminal}, \\ \sg\!\left(V_\phi(s')\right) & \text{otherwise.} \end{cases}
+        \label{eq:inductive_target}
+    \end{equation}
+\end{itemize}
+Averaging over $K$ single-step branches in \cref{eq:inductive_target} approximates the expected Bellman backup $\E_{a_t \sim \pi_\theta(\cdot \mid s_t)}[V_\phi(s_{t+1})]$ rather than bootstrapping from a single action realization.
+
+\subsection{Interleaved Backward Fitting with Replay Anchoring}
+To ensure backward induction propagates fresh value targets from $t = T-1$ toward $t = 0$ within an iteration:
+\begin{enumerate}
+    \item \textbf{Just-in-Time Target Evaluation:} We iterate backward from $\Delta = 1$ to $T_{\max}$ ($t = T - \Delta$). At step $t$, $y(s_t)$ is computed using the \emph{just-updated} critic weights $\phi$ from step $t+1$, performing multiple inner gradient steps per depth so $V_\phi$ fits the downstream level before upstream targets query it.
+    \item \textbf{Cumulative Replay Anchoring:} We maintain a cumulative dataset $\mathcal{D}_{\text{fit}}$ of already-resolved pairs $(s_{t'}, y(s_{t'}))$ for $t' \ge t$ (including all sampled terminal branch endpoints) during the backward sweep so gradient updates at early steps $t \ll T$ do not overwrite the terminal anchor learned at $t = T - 1$.
+\end{enumerate}
+
+\subsection{\texorpdfstring{$\text{FBI}(\lambda)$: Branched GAE Accumulator Interpolation}{FBI(lambda): Branched GAE Accumulator Interpolation}}
+Pure 1-Step FBI ($\lambda = 0$) relies entirely on the critic's 1-step branched expectation $\hat{V}_{\text{branch}}(s_t) \triangleq \frac{1}{K}\sum_{k=1}^K v_{\text{next}}(s_{t+1}^{(k)})$ for $t < T - 1$. Early in training, before $V_\phi$ has converged at deeper levels, pure 1-step bootstrapping can suffer from a cold-start lag as value signal takes multiple updates to propagate to $s_0$.
+
+We smoothly interpolate between 1-Step FBI ($\lambda = 0$) and Monte Carlo returns ($\lambda = 1$) via Generalized Advantage Estimation (GAE) computed backward along the base trajectory over \emph{branched Bellman residuals}.
+
+At each step $t \in \{0, \dots, T - 2\}$, we define the branched TD residual:
+\begin{equation}
+    \delta_t^{\text{branch}} = \underbrace{\left(\frac{1}{K} \sum_{k=1}^K v_{\text{next}}\!\left(s_{t+1}^{(k)}\right)\right)}_{\hat{V}_{\text{branch}}(s_t)} - \; \sg\!\left(V_\phi(s_t)\right).
+    \label{eq:delta_branch}
+\end{equation}
+At the penultimate Monte Carlo anchor $t = T - 1$, the residual against leaf rewards is:
+\begin{equation}
+    \delta_{T-1}^{\text{branch}} = \Vmc(s_{T-1}) - \sg\!\left(V_\phi(s_{T-1})\right), \quad \text{with } \hat{A}_{T-1}^{(\lambda)} = \delta_{T-1}^{\text{branch}}.
+\end{equation}
+Sweeping backward from $t = T - 2$ down to $0$, we maintain the discounted GAE accumulator and construct the target:
+\begin{equation}
+    \hat{A}_t^{(\lambda)} = \delta_t^{\text{branch}} + (\gamma \lambda) \hat{A}_{t+1}^{(\lambda)}, \qquad
+    y_t^{(\lambda)} = \sg\!\left(V_\phi(s_t)\right) + \hat{A}_t^{(\lambda)}.
+    \label{eq:fbi_lambda_gae}
+\end{equation}
+\begin{itemize}
+    \item \textbf{When $\lambda = 0$ (Pure 1-Step FBI):} $\hat{A}_t^{(0)} = \delta_t^{\text{branch}}$, so $y_t^{(0)} = V_\phi(s_t) + \delta_t^{\text{branch}} = \hat{V}_{\text{branch}}(s_t)$, recovering exact 1-step inductive Bellman lookahead.
+    \item \textbf{When $\lambda = 1$ (Anchored Monte Carlo):} The intermediate critic baselines telescope and cancel along the trajectory, anchoring upstream targets to downstream Monte Carlo completions.
+    \item \textbf{When $\lambda \in (0, 1)$:} Blends 1-step branched Bellman lookahead with downstream returns, providing immediate terminal reward signal to early states while maintaining $\mathcal{O}(K \cdot T)$ linear auxiliary transition cost.
+\end{itemize}
+
+\section{\texorpdfstring{Variant 2: Fitted Vine Interpolation and Subsampling ($V_\phi \leftrightarrow \Vmc$)}{Variant 2: Fitted Vine Interpolation and Subsampling}}
+\label{sec:fitted_vine}
+
+A key limitation of Variant 1 is that errors in $V_\phi$ on off-trunk sibling branches $s_{t+1}^{(k)}$ still compound over $T - 1$ bootstrapping steps. Variant 2 eliminates multi-step bootstrapping altogether by fitting $V_\phi(s_t)$ \textbf{directly to unbiased \textsc{VinePPO} Monte Carlo targets} $\Vmc(s_t)$, and leveraging an online measurement of $V_\phi$'s accuracy relative to $\Vmc$ to reduce variance and rollout compute.
+
+\subsection{Direct Supervised Distillation and Online Accuracy Auditing}
+Suppose we evaluate $K$-rollout Monte Carlo targets $\Vmc(s_t) = \frac{1}{K}\sum_{k=1}^K R(\tau_{t \to \text{term}}^{(k)})$ on a set of states $\mathcal{S}_{\text{MC}}$. Because $\Vmc(s_t)$ is an average of $K$ i.i.d.\ Bernoulli trials, its unbiased per-state sampling variance estimate is:
+\begin{equation}
+    \hat{\sigma}^2_{\text{MC}}(s_t) = \frac{\Vmc(s_t)\big(1 - \Vmc(s_t)\big)}{K - 1} \quad (\text{or } \tfrac{1}{4K} \text{ conservative bound for } K = 1).
+    \label{eq:sigma_mc}
+\end{equation}
+\textbf{Before} updating the critic $V_\phi$ on the current batch $\mathcal{S}_{\text{MC}}$, we audit the critic's out-of-sample mean squared error against $\Vmc$ and isolate the critic's excess prediction error variance $\sigma^2_{\text{critic}}$ via an exponential moving average (EMA):
+\begin{equation}
+    \hat{\epsilon}^2_{\text{batch}} = \frac{1}{|\mathcal{S}_{\text{MC}}|} \sum_{s_t \in \mathcal{S}_{\text{MC}}} \max\!\left(0, \; \big(V_\phi(s_t) - \Vmc(s_t)\big)^2 - \hat{\sigma}^2_{\text{MC}}(s_t)\right), \quad
+    \sigma^2_{\text{critic}} \leftarrow (1 - \beta)\sigma^2_{\text{critic}} + \beta \hat{\epsilon}^2_{\text{batch}}.
+    \label{eq:sigma_critic}
+\end{equation}
+After recording the out-of-sample audit $\sigma^2_{\text{critic}}$ and computing the interpolated values below, we fit $V_\phi$ directly to the soft probability targets $\Vmc(s_t) \in [0, 1]$ by minimizing $\E_{s_t \in \mathcal{S}_{\text{MC}}}\!\left[(V_\phi(s_t) - \Vmc(s_t))^2\right]$.
+
+\subsection{Mechanism A: Precision-Weighted Shrinkage Interpolation (Small \texorpdfstring{$K$}{K})}
+When $K$ is kept small (e.g., $K = 2$) to save rollout compute, $\Vmc(s_t)$ has noticeable binomial sampling variance $\hat{\sigma}^2_{\text{MC}}(s_t)$, whereas $V_\phi(s_t)$ has zero rollout sampling variance but carries prediction error variance $\sigma^2_{\text{critic}}$. The minimum-MSE linear combination (Empirical Bayes shrinkage) weights each estimator inversely to its variance:
+\begin{equation}
+    \Vinterp(s_t) = (1 - \alpha_t)\,\Vmc(s_t) + \alpha_t\,V_\phi(s_t), \qquad
+    \alpha_t = \frac{\hat{\sigma}^2_{\text{MC}}(s_t)}{\hat{\sigma}^2_{\text{MC}}(s_t) + \sigma^2_{\text{critic}} + \epsilon}.
+    \label{eq:precision_interp}
+\end{equation}
+\begin{itemize}
+    \item \textbf{Cold-Start Safety ($\sigma^2_{\text{critic}} \gg \hat{\sigma}^2_{\text{MC}}$):} Early in training when $V_\phi$ is inaccurate, $\alpha_t \approx 0$ and $\Vinterp(s_t)$ reduces to pure \textsc{VinePPO} ($\Vmc(s_t)$).
+    \item \textbf{Variance Reduction ($\sigma^2_{\text{critic}} \lesssim \hat{\sigma}^2_{\text{MC}}$):} As $V_\phi$ accurately tracks $\Vmc$, $\alpha_t$ increases, shrinking noisy small-$K$ Monte Carlo estimates toward $V_\phi(s_t)$.
+\end{itemize}
+
+\subsection{\texorpdfstring{Mechanism B: Subsampled Vine Rollouts ($p \cdot \mathcal{O}(K \cdot T^2)$ Cost)}{Mechanism B: Subsampled Vine Rollouts (p * O(K * T2) Cost)}}
+With a calibrated critic $V_\phi$ trained on $\Vmc$, we do not need to run $K$ full rollouts at every intermediate step:
+\begin{enumerate}
+    \item For each intermediate step $s_t$ ($t < T$), we flip a coin $\text{Bernoulli}(p)$ with subsample rate $p \in (0, 1]$ (e.g., $p = 0.25$).
+    \item \textbf{On sampled checkpoints ($s_t \in \mathcal{S}_{\text{MC}}$):} We run $K$ full rollouts to compute $\Vmc(s_t)$, audit $\sigma^2_{\text{critic}}$ via \cref{eq:sigma_critic}, and set $\hat{V}(s_t) = \Vinterp(s_t)$ via \cref{eq:precision_interp}.
+    \item \textbf{On unsampled checkpoints ($s_t \notin \mathcal{S}_{\text{MC}}$):} We skip auxiliary rollouts and use the critic prediction $\hat{V}(s_t) = V_\phi(s_t)$ directly (or fall back to rollout generation if $\sigma^2_{\text{critic}}$ exceeds a trust threshold $\tau_{\text{err}}$).
+\end{enumerate}
+
+\section{Comparison and Trade-offs}
+
+\begin{table}[ht]
+\centering
+\small
+\renewcommand{\arraystretch}{1.25}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Method} & \textbf{Auxiliary Steps / Traj.} & \textbf{Complexity} & \textbf{Bootstrapping Drift?} & \textbf{Critic Required?} \\ \midrule
+Standard PPO (GAE) & $0$ ($T$ base) & $\mathcal{O}(T)$ & High ($\lambda < 1$) & Yes \\
+\textsc{VinePPO} & $K \cdot \frac{T(T+1)}{2}$ & $\mathcal{O}(K \cdot T^2)$ & None (Unbiased MC) & No \\
+\textbf{Variant 1: 1-Step FBI} & $\approx K \cdot T$ & $\mathcal{O}(K \cdot T)$ & Moderate ($T-1$ steps) & Yes \\
+\textbf{Variant 2: Fitted Vine} & $p \cdot K \frac{T(T+1)}{2}$ & $p \cdot \mathcal{O}(K \cdot T^2)$ & \textbf{None (Direct $\Vmc$ fit)} & Yes \\ \bottomrule
+\end{tabular}%
+}
+\caption{\textbf{Comparison of step-level value estimation methods.} Variant 1 achieves linear $\mathcal{O}(K \cdot T)$ scaling via 1-step dynamic programming; Variant 2 avoids bootstrapping drift entirely by regressing $V_\phi$ on subsampled $\Vmc$ targets and interpolating via measured critic accuracy.}
+\label{tab:complexity}
+\end{table}
+
+\begin{itemize}
+    \item \textbf{When Variant 1 (1-Step FBI) is preferable:} When $T$ is large enough that full completions from early steps are prohibitively long, but $T$ is still small enough ($T \approx 4\text{--}8$ chunks) that $T-1$ stages of 1-step bootstrapping do not severely compound off-trunk critic errors.
+    \item \textbf{When Variant 2 (Fitted Vine Interpolation) is preferable:} When avoiding TD bootstrapping instability and OOD sibling queries is paramount. Because Variant 2 supervises $V_\phi$ directly on unbiased $\Vmc(s_t)$ values and gates its contribution via out-of-sample error $\sigma^2_{\text{critic}}$, a poorly fitted critic automatically receives near-zero weight ($\alpha_t \to 0$) rather than corrupting upstream targets.
+\end{itemize}
+
+\section{Algorithm Summaries}
+
+\begin{algorithm}[H]
+\caption{Variant 1: 1-Step Fitted Backward Induction PPO ($\text{FBI}(\lambda)$-PPO)}
+\label{alg:fbi_ppo}
+\begin{algorithmic}[1]
+\Require Policy $\pi_\theta$, Critic $V_\phi$, prompts $\mathcal{D}$, batch size $B$, branch factor $K$, trace parameter $\lambda \in [0, 1]$.
+\For{\textbf{each} training iteration}
+    \State Sample $B$ prompts $\{x_i\}_{i=1}^B \sim \mathcal{D}$, generate base trajectories $\{\tau_i\}_{i=1}^B \sim \pi_\theta$, and set $\mathcal{D}_{\text{fit}} \leftarrow \emptyset$.
+    \For{each base trajectory $\tau = (s_0, a_0, \dots, s_T)$ in batch}
+        \State Add terminal state $(s_T, R(s_T))$ to $\mathcal{D}_{\text{fit}}$.
+        \State \textbf{At $t = T - 1$:} Sample $K$ completions $\tau_{T-1 \to \text{term}}^{(1..K)} \sim \pi_\theta(\cdot \mid s_{T-1})$ with rewards $R^{(1..K)}$.
+        \State \textbf{At $t < T - 1$:} Sample $K$ single steps $a_t^{(1..K)} \sim \pi_\theta(\cdot \mid s_t)$ to form $s_{t+1}^{(k)} = (s_t, a_t^{(k)})$.
+    \EndFor
+    \State Add penultimate anchors $\big(s_{T-1}, \, y(s_{T-1}) = \frac{1}{K}\sum_{k=1}^K R^{(k)}\big)$ and terminal branch endpoints to $\mathcal{D}_{\text{fit}}$.
+    \State Update $\phi$ by minimizing $\E_{(s, y) \sim \mathcal{D}_{\text{fit}}}\!\left[(V_\phi(s) - y)^2\right]$.
+    \State Initialize GAE accumulator $\hat{A}_{T-1}^{(\lambda)} \leftarrow y(s_{T-1}) - \sg(V_\phi(s_{T-1}))$.
+    \For{remaining step distance $\Delta = 2 \text{ up to } T_{\max}$ (i.e., $t = T - \Delta$ moving backward)}
+        \For{each trajectory in batch with step index $t = T - \Delta \ge 0$}
+            \State $\hat{V}_{\text{branch}}(s_t) \leftarrow \frac{1}{K}\sum_{k=1}^K v_{\text{next}}\!\left(s_{t+1}^{(k)}\right)$, where $v_{\text{next}}(s') = R(s')$ if terminal else $\sg(V_\phi(s'))$.
+            \State $\delta_t^{\text{branch}} \leftarrow \hat{V}_{\text{branch}}(s_t) - \sg(V_\phi(s_t))$.
+            \State $\hat{A}_t^{(\lambda)} \leftarrow \delta_t^{\text{branch}} + (\gamma \lambda) \hat{A}_{t+1}^{(\lambda)}$.
+            \State $y(s_t) \leftarrow \sg(V_\phi(s_t)) + \hat{A}_t^{(\lambda)}$.
+            \State Append $(s_t, y(s_t))$ to cumulative buffer $\mathcal{D}_{\text{fit}}$.
+        \EndFor
+        \State Update critic $\phi$ on $\mathcal{D}_{\text{fit}}$ via gradient descent on $\E_{(s, y) \sim \mathcal{D}_{\text{fit}}}\!\left[(V_\phi(s) - y)^2\right]$.
+    \EndFor
+    \State Set $\hat{V}(s_t) \leftarrow y(s_t)$ for $t < T$ and $\hat{V}(s_T) \leftarrow R(s_T)$; update $\theta$ on $\{\tau_i\}_{i=1}^B$ via PPO (\cref{eq:ppo_actor}).
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Variant 2: Fitted Vine Interpolation \& Subsampled PPO}
+\label{alg:fitted_vine}
+\begin{algorithmic}[1]
+\Require Policy $\pi_\theta$, Critic $V_\phi$, prompts $\mathcal{D}$, batch size $B$, rollouts $K$, subsample rate $p \in (0, 1]$, EMA rate $\beta$.
+\For{\textbf{each} training iteration}
+    \State Sample $B$ prompts $\{x_i\}_{i=1}^B \sim \mathcal{D}$, generate base trajectories $\{\tau_i\}_{i=1}^B \sim \pi_\theta$, and set $\mathcal{S}_{\text{MC}} \leftarrow \emptyset$.
+    \For{each base trajectory $\tau = (s_0, a_0, \dots, s_T)$ and step $t \in \{0, \dots, T-1\}$}
+        \If{$\text{Bernoulli}(p) == 1$}
+            \State Sample $K$ full rollouts $\tau_{t \to \text{term}}^{(1..K)} \sim \pi_\theta(\cdot \mid s_t)$ and compute $\Vmc(s_t) \leftarrow \frac{1}{K}\sum_{k=1}^K R(\tau_{t \to \text{term}}^{(k)})$.
+            \State Compute MC variance $\hat{\sigma}^2_{\text{MC}}(s_t)$ via \cref{eq:sigma_mc} and add $(s_t, \Vmc(s_t), \hat{\sigma}^2_{\text{MC}}(s_t))$ to $\mathcal{S}_{\text{MC}}$.
+        \EndIf
+    \EndFor
+    \State \textbf{Audit Critic Out-of-Sample:} Update $\sigma^2_{\text{critic}}$ on $\mathcal{S}_{\text{MC}}$ using current $V_\phi$ via \cref{eq:sigma_critic}.
+    \For{each base trajectory $\tau = (s_0, a_0, \dots, s_T)$}
+        \State Set $\hat{V}(s_T) \leftarrow R(s_T)$.
+        \For{$t = 0 \text{ to } T - 1$}
+            \If{$s_t \in \mathcal{S}_{\text{MC}}$}
+                \State $\alpha_t \leftarrow \frac{\hat{\sigma}^2_{\text{MC}}(s_t)}{\hat{\sigma}^2_{\text{MC}}(s_t) + \sigma^2_{\text{critic}} + \epsilon}$; \quad $\hat{V}(s_t) \leftarrow (1 - \alpha_t)\Vmc(s_t) + \alpha_t V_\phi(s_t)$.
+            \Else
+                \State $\hat{V}(s_t) \leftarrow V_\phi(s_t)$.
+            \EndIf
+        \EndFor
+    \EndFor
+    \State \textbf{Fit Critic to $\Vmc$:} Update $\phi$ by minimizing $\E_{(s_t, \Vmc) \sim \mathcal{S}_{\text{MC}}}\!\left[(V_\phi(s_t) - \Vmc(s_t))^2\right]$ (plus terminal $(s_T, R(s_T))$).
+    \State Update policy parameters $\theta$ on base trajectories $\{\tau_i\}_{i=1}^B$ via PPO (\cref{eq:ppo_actor}) using $\hat{A}(s_t, a_t) = \hat{V}(s_{t+1}) - \hat{V}(s_t)$.
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
