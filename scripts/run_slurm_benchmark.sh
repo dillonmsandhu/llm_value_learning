@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=vine_value_bench
-#SBATCH --output=slurm/%A_%a.out
-#SBATCH --error=slurm/%A_%a.err
+#SBATCH --output=slurm/%j.out
+#SBATCH --error=slurm/%j.err
 #SBATCH --time=04:00:00
 #SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:a5000:1
@@ -35,6 +35,7 @@ fi
 [ -f "run_benchmark.py" ] || cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH}"
+export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 # Python interpreter discovery (Duke CompSci GPU cluster & local fallbacks)
@@ -54,13 +55,14 @@ else
     PYTHON="python"
 fi
 
-# Environment Configuration
-ENV_TYPE="${ENV_TYPE:-single_dag}"       # 'single_dag' (1 large problem), 'dag' (multi-problem), or 'tree'
-TOTAL_TRANSITIONS="${TOTAL_TRANSITIONS:-250000}"
-N_SEEDS="${N_SEEDS:-5}"
-MASTER_SEED="${MASTER_SEED:-42}"
-ALGOS="${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0}"
-OUT_DIR="${OUT_DIR:-results}"
+# Environment Configuration (Accept positional CLI arguments or environment variables)
+ENV_TYPE="${1:-${ENV_TYPE:-single_dag}}"
+TOTAL_TRANSITIONS="${2:-${TOTAL_TRANSITIONS:-250000}}"
+N_SEEDS="${3:-${N_SEEDS:-5}}"
+ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0}}"
+OUT_DIR="${5:-${OUT_DIR:-results}}"
+SWEEP_ID="${6:-${SWEEP_ID:-}}"
+MASTER_SEED="${7:-${MASTER_SEED:-42}}"
 
 # Large Reasoning DAG Hyperparameters
 NUM_PROBLEMS="${NUM_PROBLEMS:-10}"

@@ -23,6 +23,7 @@ SWEEP_NAME="benchmark_value_suite"
 LOG_DIR="slurm/${DATE}/${SWEEP_NAME}"
 mkdir -p "$LOG_DIR"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH}"
+export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 # CLI Parameters
@@ -32,6 +33,8 @@ N_SEEDS=${3:-5}
 OUT_DIR=${4:-"results"}
 ALGOS=${5:-"mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0"}
 MASTER_SEED=${6:-42}
+
+export ENV_TYPE TOTAL_TRANSITIONS N_SEEDS OUT_DIR ALGOS MASTER_SEED
 
 # Python interpreter discovery
 if [ -f "/home/users/ds541/.pyenv/versions/3.10.15/envs/gymnax/bin/python" ]; then
@@ -73,8 +76,8 @@ SBATCH_CMD="sbatch --parsable \
     --job-name=bench_${ENV_TYPE} \
     --output=\"${LOG_DIR}/%j_${ENV_TYPE}.out\" \
     --error=\"${LOG_DIR}/%j_${ENV_TYPE}.err\" \
-    --export=ALL,ENV_TYPE=$ENV_TYPE,TOTAL_TRANSITIONS=$TOTAL_TRANSITIONS,N_SEEDS=$N_SEEDS,MASTER_SEED=$MASTER_SEED,ALGOS=\"$ALGOS\",OUT_DIR=\"$OUT_DIR\",SWEEP_ID=\"$SWEEP_ID\",REPO_ROOT=\"$REPO_ROOT\" \
-    \"$BENCH_SCRIPT\""
+    --export=ALL \
+    \"$BENCH_SCRIPT\" \"$ENV_TYPE\" \"$TOTAL_TRANSITIONS\" \"$N_SEEDS\" \"$ALGOS\" \"$OUT_DIR\" \"$SWEEP_ID\" \"$MASTER_SEED\""
 
 JOB_ID=$(eval "$SBATCH_CMD")
 echo "Submitted GPU Benchmark Job ID: $JOB_ID"

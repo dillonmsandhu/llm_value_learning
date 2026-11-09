@@ -226,14 +226,6 @@ def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dic
     adv_per_prob = adv_cos_sim[None]
 
     return msve, adv_cos_sim, v_pred, msve_per_prob, adv_per_prob
-    pred_adv = jnp.stack([pred_adv_l, pred_adv_r], axis=0)
-
-    dot = jnp.sum(true_adv * pred_adv)
-    norm_true = jnp.linalg.norm(true_adv)
-    norm_pred = jnp.linalg.norm(pred_adv)
-    adv_cos_sim = dot / (norm_true * norm_pred + 1e-8)
-
-    return msve, adv_cos_sim, v_pred
 
 
 # -----------------------------------------------------------------------------
@@ -628,6 +620,7 @@ def run_benchmark(
     print(f"  Total Transitions:  {total_transitions_budget:,}")
     print(f"  Seeds:              {n_seeds} (Master Seed: {master_seed})")
     print(f"  Algorithms:         {algos}")
+    print(f"  JAX Platform:       {jax.default_backend().upper()} | Devices: {jax.devices()}")
     print(f"  Save Directory:     {save_dir}")
     print("=" * 85)
 
@@ -712,8 +705,8 @@ def run_benchmark(
         num_updates = max(10, total_transitions_budget // trans_per_update)
         actual_total_transitions = num_updates * trans_per_update
 
-        print(f"\n--- Running: {display_name} ---")
-        print(f"  Transitions per update: {trans_per_update} | Updates: {num_updates} | Total transitions: {actual_total_transitions:,}")
+        print(f"\n--- Running: {display_name} ---", flush=True)
+        print(f"  Transitions per update: {trans_per_update} | Updates: {num_updates} | Total transitions: {actual_total_transitions:,}", flush=True)
 
         cfg = {
             "GAMMA": 1.0,
@@ -736,13 +729,13 @@ def run_benchmark(
         seed_keys = jax.random.split(rng, n_seeds)
 
         # Measure wall-clock compute time accurately
-        print("  Compiling & Executing on Device...")
+        print("  Compiling & Executing on Device...", flush=True)
         t0 = time.perf_counter()
         out = vmapped_train(seed_keys)
         # Block device execution
         _ = jax.block_until_ready(out["metrics"]["msve"])
         elapsed = time.perf_counter() - t0
-        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / num_updates:.4f} s/update).")
+        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / num_updates:.4f} s/update).", flush=True)
 
         msve_arr = np.asarray(out["metrics"]["msve"]) # shape: (n_seeds, num_updates)
         adv_cos_arr = np.asarray(out["metrics"]["advantage_cosine_sim"])

@@ -7,6 +7,7 @@
 \usepackage{enumitem}
 \usepackage{xcolor}
 \usepackage{hyperref}
+\usepackage{cleveref}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, fit, backgrounds, decorations.pathreplacing}
 
@@ -14,6 +15,7 @@
 \definecolor{branchorange}{RGB}{230, 110, 0}
 \definecolor{termgreen}{RGB}{44, 160, 44}
 \definecolor{fitpurple}{RGB}{130, 80, 175}
+\definecolor{batchedteal}{RGB}{0, 135, 145}
 \definecolor{daggray}{RGB}{175, 175, 175}
 \definecolor{derailred}{RGB}{214, 39, 40}
 \definecolor{boxbg}{RGB}{248, 249, 252}
@@ -25,7 +27,7 @@
     urlcolor=primaryblue
 }
 
-\title{\textbf{Plain-English Guide to the VinePPO Testbed:\\Environments, Transformer Critic, and Fitted Backward Induction (FBI)}}
+\title{\textbf{Plain-English Guide to the VinePPO Testbed:\\Environments, Transformer Critic, Batched FBI, and Staged FBI}}
 \author{Project Overview \& Visual Walkthrough}
 \date{\today}
 
@@ -84,119 +86,135 @@ The critic $V_\phi(s_t)$ is a modern, miniature LLaMA-style causal Transformer (
 
 \section{The Value-Learning Algorithms}
 
-All algorithms collect a batch of $B = 64$ primary ``base trajectories'' $\tau = (s_0, a_0, s_1, \dots, s_T)$ per update, but differ in how they construct the regression target $y(s_t)$ for the critic $V_\phi(s_t)$:
+Every algorithm starts an outer training update by rolling out a batch of $B = 64$ primary ``base trajectories'' (chains) $\tau = (s_0, a_0, s_1, \dots, s_T)$, and differs in how it constructs and fits the regression targets $y(s_t)$ for the states along that chain.
 
-\subsection{1. Standard Monte Carlo (\texttt{mc\_value.py} / \texttt{mc})}
-\begin{itemize}[leftmargin=*]
-    \item \textbf{How it works:} Generates only the single base trajectory ($K=1$). Every intermediate state $s_t$ along that trajectory is trained to predict the final binary reward $R(s_T) \in \{0, 1\}$ of that single rollout.
+\subsection{Algorithm 1: Standard Monte Carlo}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+    \item \textbf{How it works:} Generates only the single base trajectory ($K=1$). Every intermediate state $s_t$ along that trajectory is trained to predict the final binary reward $R(s_T) \in \{0, 1\}$ of that single rollout ($y_t^{\text{MC}} = R(s_T)$ for all $t \in \{0, \dots, T\}$).
     \item \textbf{Trade-off:} Cheapest rollout cost ($\mathcal{O}(T)$ transitions per trajectory), but highest variance: the same intermediate state $s_t$ receives target $1$ on one trajectory and $0$ on another.
 \end{itemize}
 
-\subsection{2. Vine-Target \& Fitted Vine Interpolation (\texttt{vine\_target\_value.py} / \texttt{vine\_k4})}
-\begin{itemize}[leftmargin=*]
-    \item \textbf{How it works:} Inspired by VinePPO, at \emph{every} visited state $s_t$ along the base trajectory, the environment state is cloned $K$ times (e.g., $K=4$) and rolled out \textbf{all the way to the end of the episode ($t \to T$)}. The average terminal reward $\hat{V}_{\text{MC}}(s_t) = \frac{1}{K}\sum_{k=1}^K R(\tau_{t \to T}^{(k)})$ is used as a low-variance target to train $V_\phi(s_t)$.
-    \item \textbf{Variant 2 (Precision-Weighted Shrinkage in \texttt{vine\_target\_value.py}):} Because $\hat{V}_{\text{MC}}(s_t)$ is an average of $K$ Bernoulli trials, we know its exact sampling variance $\hat{\sigma}^2_{\text{MC}}(s_t) = \frac{\hat{V}_{\text{MC}}(1-\hat{V}_{\text{MC}})}{K-1}$. Before updating the critic on each batch, the code audits how much excess error $\sigma^2_{\text{critic}}$ the network $V_\phi$ has beyond $\hat{\sigma}^2_{\text{MC}}$, and blends $\hat{V}_{\text{MC}}$ and $V_\phi$ using inverse-variance weights.
-    \item \textbf{Trade-off:} Completely unbiased targets (zero bootstrapping drift), but requires $\mathcal{O}(K \cdot T^2)$ environment steps per trajectory because early states must be rolled out all the way to horizon $T$.
+\subsection{Algorithm 2: Vine-Target (Full-Horizon Branching)}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+    \item \textbf{How it works:} Inspired by VinePPO, at \emph{every} visited state $s_t$ along the base trajectory, the environment state is cloned $K$ times (e.g., $K=4$) and rolled out \textbf{all the way to the end of the episode ($t \to T$)}. The average terminal reward $\hat{V}_{\text{MC}}(s_t) = \frac{1}{K}\sum_{k=1}^K R(\tau_{t \to T}^{(k)})$ is used as a low-variance target.
+    \item \textbf{Optional Precision-Weighted Shrinkage:} Because $\hat{V}_{\text{MC}}(s_t)$ is an average of $K$ Bernoulli trials, its sampling variance is $\hat{\sigma}^2_{\text{MC}}(s_t) = \frac{\hat{V}_{\text{MC}}(1-\hat{V}_{\text{MC}})}{K-1}$. We can optionally blend $\hat{V}_{\text{MC}}(s_t)$ with the current critic prediction $V_\phi(s_t)$ using inverse-variance weights when the critic is already accurate.
+    \item \textbf{Trade-off:} Unbiased Monte Carlo targets (zero bootstrapping drift), but requires $\mathcal{O}(K \cdot T^2)$ environment transitions per trajectory because every intermediate branch must be rolled out all the way to horizon $T$.
 \end{itemize}
 
-\subsection{\texorpdfstring{3. Fitted Backward Induction --- $\text{FBI}(\lambda)$ (\texttt{fbi\_value.py} \& \texttt{run\_benchmark.py})}{3. Fitted Backward Induction - FBI(lambda)}}
+\medskip
+\noindent\textbf{The Core Idea of Fitted Backward Induction (FBI) --- 1-Step Branching:}
+Instead of rolling out $K$ branches all the way to the end of the episode ($T$), \textbf{Fitted Backward Induction (FBI)} rolls out $K$ parallel branches for \textbf{only 1 step} from each state $s_t$ on the primary chain:
+\[
+    s_t \xrightarrow{a_t^{(k)} \sim \pi} \big(r_t^{(k)},\; s_{t+1}^{(k)}\big), \qquad k = 1, \dots, K,
+\]
+reducing the total rollout cost from $\mathcal{O}(K \cdot T^2)$ to $\mathcal{O}(K \cdot T)$. Given critic parameters $\theta$, we approximate the expected 1-step Bellman backup at $s_t$ by averaging over those $K$ children:
+\[
+    \hat{V}_{\text{branch}}(s_t; \theta) \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_\theta\big(s_{t+1}^{(k)}\big) \Big),
+\]
+where $V_\theta(s_T^{(k)}) \equiv 0$ after a terminal step (so at the penultimate step $t = T-1$, $\hat{V}_{\text{branch}}(s_{T-1}) = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ is an \textbf{exact} average of terminal rewards with no critic bootstrap).
+To optionally blend this 1-step branched backup with longer-horizon returns along the primary chain via $\lambda \in [0, 1]$, we define the branched TD residual $\delta_t^{\text{branch}}(\theta) = \hat{V}_{\text{branch}}(s_t; \theta) - V_\theta(s_t)$ and the general $\lambda$-return target:
+\[
+    y_t^{(\lambda)}(\theta) \;=\; \hat{V}_{\text{branch}}(s_t; \theta) \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\theta), \qquad
+    \text{where}\quad \hat{A}_t^{(\lambda)}(\theta) = \delta_t^{\text{branch}}(\theta) + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\theta) \quad (\hat{A}_T^{(\lambda)} = 0).
+\]
+When $\lambda = 0$, the target simplifies to pure 1-step backward induction: $y_t^{(0)}(\theta) = \hat{V}_{\text{branch}}(s_t; \theta)$. Depending on \emph{which critic parameters $\theta$} are plugged into $y_t^{(\lambda)}(\theta)$ and \emph{in what order} the critic is trained, we obtain two distinct algorithms: \textbf{Batched FBI} (Algorithm 3) and \textbf{Staged FBI} (Algorithm 4).
 
-\textbf{Why FBI exists:} Instead of rolling out $K$ branches all the way to the end of the episode ($\mathcal{O}(K \cdot T^2)$ cost), FBI rolls out $K$ branches for \textbf{only 1 step} ($s_t \to s_{t+1}^{(1..K)}$) at each state along the base chain ($\mathcal{O}(K \cdot T)$ cost), and uses the critic $V_\phi$ itself to evaluate those 1-step children.
+\subsection{\texorpdfstring{Algorithm 3: Batched FBI --- $\text{FBI}_{\text{batched}}(\lambda)$}{Algorithm 3: Batched FBI}}
 
-Because FBI relies on its own network $V_\phi(s_{t+1}^{(k)})$ to create targets for $s_t$, the order in which rollouts and gradient updates happen is critical. Notice that the codebase actually contains \textbf{two implementations} of FBI:
+\textbf{Batched FBI} is the simpler, synchronous algorithm (\Cref{fig:batched_fbi_visual}). Within each outer training iteration, it computes all targets across the entire trajectory first using the fixed pre-update critic parameters $\phi_{\text{old}}$, and then fits the network on all timesteps simultaneously:
 
-\subsubsection*{A. The Canonical Sequential Backward-Induction Loop (\texttt{fbi\_value.py} \& \texttt{fbi\_ppo.tex})}
-In \texttt{fbi\_value.py}, each outer training iteration consists of \textbf{two rollout steps} followed by \textbf{$D$ sequential rounds (stages) of learning}:
+\begin{enumerate}[leftmargin=*, itemsep=2pt]
+    \item \textbf{Step 1 (Rollout Chain + $K$ 1-Step Branches):}
+    Roll out the primary chain $\tau = (s_0, s_1, \dots, s_T)$ and, at each state $s_t$ ($t \in \{0, \dots, T-1\}$), sample $K$ independent 1-step transitions $s_t \to s_{t+1}^{(1..K)}$.
+    \item \textbf{Step 2 (Compute All Targets Using Fixed $\phi_{\text{old}}$):}
+    Freeze the current critic weights $\theta = \phi_{\text{old}}$ and compute the target $y_t$ for every step $t \in \{0, \dots, T-1\}$:
+    \[
+        y_t \;=\; y_t^{(\lambda)}(\phi_{\text{old}}) \;=\; \hat{V}_{\text{branch}}(s_t; \phi_{\text{old}}) + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\phi_{\text{old}}), \qquad \forall\, t \in \{0, \dots, T-1\}.
+    \]
+    \item \textbf{Step 3 (Fit All Timesteps Simultaneously):}
+    Collect the full-trajectory dataset $\mathcal{D}_{\text{all}} = \big\{(s_t, y_t)\big\}_{t=0}^{T-1}$ and update $\phi$ by minimizing the mean squared error over all timesteps together for $E$ passes (epochs):
+    \[
+        \min_\phi \; \mathcal{L}_{\text{batched}}(\phi) \;=\; \frac{1}{T} \sum_{t=0}^{T-1} \Big( V_\phi(s_t) - y_t \Big)^2.
+    \]
+\end{enumerate}
 
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Rollout Phase (Done once per outer iteration before fitting):}
-    \begin{itemize}
-        \item \emph{Rollout Step 1 (Base Chain):} Roll out $B=64$ primary trajectories from root $s_0$ to leaf $s_D$ ($B \times D$ transitions).
-        \item \emph{Rollout Step 2 (Parallel 1-Step Branches):} From every state $s_t$ ($t \in \{0, \dots, D-1\}$) along the base chain, fork $K=4$ parallel \textbf{1-step} transitions $s_{t+1}^{(1..K)}$ ($B \times D \times K$ transitions). Note that for the penultimate node $s_{D-1}$, a 1-step rollout lands directly on terminal leaves $s_D^{(1..K)}$ where exact rewards $R \in \{0, 1\}$ are observed!
-    \end{itemize}
+\subsection{\texorpdfstring{Algorithm 4: Staged FBI --- $\text{FBI}_{\text{staged}}(\lambda)$}{Algorithm 4: Staged FBI}}
 
-    \item \textbf{How Many Rounds of Learning? Does It Learn All-at-Once or in Reverse Order?}
-    \begin{itemize}
-        \item It learns in \textbf{reverse backward-induction order}, across \textbf{$D$ sequential fitting stages} per outer iteration, running \texttt{STAGE\_STEPS = 4} gradient updates at each stage ($4 \times D$ gradient steps total per iteration).
-        \item \textbf{Crucial detail --- Cumulative Replay Anchoring (Not isolated 1-level fitting!):} If you trained a neural network \emph{purely} on level $t$ alone at each backward step, gradient descent on level $t$ would overwrite and destroy the weights that just learned levels $t+1 \dots D$ (catastrophic forgetting). Therefore, \texttt{fbi\_value.py} uses a \textbf{growing cumulative mask (\texttt{active\_mask} / $\mathcal{D}_{\text{fit}}$)}:
-        \begin{itemize}
-            \item \textbf{Stage 0 (Initial Base Case at the end of the DAG/Tree, $t = D$ and $t = D-1$):} We know the exact reward $y_D = R(s_D)$ at the leaf and the $K$-sample Monte Carlo average $y_{D-1} = \frac{1}{K}\sum_{k=1}^K R(s_D^{(k)})$ at the penultimate node. We put levels $\{D, D-1\}$ (plus all $K$ branched leaf states $s_D^{(1..K)}$) into $\mathcal{D}_{\text{fit}}$ and run \textbf{4 gradient steps} (\texttt{stage\_steps = 4}). Now $V_\phi$ is accurate at the end of the horizon.
-            \item \textbf{Backward Loop ($t = D-2$ down to $0$):} At level $t$, we use the \textbf{just-updated} network $V_\phi$ to evaluate the $K$ parallel 1-step children $s_{t+1}^{(1..K)}$:
-            \[
-                \hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \text{sg}\!\left(V_\phi(s_{t+1}^{(k)})\right).
-            \]
-            If $\lambda = 0$, the target is simply $y_t = \hat{V}_{\text{branch}}(s_t)$. More generally, $\text{FBI}(\lambda)$ blends this 1-step branched expectation with downstream targets using a reverse GAE accumulator over branched residuals $\delta_t^{\text{branch}} = \hat{V}_{\text{branch}}(s_t) - V_\phi(s_t)$:
-            \[
-                \hat{A}_t^{(\lambda)} = \delta_t^{\text{branch}} + (\gamma \lambda)\hat{A}_{t+1}^{(\lambda)}, \qquad y_t^{(\lambda)} = \text{sg}(V_\phi(s_t)) + \hat{A}_t^{(\lambda)}.
-            \]
-            We then \textbf{append} $(s_t, y_t^{(\lambda)})$ to the cumulative buffer $\mathcal{D}_{\text{fit}}$ (which now holds $\{t, t+1, \dots, D\}$) and run \textbf{4 gradient steps} on $\mathcal{D}_{\text{fit}}$ before moving backward to $t - 1$.
-        \end{itemize}
+\textbf{Why Staged FBI?} In Batched FBI with $\lambda = 0$, the target at step $t$ is $y_t = \frac{1}{K}\sum_{k=1}^K \big(r_t^{(k)} + \gamma V_{\phi_{\text{old}}}(s_{t+1}^{(k)})\big)$. Early in training, before $V_\phi$ has learned the values at step $t+1$, querying the pre-update network $V_{\phi_{\text{old}}}(s_{t+1}^{(k)})$ yields uncalibrated predictions, so it takes at least $T$ separate outer rollout iterations for terminal reward information at step $T$ to propagate all the way back to $s_0$.
+
+\textbf{Staged FBI} eliminates this lag by solving the value function in \textbf{reverse backward-induction order ($t = T-1 \to 0$)} within a single iteration, updating the critic parameters $\phi^{(T-1)} \to \phi^{(T-2)} \to \dots \to \phi^{(0)}$ at step $t+1$ \emph{before} querying them to construct the target at step $t$ (\Cref{fig:staged_fbi_visual}):
+
+\begin{enumerate}[leftmargin=*, itemsep=2pt]
+    \item \textbf{Step 1 (Rollout Chain + $K$ 1-Step Branches):}
+    Identical to Batched FBI: roll out the primary chain $\tau = (s_0, \dots, s_T)$ and fork $K$ 1-step branches $s_{t+1}^{(1..K)}$ at each state $s_t$.
+    \item \textbf{Step 2A (Base Case at the End of the Chain, $t = T-1$):}
+    At the penultimate step $t = T-1$, all $K$ 1-step branches land on terminal states $s_T^{(1..K)}$ where exact terminal rewards $R(s_T^{(k)}) \in \{0, 1\}$ are observed directly from the environment. Thus the target $y_{T-1} = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ (and $y_T = R(s_T)$) requires no critic bootstrapping. Initialize the active training set $\mathcal{D}_{T-1} = \big\{(s_{T-1}, y_{T-1}),\; (s_T, y_T)\big\}$ and run $M$ gradient steps on $\mathcal{D}_{T-1}$ to obtain calibrated terminal-stage parameters $\phi^{(T-1)}$.
+    \item \textbf{Step 2B (Backward Induction Loop for $t = T-2 \text{ down to } 0$):}
+    Proceeding backward one step at a time from $t = T-2$ down to $0$:
+    \begin{itemize}[itemsep=2pt]
+        \item \textbf{Compute Target at Step $t$ Using Just-Fitted Parameters $\phi^{(t+1)}$:} Query the critic $V_{\phi^{(t+1)}}$ (which was just trained on step $t+1$) on the $K$ 1-step children of $s_t$:
+        \[
+            y_t \;=\; y_t^{(\lambda)}\big(\phi^{(t+1)}\big) \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big) \Big) \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}.
+        \]
+        \item \textbf{Add $(s_t, y_t)$ to Cumulative Active Set $\mathcal{D}_t$:} Because $V_\phi$ is a single shared neural network, training \emph{only} on step $t$ would overwrite what the network just learned at deeper steps $t+1 \dots T$. We therefore keep all resolved steps $[t \dots T]$ in the active set: $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \big\{(s_t, y_t)\big\} = \big\{(s_\tau, y_\tau)\big\}_{\tau = t}^{T}$.
+        \item \textbf{Run $M$ Gradient Steps to Obtain $\phi^{(t)}$:} Update the critic from $\phi^{(t+1)}$ to $\phi^{(t)}$ by taking $M$ gradient steps on the cumulative squared loss $\mathcal{L}_t(\phi) = \frac{1}{|\mathcal{D}_t|} \sum_{\tau = t}^{T} \big( V_\phi(s_\tau) - y_\tau \big)^2$, then step backward ($t \leftarrow t - 1$) until the root $t = 0$ is fitted.
     \end{itemize}
 \end{enumerate}
 
-\subsubsection*{B. The Batched Synchronous Variant (\texttt{run\_benchmark.py})}
-In \texttt{run\_benchmark.py} (used for rapid multi-seed sweeps on the 24--32 step \texttt{ReasoningDAGEnv}), running $T=32$ separate inner fitting stages inside every outer loop would require $32 \times 4 = 128$ sequential passes per rollout batch. Instead, \texttt{run\_benchmark.py} implements a \textbf{batched all-at-once approximation}:
-\begin{enumerate}[leftmargin=*]
-    \item Collects the primary chain $(s_0 \dots s_T)$ and forks $K=4$ parallel 1-step branches at every node.
-    \item Evaluates $\hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \big(r_t^{(k)} + \gamma V_\phi(s_{t+1}^{(k)})\big)$ across all steps simultaneously using the current network $V_\phi$.
-    \item Sweeps backward in reverse order ($t = T-1 \to 0$) in a single fast vector pass to compute the $\text{FBI}(\lambda)$ GAE targets $y_t^{(\lambda)}$.
-    \item Trains the network \textbf{on all timesteps $\{0 \dots T-1\}$ at once} for \texttt{NUM\_EPOCHS = 4} shuffled minibatch epochs. Here, the backward propagation of value across the DAG happens across outer training updates (and via $\lambda > 0$ within each update).
-\end{enumerate}
+\subsection{Head-to-Head Summary: Batched FBI vs.\ Staged FBI}
+
+\begin{table}[ht!]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Property} & \textbf{Algorithm 3: Batched FBI} & \textbf{Algorithm 4: Staged FBI} \\ \midrule
+\textbf{Rollout Data} & Primary chain + $K$ 1-step branches per state & Primary chain + $K$ 1-step branches per state \\
+\textbf{Target Formula at Step $t$} & $y_t = y_t^{(\lambda)}(\phi_{\text{old}})$ (uses fixed pre-update weights) & $y_t = y_t^{(\lambda)}(\phi^{(t+1)})$ (uses weights just fitted at $t+1$) \\
+\textbf{Training Objective} & $\frac{1}{T}\sum_{t=0}^{T-1} (V_\phi(s_t) - y_t)^2$ across all $t$ at once & Sequential stages $t = T-1 \to 0$ on resolved set $\mathcal{D}_t = [t \dots T]$ \\
+\textbf{Weighting Across Steps} & \textbf{Uniform:} Every step $t$ receives equal weight & \textbf{Bottom-heavy:} Deeper steps $\tau \approx T$ stay in $\mathcal{D}_t$ across more stages \\
+\textbf{Key Advantage} & \textbf{Lower final asymptotic error} (uniform weighting) & \textbf{Faster early learning} (rewards propagate $T \to 0$ in 1 iteration) \\ \bottomrule
+\end{tabular}%
+}
+\caption{\textbf{Mathematical comparison of Batched FBI and Staged FBI.}}
+\label{tab:batched_vs_staged}
+\end{table}
 
 \newpage
-\section{Visualizing Fitted Backward Induction (FBI) on a Reasoning DAG}
+\section{Visual Diagram 1: Batched FBI ($\text{FBI}_{\text{batched}}(\lambda)$)}
 
-\vspace{0.2cm}
+\vspace{0.15cm}
 \begin{figure}[ht!]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
     >=Latex,
     font=\small,
-    dagnode/.style={circle, draw=daggray!80, fill=daggray!15, minimum size=6.5mm, inner sep=0pt, font=\scriptsize, text=black!60},
-    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
-    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
     branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.2mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
 ]
 
 % =============================================================================
-% PANEL 1: THE DAG ROLLOUT CHAIN & PARALLEL 1-STEP FORKS
+% PANEL 1: THE ROLLOUT CHAIN & PARALLEL 1-STEP BRANCHES
 % =============================================================================
-\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.3)
-    {Phase 1: Base Rollout Chain $\tau$ Through the DAG + Parallel 1-Step Forks ($K$ per node)};
+\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.4)
+    {Step 1 (Rollout): Primary Trajectory Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches per Node};
 
 \begin{scope}[shift={(0, 6.7)}]
-    % Background DAG grid headers
-    \foreach \x/\step in {0/0, 2.3/1, 4.7/t, 7.6/t+1, 10.4/T-1, 13.2/T} {
-        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.8) {Step $\step$};
+    \foreach \x/\step in {0/0, 3.0/1, 5.8/t, 8.8/t+1, 11.4/T-1, 14.4/T} {
+        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.9) {Time $\step$};
     }
 
-    % Background unselected DAG nodes (alternative milestones / derailed states)
-    \node[dagnode] (bg1_top) at (2.3, 2.0) {};
-    \node[dagnode] (bg1_bot) at (2.3, 0.0) {};
-    \node[dagnode] (bg2_top) at (4.7, 2.0) {};
-    \node[dagnode] (bg2_bot) at (4.7, 0.0) {};
-    \node[dagnode] (bg3_top) at (7.6, 2.1) {};
-    \node[dagnode] (bg4_top) at (10.4, 2.0) {};
-
-    % Primary Base Trajectory Chain Nodes
+    % Primary Base Trajectory Chain Nodes (blue = non-terminal, green = terminal)
     \node[chainnode] (s0) at (0, 1.0) {$s_0$};
-    \node[chainnode] (s1) at (2.3, 1.0) {$s_1$};
-    \node[chainnode] (st) at (4.7, 1.0) {$s_t$};
-    \node[chainnode] (st1) at (7.6, 1.0) {$s_{t+1}$};
-    \node[chainnode] (sTm1) at (10.4, 1.0) {$s_{T-1}$};
-    \node[termnode]  (sT) at (13.2, 1.0) {$s_T$};
-
-    % Faint DAG reconvergence/derail edges
-    \draw[->, daggray, dashed] (s0) -- (bg1_top);
-    \draw[->, daggray, dashed] (s0) -- (bg1_bot);
-    \draw[->, daggray, dashed] (bg1_top) -- (st);
-    \draw[->, daggray, dashed] (bg1_bot) -- (bg2_bot);
-    \draw[->, daggray, dashed] (bg2_bot) -- (st1);
-    \draw[->, daggray, dashed] (st) -- (bg3_top);
-    \draw[->, daggray, dashed] (bg3_top) -- (sTm1);
-    \draw[->, daggray, dashed] (st1) -- (bg4_top);
-    \draw[->, daggray, dashed] (bg4_top) -- (sT);
+    \node[chainnode] (s1) at (3.0, 1.0) {$s_1$};
+    \node[chainnode] (st) at (5.8, 1.0) {$s_t$};
+    \node[chainnode] (st1) at (8.8, 1.0) {$s_{t+1}$};
+    \node[chainnode] (sTm1) at (11.4, 1.0) {$s_{T-1}$};
+    \node[termnode]  (sT) at (14.4, 1.0) {$s_T$};
 
     % Primary Chain Edges
     \draw[->, primaryblue, line width=1.6pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
@@ -205,37 +223,178 @@ In \texttt{run\_benchmark.py} (used for rapid multi-seed sweeps on the 24--32 st
     \draw[->, primaryblue, line width=1.6pt, dotted] (st1) -- (sTm1);
     \draw[->, primaryblue, line width=1.6pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
 
-    % Parallel 1-step branches at intermediary node s_t
-    \node[branchnode] (bt1) at (6.4, 2.05) {$s_{t+1}^{(1)}$};
-    \node[branchnode] (bt2) at (6.4, 0.25) {$s_{t+1}^{(2)}$};
-    \node[branchnode] (btK) at (6.4, -0.6) {$s_{t+1}^{(K)}$};
-    \draw[->, branchorange!90!black, line width=1pt] (st) -- (bt1);
-    \draw[->, branchorange!90!black, line width=1pt] (st) -- (bt2);
-    \draw[->, branchorange!90!black, line width=1pt] (st) -- (btK);
-    \node[font=\scriptsize, text=branchorange!90!black] at (6.4, -0.15) {$\vdots$};
+    % K 1-step branches from s_0
+    \node[branchnode] (b01) at (1.5, 2.15) {$s_1^{(1)}$};
+    \node[branchnode] (b0K) at (1.5, -0.15) {$s_1^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[above, sloped, font=\tiny] {1 step} (b01);
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[below, sloped, font=\tiny] {1 step} (b0K);
+    \node[font=\scriptsize, text=branchorange!90!black] at (1.5, 0.5) {$\vdots$};
 
-    % Parallel 1-step branches at penultimate node s_{T-1} (landing on terminal leaves!)
-    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bT1) at (12.1, 2.15) {$s_T^{(1)}$};
-    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bT2) at (12.1, 0.2) {$s_T^{(2)}$};
-    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bTK) at (12.1, -0.65) {$s_T^{(K)}$};
-    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- (bT1);
-    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- (bT2);
-    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- (bTK);
-    \node[font=\scriptsize, text=termgreen!80!black] at (12.1, -0.2) {$\vdots$};
+    % K 1-step branches from s_t
+    \node[branchnode] (bt1) at (7.3, 2.15) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (btK) at (7.3, -0.15) {$s_{t+1}^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[above, sloped, font=\tiny] {1 step} (bt1);
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[below, sloped, font=\tiny] {1 step} (btK);
+    \node[font=\scriptsize, text=branchorange!90!black] at (7.3, 0.5) {$\vdots$};
 
-    % Legend callouts
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, 2.15) {$R^{(1)} \in \{0,1\}$};
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (13.7, 1.0) {$R(s_T)$};
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, -0.65) {$R^{(K)} \in \{0,1\}$};
+    % K 1-step branches from s_{T-1} (landing on terminal states)
+    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bT1) at (12.9, 2.15) {$s_T^{(1)}$};
+    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bTK) at (12.9, -0.15) {$s_T^{(K)}$};
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[above, sloped, font=\tiny] {1 step} (bT1);
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[below, sloped, font=\tiny] {1 step} (bTK);
+    \node[font=\scriptsize, text=termgreen!80!black] at (12.9, 0.5) {$\vdots$};
 \end{scope}
 
 % =============================================================================
-% PANEL 2: INITIAL BASE CASE (END OF THE DAG: t = T and t = T - 1)
+% PANEL 2: COMPUTE ALL TARGETS AT ONCE USING FIXED \phi_old
 % =============================================================================
-\begin{scope}[shift={(0, 2.5)}]
-    \draw[rounded corners=6pt, draw=termgreen!60!black, fill=boxbg, line width=0.9pt] (-0.4, -0.95) rectangle (16.4, 3.15);
-    \node[anchor=west, font=\footnotesize\bfseries, text=termgreen!70!black] at (-0.1, 2.75)
-        {Phase 2A (Initial Base Case at End of DAG, $t = T$ and $t = T-1$): Anchor Target \& Fitting};
+\begin{scope}[shift={(0, 2.0)}]
+    \draw[rounded corners=6pt, draw=batchedteal!80!black, fill=boxbg, line width=1.0pt] (-0.4, -0.95) rectangle (16.4, 3.85);
+    \node[anchor=west, font=\footnotesize\bfseries, text=batchedteal!90!black] at (-0.1, 3.45)
+        {Step 2 (Compute All Targets First): Evaluate All Steps $t \in \{0, \dots, T-1\}$ Using Fixed Critic $V_{\phi_{\text{old}}}$};
+
+    % Left: 1-Step Branched Backup Box
+    \node[draw=batchedteal!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (sync_eval) at (0.0, 1.05) {
+        \textbf{1. 1-Step Branched Backup at Every Node $s_t$:}\\[4pt]
+        Query the fixed pre-update critic $V_{\phi_{\text{old}}}$ on the $K$ 1-step children $s_{t+1}^{(1..K)}$ at every step $t$:
+        \[
+            \hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \Big(r_t^{(k)} + \gamma \, V_{\phi_{\text{old}}}\big(s_{t+1}^{(k)}\big)\Big)
+        \]
+        \[
+            \delta_t^{\text{branch}} = \hat{V}_{\text{branch}}(s_t) - V_{\phi_{\text{old}}}(s_t), \quad \forall\, t \in \{0, \dots, T-1\}
+        \]
+    };
+
+    % Right: Lambda Return Target Box
+    \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (sync_gae) at (8.4, 1.05) {
+        \textbf{2. Form Target $y_t$ for All Steps ($t = 0, \dots, T-1$):}\\[4pt]
+        Combine with downstream residuals via $\lambda \in [0, 1]$ (without changing $\phi_{\text{old}}$):
+        \[
+            \hat{A}_t^{(\lambda)} = \delta_t^{\text{branch}} + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}
+        \]
+        \[
+            y_t = V_{\phi_{\text{old}}}(s_t) + \hat{A}_t^{(\lambda)} \quad \Big(\text{for } \lambda=0:\; y_t = \hat{V}_{\text{branch}}(s_t)\Big)
+        \]
+    };
+
+    \draw[->, line width=1.3pt, batchedteal!90!black] (sync_eval.east) -- (sync_gae.west);
+\end{scope}
+
+% Connector Arrow between Step 2 and Step 3
+\draw[->, fitpurple, line width=1.5pt] (8.0, 1.05) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Collect all pairs $\mathcal{D}_{\text{all}} = \{(s_0, y_0), (s_1, y_1), \dots, (s_{T-1}, y_{T-1})\}$} (8.0, 0.25);
+
+% =============================================================================
+% PANEL 3: FIT ALL STEPS SIMULTANEOUSLY
+% =============================================================================
+\begin{scope}[shift={(0, -3.4)}]
+    \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -0.9) rectangle (16.4, 3.65);
+    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.25)
+        {Step 3 (All-at-Once Fitting): Train $V_\phi$ on All Steps $\{0, \dots, T-1\}$ Simultaneously ($E$ Passes)};
+
+    % Left: Full-Trajectory Dataset
+    \node[draw=primaryblue, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (all_buffer) at (0.0, 1.0) {
+        \textbf{1. Full-Trajectory Training Set $\mathcal{D}_{\text{all}}$:}\\[3pt]
+        \[
+            \mathcal{D}_{\text{all}} = \big\{(s_0, y_0),\; (s_1, y_1),\; \dots,\; (s_{T-1}, y_{T-1})\big\}
+        \]
+        $\bullet$ All timesteps $t \in \{0, \dots, T-1\}$ are trained together.\\[2pt]
+        $\bullet$ \textbf{Uniform weighting:} Early states ($s_0$) and late states ($s_{T-1}$) receive the exact same weight in the loss.
+    };
+
+    % Right: Simultaneous Loss Minimization
+    \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (epochs_box) at (8.4, 1.0) {
+        \textbf{2. Minimize Squared Error Over $\mathcal{D}_{\text{all}}$ ($E = 4$ Passes):}\\[3pt]
+        Update critic parameters $\phi$ by minimizing:
+        \[
+            \min_\phi \; \frac{1}{T} \sum_{t=0}^{T-1} \Big( V_\phi(s_t) - y_t \Big)^2
+        \]
+        over $E = 4$ passes through $\mathcal{D}_{\text{all}}$.
+    };
+
+    \draw[->, line width=1.3pt, fitpurple] (all_buffer.east) -- (epochs_box.west);
+\end{scope}
+
+\end{tikzpicture}%
+}
+\caption{\textbf{Algorithm 3: Batched FBI ($\text{FBI}_{\text{batched}}(\lambda)$).} \textbf{Top (Step 1):} Roll out the primary chain $\tau = (s_0, \dots, s_T)$ (blue/green circles) and fork $K$ parallel 1-step branches $s_{t+1}^{(1..K)}$ (orange/green circles) from each visited state $s_t$. \textbf{Middle (Step 2):} Using the fixed pre-update critic $V_{\phi_{\text{old}}}$, compute the targets $y_0, \dots, y_{T-1}$ for all steps first. \textbf{Bottom (Step 3):} Train $V_\phi$ on all steps $\{0, \dots, T-1\}$ simultaneously for $E=4$ passes.}
+\label{fig:batched_fbi_visual}
+\end{figure}
+
+\newpage
+\section{Visual Diagram 2: Staged FBI ($\text{FBI}_{\text{staged}}(\lambda)$)}
+
+\vspace{0.15cm}
+\begin{figure}[ht!]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+    >=Latex,
+    font=\small,
+    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.2mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
+]
+
+% =============================================================================
+% PANEL 1: THE ROLLOUT CHAIN & PARALLEL 1-STEP FORKS
+% =============================================================================
+\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.4)
+    {Step 1 (Rollout): Primary Trajectory Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches per Node};
+
+\begin{scope}[shift={(0, 6.7)}]
+    \foreach \x/\step in {0/0, 2.8/1, 5.4/t, 8.2/t+1, 10.8/T-1, 13.6/T} {
+        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.9) {Time $\step$};
+    }
+
+    % Primary Base Trajectory Chain Nodes
+    \node[chainnode] (s0) at (0, 1.0) {$s_0$};
+    \node[chainnode] (s1) at (2.8, 1.0) {$s_1$};
+    \node[chainnode] (st) at (5.4, 1.0) {$s_t$};
+    \node[chainnode] (st1) at (8.2, 1.0) {$s_{t+1}$};
+    \node[chainnode] (sTm1) at (10.8, 1.0) {$s_{T-1}$};
+    \node[termnode]  (sT) at (13.6, 1.0) {$s_T$};
+
+    % Primary Chain Edges
+    \draw[->, primaryblue, line width=1.6pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
+    \draw[->, primaryblue, line width=1.6pt, dotted] (s1) -- (st);
+    \draw[->, primaryblue, line width=1.6pt] (st) -- node[above, font=\scriptsize] {$a_t$} (st1);
+    \draw[->, primaryblue, line width=1.6pt, dotted] (st1) -- (sTm1);
+    \draw[->, primaryblue, line width=1.6pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
+
+    % K 1-step branches at s_0
+    \node[branchnode] (b01) at (1.4, 2.15) {$s_1^{(1)}$};
+    \node[branchnode] (b0K) at (1.4, -0.15) {$s_1^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[above, sloped, font=\tiny] {1 step} (b01);
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[below, sloped, font=\tiny] {1 step} (b0K);
+    \node[font=\scriptsize, text=branchorange!90!black] at (1.4, 0.5) {$\vdots$};
+
+    % K 1-step branches at intermediary node s_t
+    \node[branchnode] (bt1) at (6.8, 2.15) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (btK) at (6.8, -0.15) {$s_{t+1}^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[above, sloped, font=\tiny] {1 step} (bt1);
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[below, sloped, font=\tiny] {1 step} (btK);
+    \node[font=\scriptsize, text=branchorange!90!black] at (6.8, 0.5) {$\vdots$};
+
+    % K 1-step branches at penultimate node s_{T-1} (landing on terminal leaves!)
+    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bT1) at (12.2, 2.15) {$s_T^{(1)}$};
+    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bTK) at (12.2, -0.15) {$s_T^{(K)}$};
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[above, sloped, font=\tiny] {1 step} (bT1);
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[below, sloped, font=\tiny] {1 step} (bTK);
+    \node[font=\scriptsize, text=termgreen!80!black] at (12.2, 0.5) {$\vdots$};
+
+    % Terminal reward labels
+    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, 2.15) {$R(s_T^{(1)}) \in \{0,1\}$};
+    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (14.1, 1.0) {$R(s_T) \in \{0,1\}$};
+    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, -0.15) {$R(s_T^{(K)}) \in \{0,1\}$};
+\end{scope}
+
+% =============================================================================
+% PANEL 2: INITIAL BASE CASE (END OF THE CHAIN: t = T - 1)
+% =============================================================================
+\begin{scope}[shift={(0, 2.3)}]
+    \draw[rounded corners=6pt, draw=termgreen!60!black, fill=boxbg, line width=0.9pt] (-0.4, -1.05) rectangle (16.4, 3.25);
+    \node[anchor=west, font=\footnotesize\bfseries, text=termgreen!70!black] at (-0.1, 2.85)
+        {Step 2A (Base Case at End of Chain, $t = T-1$): Exact Terminal Targets \& First Fitting Stage};
 
     % Mini diagram of s_{T-1} -> leaves
     \node[chainnode] (init_sTm1) at (0.8, 0.75) {$s_{T-1}$};
@@ -251,68 +410,68 @@ In \texttt{run\_benchmark.py} (used for rapid multi-seed sweeps on the 24--32 st
     % Target box
     \node[draw=termgreen!80!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (anchor_eq) at (5.6, 0.75) {
         \textbf{1. Exact Terminal Targets:}\\[3pt]
+        No critic bootstrap needed at the end:\\[2pt]
+        $\bullet\; y_{T-1} = \frac{1}{K}\sum_{k=1}^K R\big(s_T^{(k)}\big)$\\[2pt]
         $\bullet\; y_T = R(s_T)$\\[2pt]
-        $\bullet\; y_{T-1} = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$\\[2pt]
-        $\bullet\;\mathcal{D}_{\text{fit}} \leftarrow \{s_T, s_{T-1}, s_T^{(1..K)}\}$
+        $\bullet\; \mathcal{D}_{T-1} = \big\{(s_\tau, y_\tau)\big\}_{\tau=T-1}^{T}$
     };
 
     % Fitting rounds box
     \node[draw=fitpurple, fill=fitpurple!10, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.4cm, font=\scriptsize] (fit_init) at (11.3, 0.75) {
-        \textbf{2. Fit Critic ($M = 4$ rounds):}\\[3pt]
-        Run \texttt{stage\_steps = 4} gradient updates on $\mathcal{D}_{\text{fit}}$:\\[3pt]
-        $\min_\phi \sum_{(s,y)\in \mathcal{D}_{\text{fit}}} \big(V_\phi(s) - y\big)^2$
+        \textbf{2. Fit Critic ($M = 4$ Grad Steps):}\\[3pt]
+        Minimize squared error on $\mathcal{D}_{T-1}$ to obtain updated weights $\phi^{(T-1)}$:\\[4pt]
+        $\phi^{(T-1)} \leftarrow \min_\phi \sum_{\tau=T-1}^{T} \big(V_\phi(s_\tau) - y_\tau\big)^2$
     };
 
     \draw[->, thick, termgreen!80!black] (5.0, 0.75) -- (anchor_eq.west);
     \draw[->, thick, fitpurple] (anchor_eq.east) -- (fit_init.west);
 \end{scope}
 
-% Backward Loop Connector Arrow between Phase 2A and Phase 2B
-\draw[->, fitpurple, line width=1.5pt] (8.0, 1.55) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Pass updated $V_\phi$ backward to $t = T-2, \dots, 0$} (8.0, 0.75);
+% Backward Loop Connector Arrow between Step 2A and Step 2B
+\draw[->, fitpurple, line width=1.5pt] (8.0, 1.25) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Pass calibrated critic $V_{\phi^{(T-1)}}$ backward to $t = T-2, \dots, 0$} (8.0, 0.45);
 
 % =============================================================================
 % PANEL 3: THE INDUCTIVE LOOP AT INTERMEDIARY NODE s_t (REPEATED FOR t = T-2 .. 0)
 % =============================================================================
-\begin{scope}[shift={(0, -3.4)}]
+\begin{scope}[shift={(0, -3.7)}]
     \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -1.25) rectangle (16.4, 4.15);
-    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.8)
-        {Phase 2B (Backward Induction Loop, $t = T-2 \text{ down to } 0$): Query $V_\phi$, Append to Buffer, \& Fit};
+    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.75)
+        {Step 2B (Backward Induction Loop, $t = T-2 \to 0$): Query $V_{\phi^{(t+1)}}$, Expand Set $\mathcal{D}_t$, \& Fit $\phi^{(t)}$};
 
     % Left: Intermediary node s_t and its K parallel 1-step children
     \node[chainnode] (loop_st) at (0.7, 1.2) {$s_t$};
-    \node[branchnode] (loop_b1) at (2.5, 2.3) {$s_{t+1}^{(1)}$};
-    \node[branchnode] (loop_b2) at (2.5, 1.2) {$s_{t+1}^{(2)}$};
-    \node[branchnode] (loop_bK) at (2.5, 0.0) {$s_{t+1}^{(K)}$};
-    \node[font=\scriptsize, text=branchorange!90!black] at (2.5, 0.65) {$\vdots$};
+    \node[branchnode] (loop_b1) at (2.4, 2.3) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (loop_b2) at (2.4, 1.2) {$s_{t+1}^{(2)}$};
+    \node[branchnode] (loop_bK) at (2.4, 0.0) {$s_{t+1}^{(K)}$};
+    \node[font=\scriptsize, text=branchorange!90!black] at (2.4, 0.65) {$\vdots$};
 
     \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_b1);
     \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_b2);
     \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_bK);
 
-    % Critic evaluation callouts on the K children
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v1) at (3.0, 2.3) {$\text{sg}\!\left(V_\phi(s_{t+1}^{(1)})\right)$};
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v2) at (3.0, 1.2) {$\text{sg}\!\left(V_\phi(s_{t+1}^{(2)})\right)$};
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (vK) at (3.0, 0.0) {$\text{sg}\!\left(V_\phi(s_{t+1}^{(K)})\right)$};
+    % Critic evaluation callouts on the K children using \phi^{(t+1)}
+    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v1) at (2.85, 2.3) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(1)}\big)$};
+    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v2) at (2.85, 1.2) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(2)}\big)$};
+    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (vK) at (2.85, 0.0) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(K)}\big)$};
 
     % Center: Target construction at node s_t
     \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (ind_target) at (5.6, 1.2) {
-        \textbf{1. Compute Target at Node $s_t$:}\\[2pt]
-        $\hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \text{sg}\!\left(V_\phi(s_{t+1}^{(k)})\right)$\\[3pt]
-        \textbf{Blend via $\lambda \in [0, 1]$:}\\[1pt]
-        $y_t^{(\lambda)} = \hat{V}_{\text{branch}}(s_t) + \gamma\lambda \hat{A}_{t+1}^{(\lambda)}$\\[3pt]
-        \textbf{Cumulative Replay Buffer:}\\[1pt]
-        $\mathcal{D}_{\text{fit}} \leftarrow \mathcal{D}_{\text{fit}} \cup \big\{(s_t, y_t^{(\lambda)})\big\}$\\[1pt]
-        {\tiny (Retains $\{s_t, s_{t+1}, \dots, s_T\}$ so deep levels aren't forgotten!)}
+        \textbf{1. Target at $s_t$ Using $\phi^{(t+1)}$:}\\[2pt]
+        $\hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \Big(r_t^{(k)} + \gamma V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big)\Big)$\\[3pt]
+        $y_t = \hat{V}_{\text{branch}}(s_t) + \gamma\lambda \hat{A}_{t+1}^{(\lambda)}$\\[4pt]
+        \textbf{2. Add to Resolved Set $\mathcal{D}_t$:}\\[2pt]
+        $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \big\{(s_t, y_t)\big\} = \big\{(s_\tau, y_\tau)\big\}_{\tau=t}^{T}$\\[1pt]
+        {\tiny (Keeps resolved steps $[t \dots T]$ so deep steps aren't forgotten)}
     };
 
     \draw[->, thick, branchorange!90!black] (5.05, 1.2) -- (ind_target.west);
 
     % Right: M Fitting Rounds + Loop back arrow
     \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.4cm, font=\scriptsize] (fit_loop) at (11.3, 1.2) {
-        \textbf{2. Fit Critic ($M = 4$ rounds):}\\[3pt]
-        Update $V_\phi$ for \texttt{stage\_steps = 4} gradient steps on cumulative $\mathcal{D}_{\text{fit}}$:\\[4pt]
-        \texttt{[Grad 1]} $\to$ \texttt{[Grad 2]} $\to \cdots \to$ \texttt{[Grad 4]}\\[4pt]
-        Now $V_\phi(s_t)$ is calibrated \emph{before} upstream state $s_{t-1}$ queries it!
+        \textbf{3. Fit Critic ($M = 4$ Grad Steps):}\\[3pt]
+        Take $M = 4$ gradient steps on the cumulative loss over $\mathcal{D}_t = [t \dots T]$:\\[4pt]
+        $\phi^{(t)} \leftarrow \min_\phi \frac{1}{|\mathcal{D}_t|} \sum_{\tau=t}^{T} \big(V_\phi(s_\tau) - y_\tau\big)^2$\\[4pt]
+        Now $V_{\phi^{(t)}}(s_t)$ is calibrated \emph{before} step $t-1$ queries it!
     };
 
     \draw[->, thick, fitpurple] (ind_target.east) -- (fit_loop.west);
@@ -320,13 +479,13 @@ In \texttt{run\_benchmark.py} (used for rapid multi-seed sweeps on the 24--32 st
     % Loop back arrow showing decrement t <- t - 1
     \draw[->, fitpurple!90!black, line width=1.3pt, dashed]
         (fit_loop.south) -- ++(0, -0.75) -| node[pos=0.25, below, font=\scriptsize\bfseries, fill=boxbg, inner sep=1.5pt]
-        {Next backward step: $t \leftarrow t - 1$ (repeat until root $t = 0$ is fitted)} (loop_st.south);
+        {Next backward stage: $t \leftarrow t - 1$ (repeat until root $t = 0$ is fitted)} (loop_st.south);
 \end{scope}
 
 \end{tikzpicture}%
 }
-\caption{\textbf{How 1-Step Fitted Backward Induction ($\text{FBI}(\lambda)$) Solves the DAG Value Problem.} \textbf{Top (Phase 1):} A primary trajectory $\tau = (s_0 \dots s_T)$ is rolled out as a chain, and at every visited state $s_t$, $K$ parallel 1-step rollouts $s_{t+1}^{(1..K)}$ are sampled. \textbf{Middle (Phase 2A):} Learning begins at the end of the DAG ($t=T$ and $t=T-1$), where the 1-step branches land on terminal leaves with exact rewards $R^{(1..K)}$, and the critic $V_\phi$ is fitted for $M=4$ gradient rounds. \textbf{Bottom (Phase 2B):} Sweeping backward from $t = T-2$ down to $0$, the intermediary node $s_t$ queries the \emph{just-updated} critic $V_\phi$ on its $K$ parallel 1-step children, appends $(s_t, y_t^{(\lambda)})$ to the cumulative replay buffer $\mathcal{D}_{\text{fit}}$ (retaining $t' \ge t$), and runs $M=4$ fitting rounds before stepping backward to $t-1$.}
-\label{fig:fbi_dag_visual}
+\caption{\textbf{Algorithm 4: Staged FBI ($\text{FBI}_{\text{staged}}(\lambda)$).} \textbf{Top (Step 1):} Roll out the primary chain $\tau = (s_0, \dots, s_T)$ and fork $K$ parallel 1-step branches $s_{t+1}^{(1..K)}$ from each visited state $s_t$. \textbf{Middle (Step 2A):} At the end of the chain ($t=T-1$), the $K$ 1-step branches land on terminal states $s_T^{(1..K)}$ with exact rewards $R(s_T^{(k)})$, and the critic is trained for $M=4$ gradient steps to obtain $\phi^{(T-1)}$. \textbf{Bottom (Step 2B):} Sweeping backward for $t = T-2$ down to $0$, step $t$ queries the \emph{just-updated} critic $V_{\phi^{(t+1)}}$ on its $K$ 1-step children, adds $(s_t, y_t)$ to the resolved set $\mathcal{D}_t = \{(s_\tau, y_\tau)\}_{\tau=t}^T$, and takes $M=4$ gradient steps to produce $\phi^{(t)}$ before stepping backward to $t-1$.}
+\label{fig:staged_fbi_visual}
 \end{figure}
 
 \end{document}
