@@ -57,9 +57,9 @@ fi
 
 # Environment Configuration (Accept positional CLI arguments or environment variables)
 ENV_TYPE="${1:-${ENV_TYPE:-single_dag}}"
-TOTAL_TRANSITIONS="${2:-${TOTAL_TRANSITIONS:-250000}}"
+TOTAL_TRANSITIONS="${2:-${TOTAL_TRANSITIONS:-1000000}}"
 N_SEEDS="${3:-${N_SEEDS:-5}}"
-ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0}}"
+ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0, fbi_staged_lam0.5}}"
 OUT_DIR="${5:-${OUT_DIR:-results}}"
 SWEEP_ID="${6:-${SWEEP_ID:-}}"
 MASTER_SEED="${7:-${MASTER_SEED:-42}}"
@@ -69,7 +69,7 @@ NUM_PROBLEMS="${NUM_PROBLEMS:-10}"
 NUM_MILESTONES="${NUM_MILESTONES:-6}"
 MAX_STEPS="${MAX_STEPS:-24}"
 NUM_ACTIONS="${NUM_ACTIONS:-8}"
-DIFFICULTY="${DIFFICULTY:-0.25}"
+DIFFICULTY="${DIFFICULTY:-0.2}"
 
 # Large Tree MRP Hyperparameters
 DEPTH="${DEPTH:-12}"
