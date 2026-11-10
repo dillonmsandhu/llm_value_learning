@@ -217,7 +217,9 @@ class ReasoningDAGEnv:
         num_actions: int = 8,
         difficulties: Any = None,
         seed: int = 42,
+        eval_seed: int = 12345,
     ):
+        self.eval_seed = int(eval_seed)
         self.evaluator = ReasoningDAGExactValue(
             num_problems=num_problems,
             num_milestones=num_milestones,

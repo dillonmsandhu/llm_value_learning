@@ -792,7 +792,7 @@ def run_benchmark(
             seed=master_seed,
         )
         samples_per_p = max(8, 256 // num_probs)
-        eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
+        eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=env.eval_seed)
         num_steps = env.max_steps
     else:
         # Procedural Tree Family
@@ -818,7 +818,7 @@ def run_benchmark(
             seed=master_seed,
         )
         samples_per_p = max(8, 256 // num_probs)
-        eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
+        eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=env.eval_seed)
         num_steps = env.max_depth
 
     # Measure empirical active trunk length per trajectory to calibrate buffer replay ratio (~epochs_per_update)

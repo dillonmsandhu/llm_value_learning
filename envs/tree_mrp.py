@@ -431,7 +431,9 @@ class ProceduralTreeExactValue:
         f_max: float = 0.50,
         gamma: float = 1.0,
         seed: int = 42,
+        eval_seed: int = 12345,
     ):
+        self.eval_seed = int(eval_seed)
         self.num_problems = int(num_problems)
         self.gamma = float(gamma)
         self.p_min = float(p_min)
@@ -587,7 +589,9 @@ class ProceduralTreeEnv:
         f_max: float = 0.50,
         gamma: float = 1.0,
         seed: int = 42,
+        eval_seed: int = 12345,
     ):
+        self.eval_seed = int(eval_seed)
         self.evaluator = ProceduralTreeExactValue(
             num_problems=num_problems,
             depth=depth,
