@@ -332,9 +332,12 @@ def make_train_loop(
     num_envs = int(cfg.get("NUM_ENVS", 64))
     num_steps = int(cfg.get("NUM_STEPS", 24))
     num_updates = int(cfg.get("NUM_UPDATES", 100))
-    num_epochs = int(cfg.get("NUM_EPOCHS", 4))
+    grad_steps_per_update = int(cfg.get("GRAD_STEPS_PER_UPDATE", num_steps))
     minibatch_size = int(cfg.get("MINIBATCH_SIZE", 64))
-    lr = float(cfg.get("LR", 1e-3))
+    lr = float(cfg.get("LR", 5e-4))
+    weight_decay = float(cfg.get("WEIGHT_DECAY", 1e-4))
+    warmup_ratio = float(cfg.get("WARMUP_RATIO", 0.10))
+    max_grad_norm = float(cfg.get("MAX_GRAD_NORM", 1.0))
 
     # Parse algo parameters
     is_mc = (algo == "mc")
@@ -344,7 +347,8 @@ def make_train_loop(
     is_fbi = is_fbi_staged or is_fbi_batched
     k_branches = 4
     lmbda = 0.0
-    stage_steps = int(cfg.get("STAGE_STEPS", 4))
+    # For staged FBI: distribute grad steps across reverse levels
+    stage_steps = max(1, grad_steps_per_update // num_steps)
 
     if is_vine:
         k_branches = int(algo.split("_k")[1])
@@ -368,7 +372,22 @@ def make_train_loop(
         add_bos=add_bos,
     )
 
-    optimizer = optax.adamw(learning_rate=lr, weight_decay=cfg.get("WEIGHT_DECAY", 0.01))
+    # RLVR Best Practice Optimizer: Warmup-Cosine Schedule + Gradient Clipping + Calibrated Weight Decay
+    total_grad_steps = num_updates * grad_steps_per_update
+    warmup_steps = max(1, int(warmup_ratio * total_grad_steps))
+
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,
+        peak_value=lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_grad_steps,
+        end_value=0.05 * lr,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
+    )
 
     # Snapshots indices
     u_snap_1 = max(1, int(round(0.2 * num_updates)))
@@ -604,29 +623,23 @@ def make_train_loop(
                 obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
                 targets_flat = targets.reshape(-1)
                 total_samples = obs_flat.shape[0]
-                n_minibatches = total_samples // minibatch_size
 
-                def _update_epoch(carry, _):
+                def _step_mb(carry, _):
                     ts, k = carry
-                    k, shuff_k = jax.random.split(k)
-                    perm = jax.random.permutation(shuff_k, total_samples)
-                    shuff_obs = obs_flat[perm].reshape(n_minibatches, minibatch_size, *obs_flat.shape[1:])
-                    shuff_targets = targets_flat[perm].reshape(n_minibatches, minibatch_size)
+                    k, mb_k = jax.random.split(k)
+                    mb_idx = jax.random.randint(mb_k, (minibatch_size,), minval=0, maxval=total_samples)
+                    m_obs = obs_flat[mb_idx]
+                    m_targ = targets_flat[mb_idx]
 
-                    def _step_mb(t_state, mb):
-                        m_obs, m_targ = mb
-                        def _loss(p):
-                            preds = network.apply(p, m_obs, method=network.value)
-                            return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+                    def _loss(p):
+                        preds = network.apply(p, m_obs, method=network.value)
+                        return 0.5 * jnp.mean(jnp.square(preds - m_targ))
 
-                        loss, grads = jax.value_and_grad(_loss)(t_state.params)
-                        t_state = t_state.apply_gradients(grads=grads)
-                        return t_state, loss
+                    loss, grads = jax.value_and_grad(_loss)(ts.params)
+                    ts = ts.apply_gradients(grads=grads)
+                    return (ts, k), loss
 
-                    ts, _ = jax.lax.scan(_step_mb, ts, (shuff_obs, shuff_targets))
-                    return (ts, k), None
-
-                (train_state, rng), _ = jax.lax.scan(_update_epoch, (train_state, rng), None, length=num_epochs)
+                (train_state, rng), _ = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
 
             # --- D. Evaluation across Fixed Eval Set ---
             msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
@@ -675,9 +688,17 @@ def run_benchmark(
     save_dir: str = "results/benchmark",
     dag_params: Dict[str, Any] = None,
     tree_params: Dict[str, Any] = None,
+    num_updates: int = 100,
+    grad_steps_per_update: int = None,
+    lr: float = 5e-4,
+    weight_decay: float = 1e-4,
+    warmup_ratio: float = 0.10,
+    max_grad_norm: float = 1.0,
+    minibatch_size: int = 64,
 ):
     """
     Executes the comprehensive Value Learning & Advantage Alignment benchmark suite.
+    Enforces identical transitions per update and identical gradient steps across all algorithms.
     """
     os.makedirs(save_dir, exist_ok=True)
     algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.5"]
@@ -745,7 +766,10 @@ def run_benchmark(
         eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
         num_steps = env.max_depth
 
-    num_envs = 64
+    target_num_updates = int(num_updates)
+    actual_grad_steps = int(grad_steps_per_update) if grad_steps_per_update is not None else num_steps
+    target_trans_per_update = max(1000, total_transitions_budget // target_num_updates)
+
     results: Dict[str, Any] = {
         "env_type": env_type,
         "env_title": env_title,
@@ -770,35 +794,39 @@ def run_benchmark(
     for algo in algos:
         display_name = ALGO_NAMES.get(algo, algo)
 
-        # Compute exact transition sample cost per update
+        # Compute exact transition sample cost per environment
         if algo == "mc":
-            trans_per_update = num_envs * num_steps
+            algo_trans_per_env = num_steps
         elif algo.startswith("vine"):
             k = int(algo.split("_k")[1])
-            # Primary + sum_{t=0}^{T-1} k * (T - t)
             fork_trans = sum(k * (num_steps - t) for t in range(num_steps))
-            trans_per_update = num_envs * (num_steps + fork_trans)
+            algo_trans_per_env = num_steps + fork_trans
         elif algo.startswith("fbi"):
             k = 4
-            # Primary + 1-step branching (num_steps * k)
-            trans_per_update = num_envs * num_steps * (1 + k)
+            algo_trans_per_env = num_steps * (1 + k)
         else:
-            trans_per_update = num_envs * num_steps
+            algo_trans_per_env = num_steps
 
-        num_updates = max(10, total_transitions_budget // trans_per_update)
-        actual_total_transitions = num_updates * trans_per_update
+        # Dynamically scale parallel environments so ALL algorithms consume the same transitions per update
+        algo_num_envs = max(1, target_trans_per_update // algo_trans_per_env)
+        trans_per_update = algo_num_envs * algo_trans_per_env
+        actual_total_transitions = target_num_updates * trans_per_update
 
         print(f"\n--- Running: {display_name} ---", flush=True)
-        print(f"  Transitions per update: {trans_per_update} | Updates: {num_updates} | Total transitions: {actual_total_transitions:,}", flush=True)
+        print(f"  Transitions per update: {trans_per_update:,} (envs: {algo_num_envs}) | Updates: {target_num_updates} | Total transitions: {actual_total_transitions:,}", flush=True)
+        print(f"  Gradient steps per update: {actual_grad_steps} | Total grad steps: {target_num_updates * actual_grad_steps:,} | Trans/GradStep: {trans_per_update / actual_grad_steps:.1f}", flush=True)
 
         cfg = {
             "GAMMA": 1.0,
-            "NUM_ENVS": num_envs,
+            "NUM_ENVS": algo_num_envs,
             "NUM_STEPS": num_steps,
-            "NUM_UPDATES": num_updates,
-            "NUM_EPOCHS": 4,
-            "MINIBATCH_SIZE": 64,
-            "LR": 1e-3,
+            "NUM_UPDATES": target_num_updates,
+            "GRAD_STEPS_PER_UPDATE": actual_grad_steps,
+            "MINIBATCH_SIZE": minibatch_size,
+            "LR": lr,
+            "WEIGHT_DECAY": weight_decay,
+            "WARMUP_RATIO": warmup_ratio,
+            "MAX_GRAD_NORM": max_grad_norm,
             "D_MODEL": 64,
             "N_HEADS": 4,
             "N_LAYERS": 2,
@@ -818,7 +846,7 @@ def run_benchmark(
         # Block device execution
         _ = jax.block_until_ready(out["metrics"]["msve"])
         elapsed = time.perf_counter() - t0
-        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / num_updates:.4f} s/update).", flush=True)
+        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / target_num_updates:.4f} s/update).", flush=True)
 
         msve_arr = np.asarray(out["metrics"]["msve"]) # shape: (n_seeds, num_updates)
         adv_cos_arr = np.asarray(out["metrics"]["advantage_cosine_sim"])
@@ -831,10 +859,10 @@ def run_benchmark(
         final_msve_p = msve_p_arr[:, -1, :]                              # (n_seeds, P)
         final_adv_p = adv_p_arr[:, -1, :]                                # (n_seeds, P)
 
-        x_updates = np.arange(1, num_updates + 1)
+        x_updates = np.arange(1, target_num_updates + 1)
         x_samples = x_updates * trans_per_update
         # Linear wall-clock interpolation per update
-        x_wallclock = np.linspace(elapsed / num_updates, elapsed, num_updates)
+        x_wallclock = np.linspace(elapsed / target_num_updates, elapsed, target_num_updates)
 
         results["methods"][display_name] = {
             "x_updates": x_updates,
@@ -889,6 +917,15 @@ def main():
     parser.add_argument("--p_correct", type=float, default=None, help="Tree: Base policy transition probability (default: derived from difficulty theta)")
     parser.add_argument("--percent_correct", type=float, default=None, help="Tree: Percentage of correct leaves (default: derived from difficulty theta)")
 
+    # RLVR Training & Fair Comparison params
+    parser.add_argument("--num_updates", type=int, default=100, help="Number of updates / gradient batches (default: 100)")
+    parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Number of gradient steps per update (default: num_steps)")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for warmup-cosine schedule (default: 5e-4)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay (default: 1e-4)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.10, help="Warmup fraction of total gradient steps (default: 0.10)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm clipping (default: 1.0)")
+    parser.add_argument("--minibatch_size", type=int, default=64, help="Minibatch size for gradient steps (default: 64)")
+
     args = parser.parse_args()
 
     sweep_id = args.sweep_id or os.environ.get("SLURM_ARRAY_JOB_ID") or datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -926,6 +963,13 @@ def main():
         save_dir=save_dir,
         dag_params=dag_params,
         tree_params=tree_params,
+        num_updates=args.num_updates,
+        grad_steps_per_update=args.grad_steps_per_update,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        max_grad_norm=args.max_grad_norm,
+        minibatch_size=args.minibatch_size,
     )
 
 

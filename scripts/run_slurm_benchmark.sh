@@ -76,6 +76,12 @@ DEPTH="${DEPTH:-7}"
 P_CORRECT="${P_CORRECT:-}"
 PERCENT_CORRECT="${PERCENT_CORRECT:-}"
 
+# RLVR Optimizer & Schedule Parameters
+NUM_UPDATES="${NUM_UPDATES:-100}"
+GRAD_STEPS_PER_UPDATE="${GRAD_STEPS_PER_UPDATE:-}"
+LR="${LR:-5e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+
 # Sweep / Run ID
 SWEEP_ID="${SWEEP_ID:-${SLURM_ARRAY_JOB_ID:+bench_${SLURM_ARRAY_JOB_ID}}}"
 SWEEP_ID="${SWEEP_ID:-bench_${SLURM_JOB_ID:-$(date +"%Y%m%d_%H%M%S")}}"
@@ -109,7 +115,11 @@ $PYTHON run_benchmark.py \
     --difficulty "$DIFFICULTY" \
     --depth "$DEPTH" \
     ${P_CORRECT:+--p_correct "$P_CORRECT"} \
-    ${PERCENT_CORRECT:+--percent_correct "$PERCENT_CORRECT"}
+    ${PERCENT_CORRECT:+--percent_correct "$PERCENT_CORRECT"} \
+    ${NUM_UPDATES:+--num_updates "$NUM_UPDATES"} \
+    ${GRAD_STEPS_PER_UPDATE:+--grad_steps_per_update "$GRAD_STEPS_PER_UPDATE"} \
+    ${LR:+--lr "$LR"} \
+    ${WEIGHT_DECAY:+--weight_decay "$WEIGHT_DECAY"}
 
 STATUS=$?
 if [ $STATUS -eq 0 ]; then
