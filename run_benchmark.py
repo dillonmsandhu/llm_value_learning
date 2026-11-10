@@ -190,11 +190,11 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
             step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
             next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
             v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
-            return next_o, r, v_next
+            return next_o, r, v_next, d
 
         all_acts = jnp.arange(env.num_actions)
-        next_obs_all, r_all, v_next_all = jax.vmap(_action_target)(all_acts)
-        true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]
+        next_obs_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
+        true_adv = r_all + env.evaluator.gamma * (1.0 - d_all.astype(jnp.float32)) * v_next_all - exact_v[None, :]
 
         all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
 
@@ -206,6 +206,7 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
             "next_obs_all": next_obs_all,
             "all_eval_tokens": all_eval_tokens,
             "r_all": r_all,
+            "d_all": d_all,
             "num_actions": env.num_actions,
             "prompts": flat_prompt,
             "num_problems": P,
@@ -653,7 +654,7 @@ def make_train_loop(
                 (train_state, rng), _ = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
 
             # --- D. Evaluation across Fixed Eval Set ---
-            if is_dag:
+            if "all_eval_tokens" in eval_set:
                 msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
             else:
                 msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_tree_metrics(network, train_state.params, eval_set)

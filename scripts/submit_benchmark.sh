@@ -93,7 +93,7 @@ SBATCH_POST_CMD="sbatch --parsable \
     --partition=compsci \
     --cpus-per-task=4 \
     --mem=16G \
-    --dependency=afterany:$JOB_ID \
+    --dependency=afterok:$JOB_ID \
     --wrap=\"$PYTHON $POST_SCRIPT --data_path '$TARGET_DIR/benchmark_results.pkl' --save_dir '$TARGET_DIR'\""
 
 POST_JOB_ID=$(eval "$SBATCH_POST_CMD")
