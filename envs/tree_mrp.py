@@ -425,14 +425,19 @@ class ProceduralTreeExactValue:
         difficulties: Any = "spectrum",
         p_correct: float | None = None,
         percent_correct: float | None = None,
-        p_min: float = 0.55,
-        p_max: float = 0.90,
-        f_max: float = 0.35,
+        p_min: float = 0.70,
+        p_max: float = 0.95,
+        f_min: float = 0.15,
+        f_max: float = 0.50,
         gamma: float = 1.0,
         seed: int = 42,
     ):
         self.num_problems = int(num_problems)
         self.gamma = float(gamma)
+        self.p_min = float(p_min)
+        self.p_max = float(p_max)
+        self.f_min = float(f_min)
+        self.f_max = float(f_max)
 
         # 1. Unified Difficulty Spectrum: theta in [0, 1]
         if difficulties is None:
@@ -484,8 +489,8 @@ class ProceduralTreeExactValue:
             if percent_correct is not None:
                 nc = max(1, int(round(n_leaves_p * float(percent_correct))))
             else:
-                f_min_p = 1.0 / n_leaves_p
-                f_p = float(f_max) * ((f_min_p / float(f_max)) ** th)
+                f_min_val = max(1.0 / n_leaves_p, float(self.f_min))
+                f_p = float(self.f_max) * ((f_min_val / float(self.f_max)) ** th)
                 nc = max(1, int(round(n_leaves_p * f_p)))
 
             n_correct_list.append(nc)
@@ -576,9 +581,10 @@ class ProceduralTreeEnv:
         difficulties: Any = "spectrum",
         p_correct: float | None = None,
         percent_correct: float | None = None,
-        p_min: float = 0.55,
-        p_max: float = 0.90,
-        f_max: float = 0.35,
+        p_min: float = 0.70,
+        p_max: float = 0.95,
+        f_min: float = 0.15,
+        f_max: float = 0.50,
         gamma: float = 1.0,
         seed: int = 42,
     ):
@@ -591,6 +597,7 @@ class ProceduralTreeEnv:
             percent_correct=percent_correct,
             p_min=p_min,
             p_max=p_max,
+            f_min=f_min,
             f_max=f_max,
             gamma=gamma,
             seed=seed,
