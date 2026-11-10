@@ -372,7 +372,7 @@ class ReasoningDAGEnv:
         # 3. Horizon termination fallback (reached max_steps without EOS):
         max_step_done = (step_count >= self.max_steps)
         max_step_success = (step_milestone >= self.required_milestones[state.prompt_idx]) & (step_derailed == 0)
-        max_step_reward = jnp.where(max_step_success, 1.0, 0.0)
+        max_step_reward = jnp.where(max_step_done & max_step_success, 1.0, 0.0)
 
         # Overall termination and reward:
         new_done = is_eos | max_step_done | state.done

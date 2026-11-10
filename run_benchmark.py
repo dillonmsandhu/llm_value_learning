@@ -37,9 +37,10 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
     """
     Constructs a balanced evaluation dataset for ReasoningDAGEnv covering
     each problem index (difficulty tier) equally, spanning steps, milestones, and derailment conditions.
+    Filters out dummy post-termination states.
     """
     P = env.num_problems
-    num_rollouts = max(4, samples_per_problem // env.max_steps + 1)
+    num_rollouts = max(16, (samples_per_problem // 6) + 4)
 
     all_prompts, all_m, all_d, all_steps, all_hist, all_done = [], [], [], [], [], []
 
@@ -61,19 +62,23 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
             p_states.append(next_state)
             curr_state = next_state
 
-        flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)[:samples_per_problem]
-        flat_p_m = jnp.concatenate([st.milestone for st in p_states], axis=0)[:samples_per_problem]
-        flat_p_d = jnp.concatenate([st.is_derailed for st in p_states], axis=0)[:samples_per_problem]
-        flat_p_s = jnp.concatenate([st.step_count for st in p_states], axis=0)[:samples_per_problem]
-        flat_p_h = jnp.concatenate([st.history_tokens for st in p_states], axis=0)[:samples_per_problem]
-        flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)[:samples_per_problem]
+        flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)
+        flat_p_m = jnp.concatenate([st.milestone for st in p_states], axis=0)
+        flat_p_d = jnp.concatenate([st.is_derailed for st in p_states], axis=0)
+        flat_p_s = jnp.concatenate([st.step_count for st in p_states], axis=0)
+        flat_p_h = jnp.concatenate([st.history_tokens for st in p_states], axis=0)
+        flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)
 
-        all_prompts.append(flat_p_prompt)
-        all_m.append(flat_p_m)
-        all_d.append(flat_p_d)
-        all_steps.append(flat_p_s)
-        all_hist.append(flat_p_h)
-        all_done.append(flat_p_done)
+        # Strictly select active (non-done) states
+        active_idx = jnp.where(~flat_p_done)[0]
+        sel_idx = active_idx[:samples_per_problem]
+
+        all_prompts.append(flat_p_prompt[sel_idx])
+        all_m.append(flat_p_m[sel_idx])
+        all_d.append(flat_p_d[sel_idx])
+        all_steps.append(flat_p_s[sel_idx])
+        all_hist.append(flat_p_h[sel_idx])
+        all_done.append(flat_p_done[sel_idx])
 
     flat_prompt = jnp.concatenate(all_prompts, axis=0)
     flat_milestone = jnp.concatenate(all_m, axis=0)
@@ -597,10 +602,12 @@ def make_train_loop(
                         mb_envs = jax.random.randint(k_env, (minibatch_size,), minval=0, maxval=num_envs)
                         m_obs = traj_batch.obs[mb_levels, mb_envs]
                         m_targ = curr_targets[mb_levels, mb_envs]
+                        m_mask = (~visited_states.done)[mb_levels, mb_envs].astype(jnp.float32)
 
                         def _loss(p):
                             preds = network.apply(p, m_obs, method=network.value)
-                            return 0.5 * jnp.mean(jnp.square(preds - m_targ))
+                            sq_err = jnp.square(preds - m_targ)
+                            return 0.5 * jnp.sum(sq_err * m_mask) / jnp.maximum(1.0, jnp.sum(m_mask))
 
                         loss_val, grads = jax.value_and_grad(_loss)(ts_inner.params)
                         ts_inner = ts_inner.apply_gradients(grads=grads)
@@ -618,18 +625,22 @@ def make_train_loop(
                     rev_levels,
                 )
 
-            # --- C. Critic Network Update (MSE Loss for non-staged methods) ---
+            # --- C. Critic Network Update (MSE Loss for non-staged methods on active states) ---
             if not is_fbi_staged:
                 obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
                 targets_flat = targets.reshape(-1)
-                total_samples = obs_flat.shape[0]
+                active_mask_flat = (~visited_states.done).reshape(-1)
+                num_active = jnp.sum(active_mask_flat)
+                active_order = jnp.argsort(~active_mask_flat)
+                obs_active = obs_flat[active_order]
+                targets_active = targets_flat[active_order]
 
                 def _step_mb(carry, _):
                     ts, k = carry
                     k, mb_k = jax.random.split(k)
-                    mb_idx = jax.random.randint(mb_k, (minibatch_size,), minval=0, maxval=total_samples)
-                    m_obs = obs_flat[mb_idx]
-                    m_targ = targets_flat[mb_idx]
+                    mb_idx = jax.random.randint(mb_k, (minibatch_size,), minval=0, maxval=jnp.maximum(1, num_active))
+                    m_obs = obs_active[mb_idx]
+                    m_targ = targets_active[mb_idx]
 
                     def _loss(p):
                         preds = network.apply(p, m_obs, method=network.value)
@@ -642,7 +653,10 @@ def make_train_loop(
                 (train_state, rng), _ = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
 
             # --- D. Evaluation across Fixed Eval Set ---
-            msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
+            if is_dag:
+                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
+            else:
+                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_tree_metrics(network, train_state.params, eval_set)
 
             # Record snapshots at 1/5 and 4/5
             snap_1_val = jnp.where(update_idx == u_snap_1, v_eval_preds, snap_1_val)
@@ -766,9 +780,29 @@ def run_benchmark(
         eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
         num_steps = env.max_depth
 
-    target_num_updates = int(num_updates)
+    def get_algo_cost(a: str) -> int:
+        if a == "mc":
+            return num_steps
+        elif a.startswith("vine"):
+            k = int(a.split("_k")[1])
+            fork_trans = sum(k * (num_steps - t) for t in range(num_steps))
+            return num_steps + fork_trans
+        elif a.startswith("fbi"):
+            k = 4
+            return num_steps * (1 + k)
+        else:
+            return num_steps
+
+    algo_costs = {a: get_algo_cost(a) for a in algos}
+    max_algo_cost = max(algo_costs.values())
+
+    # Guarantee at least 4 parallel envs for statistical diversity
+    min_parallel_envs = 4
+    min_trans_per_update = min_parallel_envs * max_algo_cost
+    nominal_trans_per_update = max(1000, total_transitions_budget // int(num_updates))
+    target_trans_per_update = max(nominal_trans_per_update, min_trans_per_update)
+    target_num_updates = max(5, total_transitions_budget // target_trans_per_update)
     actual_grad_steps = int(grad_steps_per_update) if grad_steps_per_update is not None else num_steps
-    target_trans_per_update = max(1000, total_transitions_budget // target_num_updates)
 
     results: Dict[str, Any] = {
         "env_type": env_type,
@@ -793,22 +827,10 @@ def run_benchmark(
     # 2. Iterate Over Algorithms
     for algo in algos:
         display_name = ALGO_NAMES.get(algo, algo)
-
-        # Compute exact transition sample cost per environment
-        if algo == "mc":
-            algo_trans_per_env = num_steps
-        elif algo.startswith("vine"):
-            k = int(algo.split("_k")[1])
-            fork_trans = sum(k * (num_steps - t) for t in range(num_steps))
-            algo_trans_per_env = num_steps + fork_trans
-        elif algo.startswith("fbi"):
-            k = 4
-            algo_trans_per_env = num_steps * (1 + k)
-        else:
-            algo_trans_per_env = num_steps
+        algo_trans_per_env = algo_costs[algo]
 
         # Dynamically scale parallel environments so ALL algorithms consume the same transitions per update
-        algo_num_envs = max(1, target_trans_per_update // algo_trans_per_env)
+        algo_num_envs = max(min_parallel_envs, target_trans_per_update // algo_trans_per_env)
         trans_per_update = algo_num_envs * algo_trans_per_env
         actual_total_transitions = target_num_updates * trans_per_update
 
