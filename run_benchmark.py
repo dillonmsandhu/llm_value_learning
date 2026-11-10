@@ -15,7 +15,7 @@ from flax.training.train_state import TrainState
 
 from transformer import TransformerCritic
 from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
-from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState
+from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTreeEnv, ProceduralTreeExactValue, TreeState
 import plot_results
 
 
@@ -121,34 +121,114 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
     }
 
 
-def build_tree_eval_set(env: TreeMRP):
+def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 12345):
     """
-    Builds exact evaluation set for TreeMRP over all 2^(D+1)-1 states.
+    Constructs a balanced evaluation dataset for ProceduralTreeEnv covering
+    each problem index (difficulty tier) equally, spanning steps, branches, and outcomes.
     """
-    evaluator = env.evaluator
-    num_states = evaluator.num_states
-    v_true_all = evaluator.solve_backward_induction()[:num_states]
-    eval_obs = evaluator.obs_stack[:num_states]
+    if hasattr(env, "evaluator") and hasattr(env.evaluator, "target_depths"):
+        P = env.num_problems
+        num_rollouts = max(4, samples_per_problem // env.max_depth + 1)
 
-    num_internal = evaluator.leaf_offset
-    parents = jnp.arange(num_internal, dtype=jnp.int32)
-    left_c = 2 * parents + 1
-    right_c = 2 * parents + 2
+        all_prompts, all_nodes, all_depths, all_hist, all_done = [], [], [], [], []
 
-    true_adv_left = v_true_all[left_c] - v_true_all[parents]
-    true_adv_right = v_true_all[right_c] - v_true_all[parents]
-    true_adv = jnp.stack([true_adv_left, true_adv_right], axis=0) # (2, num_internal)
+        for p in range(P):
+            rng = jax.random.PRNGKey(seed + p * 1000)
+            def reset_prob(k):
+                history, s = env.reset(k)
+                history = history.at[1].set(env.evaluator.PROMPT_TOKEN_OFFSET + p)
+                s = s._replace(prompt_idx=jnp.array(p, dtype=jnp.int32), history_tokens=history)
+                return history, s
 
-    return {
-        "eval_obs": eval_obs,
-        "exact_v": v_true_all,
-        "true_adv": true_adv,
-        "num_internal": num_internal,
-        "left_c": left_c,
-        "right_c": right_c,
-        "parents": parents,
-        "num_problems": 1,
-    }
+            obs, state = jax.vmap(reset_prob)(jax.random.split(rng, num_rollouts))
+            p_states = [state]
+            curr_state = state
+            for _ in range(env.max_depth):
+                rng, k1, k2 = jax.random.split(rng, 3)
+                actions = jax.vmap(env.sample_base_action)(jax.random.split(k1, num_rollouts), curr_state)
+                next_obs, next_state, r, d, _ = jax.vmap(env.step)(jax.random.split(k2, num_rollouts), curr_state, actions)
+                p_states.append(next_state)
+                curr_state = next_state
+
+            flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)[:samples_per_problem]
+            flat_p_node = jnp.concatenate([st.node_idx for st in p_states], axis=0)[:samples_per_problem]
+            flat_p_depth = jnp.concatenate([st.depth_count for st in p_states], axis=0)[:samples_per_problem]
+            flat_p_hist = jnp.concatenate([st.history_tokens for st in p_states], axis=0)[:samples_per_problem]
+            flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)[:samples_per_problem]
+
+            all_prompts.append(flat_p_prompt)
+            all_nodes.append(flat_p_node)
+            all_depths.append(flat_p_depth)
+            all_hist.append(flat_p_hist)
+            all_done.append(flat_p_done)
+
+        flat_prompt = jnp.concatenate(all_prompts, axis=0)
+        flat_node = jnp.concatenate(all_nodes, axis=0)
+        flat_depth = jnp.concatenate(all_depths, axis=0)
+        flat_obs = jnp.concatenate(all_hist, axis=0)
+        flat_done = jnp.concatenate(all_done, axis=0)
+        num_samples = flat_obs.shape[0]
+
+        eval_state = TreeState(
+            prompt_idx=flat_prompt,
+            node_idx=flat_node,
+            depth_count=flat_depth,
+            history_tokens=flat_obs,
+            done=flat_done,
+        )
+
+        exact_v = jax.vmap(env.evaluator.get_exact_value)(eval_state)
+
+        def _action_target(a):
+            act_arr = jnp.full(num_samples, a, dtype=jnp.int32)
+            step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
+            next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
+            v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
+            return next_o, r, v_next
+
+        all_acts = jnp.arange(env.num_actions)
+        next_obs_all, r_all, v_next_all = jax.vmap(_action_target)(all_acts)
+        true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]
+
+        all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
+
+        return {
+            "eval_obs": flat_obs,
+            "eval_state": eval_state,
+            "exact_v": exact_v,
+            "true_adv": true_adv,
+            "next_obs_all": next_obs_all,
+            "all_eval_tokens": all_eval_tokens,
+            "r_all": r_all,
+            "num_actions": env.num_actions,
+            "prompts": flat_prompt,
+            "num_problems": P,
+        }
+    else:
+        evaluator = env.evaluator
+        num_states = evaluator.num_states
+        v_true_all = evaluator.solve_backward_induction()[:num_states]
+        eval_obs = evaluator.obs_stack[:num_states]
+
+        num_internal = evaluator.leaf_offset
+        parents = jnp.arange(num_internal, dtype=jnp.int32)
+        left_c = 2 * parents + 1
+        right_c = 2 * parents + 2
+
+        true_adv_left = v_true_all[left_c] - v_true_all[parents]
+        true_adv_right = v_true_all[right_c] - v_true_all[parents]
+        true_adv = jnp.stack([true_adv_left, true_adv_right], axis=0)
+
+        return {
+            "eval_obs": eval_obs,
+            "exact_v": v_true_all,
+            "true_adv": true_adv,
+            "num_internal": num_internal,
+            "left_c": left_c,
+            "right_c": right_c,
+            "parents": parents,
+            "num_problems": 1,
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -266,11 +346,11 @@ def make_train_loop(
     elif is_fbi:
         lmbda = float(algo.split("_lam")[1])
 
-    is_dag = (env_type == "dag")
-    vocab_size = env.vocab_size if is_dag else 4
-    max_seq_len = env.max_seq_len if is_dag else (env.evaluator.depth + 4)
-    pad_token_id = 0 if is_dag else 2
-    add_bos = False if is_dag else True
+    is_dag = (env_type in ("dag", "single_dag", "dag_spectrum"))
+    vocab_size = env.vocab_size
+    max_seq_len = env.max_seq_len
+    pad_token_id = 0
+    add_bos = False
 
     network = TransformerCritic(
         vocab_size=vocab_size,
@@ -299,10 +379,7 @@ def make_train_loop(
 
         # 2. Reset Environments
         reset_keys = jax.random.split(reset_rng, num_envs)
-        if is_dag:
-            last_obs, env_state = jax.vmap(env.reset)(reset_keys)
-        else:
-            last_obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_keys, None)
+        last_obs, env_state = jax.vmap(env.reset)(reset_keys)
 
         def _update_step(runner_state, update_idx):
             train_state, env_state, last_obs, rng, snap_1_val, snap_4_val = runner_state
@@ -312,14 +389,8 @@ def make_train_loop(
                 st, o, k = carry
                 k, act_k, step_k = jax.random.split(k, 3)
 
-                if is_dag:
-                    a = jax.vmap(env.sample_base_action)(jax.random.split(act_k, num_envs), st)
-                    next_o, next_st, r, d, _ = jax.vmap(env.step)(jax.random.split(step_k, num_envs), st, a)
-                else:
-                    a = jnp.zeros(num_envs, dtype=jnp.int32)
-                    next_o, next_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
-                        jax.random.split(step_k, num_envs), st, a, None
-                    )
+                a = jax.vmap(env.sample_base_action)(jax.random.split(act_k, num_envs), st)
+                next_o, next_st, r, d, _ = jax.vmap(env.step)(jax.random.split(step_k, num_envs), st, a)
 
                 step_data = StepData(obs=o, action=a, reward=r, done=d, value=jnp.zeros(num_envs, dtype=jnp.float32))
                 return (next_st, next_o, k), (step_data, st)
@@ -346,14 +417,8 @@ def make_train_loop(
                     def _fork_step(carry, _):
                         st, k = carry
                         k, ak, sk = jax.random.split(k, 3)
-                        if is_dag:
-                            a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
-                            _, n_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
-                        else:
-                            a = jnp.zeros(k_branches, dtype=jnp.int32)
-                            _, n_st, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
-                                jax.random.split(sk, k_branches), st, a, None
-                            )
+                        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
+                        _, n_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
                         return (n_st, k), (r, d)
 
                     # Repeat state k_branches times
@@ -367,9 +432,12 @@ def make_train_loop(
                             done=jnp.repeat(state.done, k_branches),
                         )
                     else:
-                        fork_st = TabularState(
-                            s_idx=jnp.repeat(state.s_idx, k_branches),
-                            time=jnp.repeat(state.time, k_branches),
+                        fork_st = TreeState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            node_idx=jnp.repeat(state.node_idx, k_branches),
+                            depth_count=jnp.repeat(state.depth_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
                         )
 
                     _, (r_seq, d_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
@@ -400,17 +468,16 @@ def make_train_loop(
                             history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
                             done=jnp.repeat(state.done, k_branches),
                         )
-                        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
-                        next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     else:
-                        fork_st = TabularState(
-                            s_idx=jnp.repeat(state.s_idx, k_branches),
-                            time=jnp.repeat(state.time, k_branches),
+                        fork_st = TreeState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            node_idx=jnp.repeat(state.node_idx, k_branches),
+                            depth_count=jnp.repeat(state.depth_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
                         )
-                        a = jnp.zeros(k_branches, dtype=jnp.int32)
-                        next_o, _, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
-                            jax.random.split(sk, k_branches), fork_st, a, None
-                        )
+                    a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
+                    next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     return next_o, r, d
 
                 rng, b_rng = jax.random.split(rng)
@@ -459,17 +526,16 @@ def make_train_loop(
                             history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
                             done=jnp.repeat(state.done, k_branches),
                         )
-                        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
-                        next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     else:
-                        fork_st = TabularState(
-                            s_idx=jnp.repeat(state.s_idx, k_branches),
-                            time=jnp.repeat(state.time, k_branches),
+                        fork_st = TreeState(
+                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+                            node_idx=jnp.repeat(state.node_idx, k_branches),
+                            depth_count=jnp.repeat(state.depth_count, k_branches),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+                            done=jnp.repeat(state.done, k_branches),
                         )
-                        a = jnp.zeros(k_branches, dtype=jnp.int32)
-                        next_o, _, r, d, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
-                            jax.random.split(sk, k_branches), fork_st, a, None
-                        )
+                    a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
+                    next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     return next_o, r, d
 
                 rng, b_rng, stage_scan_rng = jax.random.split(rng, 3)
@@ -558,10 +624,7 @@ def make_train_loop(
                 (train_state, rng), _ = jax.lax.scan(_update_epoch, (train_state, rng), None, length=num_epochs)
 
             # --- D. Evaluation across Fixed Eval Set ---
-            if is_dag:
-                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
-            else:
-                msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_tree_metrics(network, train_state.params, eval_set)
+            msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
 
             # Record snapshots at 1/5 and 4/5
             snap_1_val = jnp.where(update_idx == u_snap_1, v_eval_preds, snap_1_val)
@@ -651,16 +714,31 @@ def run_benchmark(
         eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
         num_steps = env.max_steps
     else:
-        tree_params = tree_params or {"depth": 7, "p": 0.8, "cluster_size": 2}
-        env = TreeMRP(
-            depth=tree_params["depth"],
-            p=tree_params["p"],
-            cluster_size=tree_params["cluster_size"],
-            gamma=1.0,
+        # Procedural Tree Family
+        is_single_tree = (env_type == "single_tree")
+        if is_single_tree:
+            tree_params = tree_params or {"num_problems": 1, "depth": 7, "difficulty": 0.5}
+            diff_val = tree_params.get("difficulty", 0.5)
+            env_title = f"Single Procedural Tree (Difficulty theta={diff_val}, Depth={tree_params.get('depth', 7)})"
+            difficulties = diff_val
+            num_probs = 1
+        else:
+            tree_params = tree_params or {"num_problems": 10, "depth": 7}
+            num_probs = tree_params.get("num_problems", 10)
+            env_title = f"Difficulty Spectrum Procedural Tree (P={num_probs}, Depth={tree_params.get('depth', 7)})"
+            difficulties = "spectrum"
+
+        env = ProceduralTreeEnv(
+            num_problems=num_probs,
+            depth=tree_params.get("depth", 7),
+            difficulties=difficulties,
+            p_correct=tree_params.get("p_correct", None),
+            percent_correct=tree_params.get("percent_correct", None),
+            seed=master_seed,
         )
-        eval_set = build_tree_eval_set(env)
-        env_title = f"Single Large Tree MRP (Depth={tree_params['depth']}, p={tree_params['p']}, States={env.evaluator.num_states})"
-        num_steps = tree_params["depth"] + 1
+        samples_per_p = max(8, 256 // num_probs)
+        eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
+        num_steps = env.max_depth
 
     num_envs = 64
     results: Dict[str, Any] = {
@@ -784,24 +862,27 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
-    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "tree"], help="Environment type: single_dag (single large DAG), dag (multi-problem DAG), tree (binary tree MRP)")
+    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "single_tree", "tree"], help="Environment type: single_dag, dag, single_tree, tree")
     parser.add_argument("--total_transitions", type=int, default=150000, help="Total transition budget")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
-    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.5", help="Comma-separated algos")
+    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")
     
-    # DAG params
-    parser.add_argument("--num_problems", type=int, default=None, help="DAG: Number of problems (defaults: 1 for single_dag, 20 for dag)")
+    # Shared difficulty / problem params
+    parser.add_argument("--num_problems", type=int, default=None, help="Number of problems (defaults: 1 for single_*, 10-20 for spectrum)")
+    parser.add_argument("--difficulty", type=float, default=0.5, help="Difficulty theta in [0, 1] for single_* (default: 0.5)")
+
+    # DAG specific params
     parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 6 for dag)")
     parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 24 for dag)")
     parser.add_argument("--num_actions", type=int, default=8, help="DAG: Number of discrete actions")
-    parser.add_argument("--difficulty", type=float, default=0.5, help="DAG: Difficulty theta in [0, 1] for single_dag (default: 0.5)")
 
-    # Tree params
-    parser.add_argument("--depth", type=int, default=7, help="Tree: Depth of binary tree")
-    parser.add_argument("--p", type=float, default=0.8, help="Tree: Transition probability")
+    # Tree specific params
+    parser.add_argument("--depth", type=int, default=7, help="Tree: Depth of binary tree (default: 7)")
+    parser.add_argument("--p_correct", type=float, default=None, help="Tree: Base policy transition probability (default: derived from difficulty theta)")
+    parser.add_argument("--percent_correct", type=float, default=None, help="Tree: Percentage of correct leaves (default: derived from difficulty theta)")
 
     args = parser.parse_args()
 
@@ -811,14 +892,10 @@ def main():
     algo_list = [a.strip() for a in args.algos.split(",") if a.strip()]
 
     # Set smart defaults based on env_type
-    if args.env_type == "single_dag":
-        num_prob = args.num_problems if args.num_problems is not None else 1
-        num_mile = args.num_milestones if args.num_milestones is not None else 8
-        max_st = args.max_steps if args.max_steps is not None else 32
-    else:
-        num_prob = args.num_problems if args.num_problems is not None else 20
-        num_mile = args.num_milestones if args.num_milestones is not None else 6
-        max_st = args.max_steps if args.max_steps is not None else 24
+    is_single = args.env_type in ("single_dag", "single_tree")
+    num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else 10)
+    num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 6)
+    max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 24)
 
     dag_params = {
         "num_problems": num_prob,
@@ -828,9 +905,11 @@ def main():
         "difficulty": args.difficulty,
     }
     tree_params = {
+        "num_problems": num_prob,
         "depth": args.depth,
-        "p": args.p,
-        "cluster_size": 2,
+        "difficulty": args.difficulty,
+        "p_correct": args.p_correct,
+        "percent_correct": args.percent_correct,
     }
 
     run_benchmark(
