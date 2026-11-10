@@ -59,8 +59,7 @@ else
     PYTHON="python"
 fi
 
-SWEEP_ID="bench_${ENV_TYPE}_$(date +%Y%m%d_%H%M%S)"
-TARGET_DIR="${OUT_DIR}/benchmark_${ENV_TYPE}_${SWEEP_ID}"
+TARGET_DIR="${OUT_DIR}/${ENV_TYPE}_full"
 
 echo "================================================================"
 echo "Submitting Comprehensive Value Benchmark to SLURM Cluster"
@@ -68,8 +67,7 @@ echo "  Target Env:       $ENV_TYPE"
 echo "  Updates:          $NUM_UPDATES"
 echo "  Seeds:            $N_SEEDS (Master: $MASTER_SEED)"
 echo "  Algorithms:       $ALGOS"
-echo "  Sweep ID:         $SWEEP_ID"
-echo "  Expected Output:  $TARGET_DIR"
+echo "  Output Directory: $TARGET_DIR"
 echo "  Log Directory:    $LOG_DIR"
 echo "  Python:           $PYTHON"
 echo "  Repo Root:        $REPO_ROOT"
@@ -83,7 +81,7 @@ SBATCH_CMD="sbatch --parsable \
     --output=\"${LOG_DIR}/%j_${ENV_TYPE}.out\" \
     --error=\"${LOG_DIR}/%j_${ENV_TYPE}.err\" \
     --export=ALL \
-    \"$BENCH_SCRIPT\" \"$ENV_TYPE\" \"$NUM_UPDATES\" \"$N_SEEDS\" \"$ALGOS\" \"$OUT_DIR\" \"$SWEEP_ID\" \"$MASTER_SEED\""
+    \"$BENCH_SCRIPT\" \"$ENV_TYPE\" \"$NUM_UPDATES\" \"$N_SEEDS\" \"$ALGOS\" \"$OUT_DIR\" \"$TARGET_DIR\" \"$MASTER_SEED\""
 
 JOB_ID=$(eval "$SBATCH_CMD")
 echo "Submitted GPU Benchmark Job ID: $JOB_ID"

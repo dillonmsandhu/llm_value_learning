@@ -997,6 +997,7 @@ def main():
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
     parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
+    parser.add_argument("--save_dir", type=str, default=None, help="Explicit save directory (overrides --out_dir/--sweep_id)")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")
     
     # Shared difficulty / problem params
@@ -1027,8 +1028,12 @@ def main():
 
     args = parser.parse_args()
 
-    sweep_id = args.sweep_id or os.environ.get("SLURM_ARRAY_JOB_ID") or datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    save_dir = os.path.join(args.out_dir, f"benchmark_{args.env_type}_{sweep_id}")
+    if args.save_dir:
+        save_dir = args.save_dir
+    elif args.sweep_id:
+        save_dir = os.path.join(args.out_dir, f"{args.env_type}_{args.sweep_id}")
+    else:
+        save_dir = os.path.join(args.out_dir, f"{args.env_type}_full")
 
     algo_list = [a.strip() for a in args.algos.split(",") if a.strip()]
 

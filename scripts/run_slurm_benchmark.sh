@@ -66,7 +66,7 @@ NUM_UPDATES="${2:-${NUM_UPDATES:-$DEFAULT_UPDATES}}"
 N_SEEDS="${3:-${N_SEEDS:-5}}"
 ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
 OUT_DIR="${5:-${OUT_DIR:-results}}"
-SWEEP_ID="${6:-${SWEEP_ID:-}}"
+SAVE_DIR="${6:-${SAVE_DIR:-${OUT_DIR}/${ENV_TYPE}_full}}"
 MASTER_SEED="${7:-${MASTER_SEED:-42}}"
 
 # Large Reasoning DAG Hyperparameters (leave empty to use smart per-env defaults in run_benchmark.py:
@@ -89,10 +89,6 @@ GRAD_STEPS_PER_UPDATE="${GRAD_STEPS_PER_UPDATE:-}"
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 
-# Sweep / Run ID
-SWEEP_ID="${SWEEP_ID:-${SLURM_ARRAY_JOB_ID:+bench_${SLURM_ARRAY_JOB_ID}}}"
-SWEEP_ID="${SWEEP_ID:-bench_${SLURM_JOB_ID:-$(date +"%Y%m%d_%H%M%S")}}"
-
 echo "=================================================================="
 echo "Starting Value Learning & Advantage Alignment Benchmark"
 echo "  SLURM Job:        ${SLURM_ARRAY_JOB_ID:-local}_${SLURM_ARRAY_TASK_ID:-${SLURM_JOB_ID:-0}}"
@@ -103,8 +99,7 @@ echo "  Environment:      $ENV_TYPE"
 echo "  Updates:          $NUM_UPDATES"
 echo "  Seeds:            $N_SEEDS (Master: $MASTER_SEED)"
 echo "  Algorithms:       $ALGOS"
-echo "  Sweep / Run ID:   $SWEEP_ID"
-echo "  Output Directory: $OUT_DIR"
+echo "  Save Directory:   $SAVE_DIR"
 echo "=================================================================="
 
 $PYTHON run_benchmark.py \
@@ -113,7 +108,7 @@ $PYTHON run_benchmark.py \
     --master_seed "$MASTER_SEED" \
     --algos "$ALGOS" \
     --out_dir "$OUT_DIR" \
-    --sweep_id "$SWEEP_ID" \
+    --save_dir "$SAVE_DIR" \
     ${NUM_PROBLEMS:+--num_problems "$NUM_PROBLEMS"} \
     ${NUM_MILESTONES:+--num_milestones "$NUM_MILESTONES"} \
     ${MAX_STEPS:+--max_steps "$MAX_STEPS"} \
