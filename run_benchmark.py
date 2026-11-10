@@ -69,9 +69,11 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         flat_p_h = jnp.concatenate([st.history_tokens for st in p_states], axis=0)
         flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)
 
-        # Strictly select active (non-done) states
+        # Strictly select active (non-done) states uniformly across all timesteps 0..max_steps
         active_idx = jnp.where(~flat_p_done)[0]
-        sel_idx = active_idx[:samples_per_problem]
+        n_sel = min(samples_per_problem, int(active_idx.shape[0]))
+        rng, sel_rng = jax.random.split(rng)
+        sel_idx = jax.random.choice(sel_rng, active_idx, shape=(n_sel,), replace=False)
 
         all_prompts.append(flat_p_prompt[sel_idx])
         all_m.append(flat_p_m[sel_idx])
@@ -134,7 +136,7 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
     """
     if hasattr(env, "evaluator") and hasattr(env.evaluator, "target_depths"):
         P = env.num_problems
-        num_rollouts = max(4, samples_per_problem // env.max_depth + 1)
+        num_rollouts = max(16, (samples_per_problem // max(1, env.max_depth)) + 4)
 
         all_prompts, all_nodes, all_depths, all_hist, all_done = [], [], [], [], []
 
@@ -156,17 +158,22 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
                 p_states.append(next_state)
                 curr_state = next_state
 
-            flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)[:samples_per_problem]
-            flat_p_node = jnp.concatenate([st.node_idx for st in p_states], axis=0)[:samples_per_problem]
-            flat_p_depth = jnp.concatenate([st.depth_count for st in p_states], axis=0)[:samples_per_problem]
-            flat_p_hist = jnp.concatenate([st.history_tokens for st in p_states], axis=0)[:samples_per_problem]
-            flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)[:samples_per_problem]
+            flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)
+            flat_p_node = jnp.concatenate([st.node_idx for st in p_states], axis=0)
+            flat_p_depth = jnp.concatenate([st.depth_count for st in p_states], axis=0)
+            flat_p_hist = jnp.concatenate([st.history_tokens for st in p_states], axis=0)
+            flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)
 
-            all_prompts.append(flat_p_prompt)
-            all_nodes.append(flat_p_node)
-            all_depths.append(flat_p_depth)
-            all_hist.append(flat_p_hist)
-            all_done.append(flat_p_done)
+            active_idx = jnp.where(~flat_p_done)[0]
+            n_sel = min(samples_per_problem, int(active_idx.shape[0]))
+            rng, sel_rng = jax.random.split(rng)
+            sel_idx = jax.random.choice(sel_rng, active_idx, shape=(n_sel,), replace=False)
+
+            all_prompts.append(flat_p_prompt[sel_idx])
+            all_nodes.append(flat_p_node[sel_idx])
+            all_depths.append(flat_p_depth[sel_idx])
+            all_hist.append(flat_p_hist[sel_idx])
+            all_done.append(flat_p_done[sel_idx])
 
         flat_prompt = jnp.concatenate(all_prompts, axis=0)
         flat_node = jnp.concatenate(all_nodes, axis=0)

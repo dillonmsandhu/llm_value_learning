@@ -69,12 +69,13 @@ OUT_DIR="${5:-${OUT_DIR:-results}}"
 SWEEP_ID="${6:-${SWEEP_ID:-}}"
 MASTER_SEED="${7:-${MASTER_SEED:-42}}"
 
-# Large Reasoning DAG Hyperparameters
-NUM_PROBLEMS="${NUM_PROBLEMS:-10}"
-NUM_MILESTONES="${NUM_MILESTONES:-6}"
-MAX_STEPS="${MAX_STEPS:-24}"
+# Large Reasoning DAG Hyperparameters (leave empty to use smart per-env defaults in run_benchmark.py:
+# e.g. single_dag -> M=8, T=32, difficulty=0.5; dag spectrum -> P=10, M=6, T=24)
+NUM_PROBLEMS="${NUM_PROBLEMS:-}"
+NUM_MILESTONES="${NUM_MILESTONES:-}"
+MAX_STEPS="${MAX_STEPS:-}"
 NUM_ACTIONS="${NUM_ACTIONS:-8}"
-DIFFICULTY="${DIFFICULTY:-0.2}"
+DIFFICULTY="${DIFFICULTY:-0.5}"
 
 # Procedural Tree Hyperparameters
 DEPTH="${DEPTH:-7}"
@@ -113,9 +114,9 @@ $PYTHON run_benchmark.py \
     --algos "$ALGOS" \
     --out_dir "$OUT_DIR" \
     --sweep_id "$SWEEP_ID" \
-    --num_problems "$NUM_PROBLEMS" \
-    --num_milestones "$NUM_MILESTONES" \
-    --max_steps "$MAX_STEPS" \
+    ${NUM_PROBLEMS:+--num_problems "$NUM_PROBLEMS"} \
+    ${NUM_MILESTONES:+--num_milestones "$NUM_MILESTONES"} \
+    ${MAX_STEPS:+--max_steps "$MAX_STEPS"} \
     --num_actions "$NUM_ACTIONS" \
     --difficulty "$DIFFICULTY" \
     --depth "$DEPTH" \
