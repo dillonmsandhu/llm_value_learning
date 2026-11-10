@@ -24,6 +24,7 @@ class DAGEnvParams:
     p_blunder: float = 0.15       # Base policy probability of taking a blunder / dead-end branch
     p_recover: float = 0.35       # Base policy probability of self-correcting when derailed
     p_neutral: float = 0.15       # Base policy probability of fluff/neutral steps
+    p_eos: float = 0.80           # Base policy probability of emitting EOS once milestones are complete
     gamma: float = 1.0
 
 
@@ -76,11 +77,16 @@ class ReasoningDAGExactValue:
         self.p_recover = 0.50 - self.thetas * 0.40
         self.p_blunder = 0.10 + self.thetas * 0.55
         self.p_neutral = jnp.maximum(0.02, 1.0 - self.p_advance - self.p_blunder)
+        # Base policy probability of emitting EOS once milestones are complete:
+        self.p_eos = 0.80 - self.thetas * 0.15
 
         # 2. Procedural generation of problem tables
-        # Action (num_actions - 1) is universally designated as the Meta Self-Correction / Verification operator
-        self.correction_action = self.num_actions - 1
-        num_standard_actions = self.num_actions - 1
+        # Action (num_actions - 2) is designated as the Meta Self-Correction / Verification operator
+        # Action (num_actions - 1) is designated as the EOS (Terminal Submission) operator
+        assert self.num_actions >= 4, "ReasoningDAGEnv requires at least 4 actions (>=2 advance, 1 correction, 1 EOS)"
+        self.correction_action = self.num_actions - 2
+        self.eos_action = self.num_actions - 1
+        num_standard_actions = self.num_actions - 2
 
         # For each problem and milestone, we define 2 valid advance tokens (allowing reconverging paths)
         rng = jax.random.PRNGKey(seed)
@@ -120,6 +126,9 @@ class ReasoningDAGExactValue:
         """
         Solves exact Bellman backward induction for the base policy across the entire DAG.
         Returns V_table of shape (num_problems, max_steps + 1, num_milestones + 1, 2).
+        Includes EOS termination semantics:
+          - If m >= required_milestones and d == 0, emitting EOS yields immediate reward 1.0 (done=True).
+          - If d == 1 or m < required_milestones, emitting EOS yields immediate reward 0.0 (done=True).
         """
         P = self.num_problems
         T = self.max_steps
@@ -127,7 +136,7 @@ class ReasoningDAGExactValue:
 
         v_table = jnp.zeros((P, T + 1, M + 1, 2), dtype=jnp.float32)
 
-        # Terminal boundary at t = T:
+        # Terminal boundary at t = T (horizon cutoff fallback):
         # Reward is 1.0 iff milestone >= required_milestones[p] and is_derailed == 0
         terminal_rewards = jnp.zeros((P, M + 1, 2), dtype=jnp.float32)
         for p in range(P):
@@ -145,31 +154,52 @@ class ReasoningDAGExactValue:
                         v_blunder = v_next_layer[:, m, 1]
                         v_neutral = v_next_layer[:, m, 0]
 
+                        # When milestones not yet reached:
                         expected_v_not_reached = (
                             self.p_advance * v_advance
                             + self.p_blunder * v_blunder
                             + self.p_neutral * v_neutral
                         )
+
+                        # When milestones reached:
+                        # Model emits EOS with p_eos -> immediate reward 1.0, done.
+                        # Otherwise can verify (v_neutral) or blunder (v_blunder).
+                        p_blund_reached = jnp.minimum(0.10, self.p_blunder)
+                        p_neut_reached = jnp.maximum(0.02, 1.0 - self.p_eos - p_blund_reached)
                         expected_v_reached = (
-                            (1.0 - self.p_blunder) * v_neutral
-                            + self.p_blunder * v_blunder
+                            self.p_eos * 1.0
+                            + self.gamma * (p_neut_reached * v_neutral + p_blund_reached * v_blunder)
                         )
-                        expected_v = jnp.where(m < self.required_milestones, expected_v_not_reached, expected_v_reached)
+                        expected_v = jnp.where(m < self.required_milestones, self.gamma * expected_v_not_reached, expected_v_reached)
                     else:  # Derailed (d == 1)
                         v_recover = v_next_layer[:, m, 0]
                         v_stay_derailed = v_next_layer[:, m, 1]
-                        expected_v = (
+
+                        # When milestones not yet reached:
+                        expected_v_not_reached = (
                             self.p_recover * v_recover
                             + (1.0 - self.p_recover) * v_stay_derailed
                         )
 
-                    v_table = v_table.at[:, t, m, d].set(self.gamma * expected_v)
+                        # When milestones reached but derailed:
+                        # Emitting EOS yields immediate reward 0.0 (done=True).
+                        # Can recover (v_recover) or stay derailed (v_stay_derailed).
+                        p_rec_reached = jnp.minimum(0.40, self.p_recover)
+                        p_stay_reached = jnp.maximum(0.0, 1.0 - self.p_eos - p_rec_reached)
+                        expected_v_reached = (
+                            self.p_eos * 0.0
+                            + self.gamma * (p_rec_reached * v_recover + p_stay_reached * v_stay_derailed)
+                        )
+                        expected_v = jnp.where(m < self.required_milestones, self.gamma * expected_v_not_reached, expected_v_reached)
+
+                    v_table = v_table.at[:, t, m, d].set(expected_v)
 
         return v_table
 
     def get_exact_value(self, state: DAGState) -> jnp.ndarray:
         """Looks up the exact ground-truth value V*(s) for any state (scalar or batched)."""
-        return self.V_table[state.prompt_idx, state.step_count, state.milestone, state.is_derailed]
+        v = self.V_table[state.prompt_idx, state.step_count, state.milestone, state.is_derailed]
+        return jnp.where(state.done, 0.0, v)
 
 
 class ReasoningDAGEnv:
@@ -209,6 +239,8 @@ class ReasoningDAGEnv:
         self.max_seq_len = self.evaluator.max_seq_len
         self.prompt_len = self.evaluator.prompt_len
         self.correction_action = self.evaluator.correction_action
+        self.eos_action = self.evaluator.eos_action
+        self.p_eos = self.evaluator.p_eos
         self.valid_advance_mask = self.evaluator.valid_advance_mask
         self.valid_advance_actions = self.evaluator.valid_advance_actions
         self.blunder_actions = self.evaluator.blunder_actions
@@ -237,18 +269,19 @@ class ReasoningDAGEnv:
     def sample_base_action(self, rng: jax.random.PRNGKey, state: DAGState, params: DAGEnvParams = None) -> jnp.ndarray:
         """
         Samples an action from the base model policy pi_0(a | s).
-        Models realistic base LLM sampling with valid advances, blunders, and self-corrections
-        under problem-specific difficulty theta.
+        Models realistic base LLM sampling with valid advances, blunders, self-corrections,
+        and EOS (terminal conclusion) once milestones are achieved.
         """
         rng, choice_rng, act_rng = jax.random.split(rng, 3)
 
         curr_m = jnp.minimum(state.milestone, self.num_milestones - 1)
         valid_acts = self.valid_advance_actions[state.prompt_idx, curr_m]      # shape (2,)
-        blunder_acts = self.blunder_actions[state.prompt_idx, curr_m]          # shape (num_actions - 3,)
+        blunder_acts = self.blunder_actions[state.prompt_idx, curr_m]          # shape (num_actions - 4,)
 
         p_adv = self.p_advance[state.prompt_idx]
         p_blund = self.p_blunder[state.prompt_idx]
         p_rec = self.p_recover[state.prompt_idx]
+        p_eos = self.p_eos[state.prompt_idx]
 
         r = jax.random.uniform(choice_rng)
         rand_valid_idx = jax.random.randint(act_rng, shape=(), minval=0, maxval=valid_acts.shape[0])
@@ -257,19 +290,42 @@ class ReasoningDAGEnv:
         pick_advance = valid_acts[rand_valid_idx]
         pick_blunder = blunder_acts[rand_blunder_idx]
         pick_correction = jnp.array(self.correction_action, dtype=jnp.int32)
+        pick_eos = jnp.array(self.eos_action, dtype=jnp.int32)
 
-        def _sample_on_track():
-            return jnp.where(
-                r < p_adv,
-                pick_advance,
-                jnp.where(r < p_adv + p_blund, pick_blunder, pick_correction),
-            )
+        m_reached = (state.milestone >= self.required_milestones[state.prompt_idx])
 
-        def _sample_derailed():
-            return jnp.where(r < p_rec, pick_correction, pick_blunder)
+        # 1. Action selection when milestones NOT yet reached:
+        act_on_track_not_reached = jnp.where(
+            r < p_adv,
+            pick_advance,
+            jnp.where(r < p_adv + p_blund, pick_blunder, pick_correction),
+        )
+        act_derailed_not_reached = jnp.where(
+            r < p_rec,
+            pick_correction,
+            pick_blunder,
+        )
 
-        action = jnp.where(state.is_derailed == 0, _sample_on_track(), _sample_derailed())
-        return action
+        # 2. Action selection when milestones ARE reached:
+        # Model favors emitting EOS (submitting final solution)
+        p_blund_reached = jnp.minimum(0.10, p_blund)
+        act_on_track_reached = jnp.where(
+            r < p_eos,
+            pick_eos,
+            jnp.where(r < p_eos + p_blund_reached, pick_blunder, pick_correction),
+        )
+        p_rec_reached = jnp.minimum(0.40, p_rec)
+        act_derailed_reached = jnp.where(
+            r < p_eos,
+            pick_eos,
+            jnp.where(r < p_eos + p_rec_reached, pick_correction, pick_blunder),
+        )
+
+        act_on_track = jnp.where(m_reached, act_on_track_reached, act_on_track_not_reached)
+        act_derailed = jnp.where(m_reached, act_derailed_reached, act_derailed_not_reached)
+
+        action = jnp.where(state.is_derailed == 0, act_on_track, act_derailed)
+        return jnp.where(state.done, pick_eos, action)
 
     def step(
         self,
@@ -281,68 +337,76 @@ class ReasoningDAGEnv:
         """
         Executes one reasoning step.
         action: int32 in 0 .. num_actions - 1.
+        Supports early termination via EOS operator (action == self.eos_action).
         """
         # Determine action category for current problem and milestone:
+        is_eos = (action == self.eos_action)
+        is_correction = (action == self.correction_action)
         curr_m = jnp.minimum(state.milestone, self.num_milestones - 1)
-        is_advance_action = self.valid_advance_mask[state.prompt_idx, curr_m, action]
-        is_correction_action = (action == self.correction_action)
+        is_advance = self.valid_advance_mask[state.prompt_idx, curr_m, action]
 
-        # Transition logic:
-        # 1. If on-track (d == 0):
-        #    - advance action -> milestone increments (if not yet at problem-specific target)
-        #    - correction action -> neutral verification (milestone stays, stays on track)
-        #    - other action -> enters error state (is_derailed becomes 1)
+        # 1. State updates for standard (non-EOS) reasoning steps:
         new_milestone_on_track = jnp.where(
-            is_advance_action & (state.milestone < self.required_milestones[state.prompt_idx]),
+            is_advance & (state.milestone < self.required_milestones[state.prompt_idx]),
             state.milestone + 1,
             state.milestone,
         )
         new_derailed_on_track = jnp.where(
-            is_advance_action | is_correction_action,
+            is_advance | is_correction,
             0,
             1,  # Blunder committed
         )
-
-        # 2. If derailed (d == 1):
-        #    - correction action -> successfully recovers to d = 0 (milestone preserved!)
-        #    - any other action -> remains derailed (d = 1, milestone stays)
         new_milestone_derailed = state.milestone
-        new_derailed_derailed = jnp.where(is_correction_action, 0, 1)
+        new_derailed_derailed = jnp.where(is_correction, 0, 1)
 
-        # Select new milestone and derail state:
-        new_milestone = jnp.where(state.is_derailed == 0, new_milestone_on_track, new_milestone_derailed)
-        new_derailed = jnp.where(state.is_derailed == 0, new_derailed_on_track, new_derailed_derailed)
-        new_step_count = state.step_count + 1
+        step_milestone = jnp.where(state.is_derailed == 0, new_milestone_on_track, new_milestone_derailed)
+        step_derailed = jnp.where(state.is_derailed == 0, new_derailed_on_track, new_derailed_derailed)
+        step_count = state.step_count + 1
+
+        # 2. EOS termination logic:
+        # If EOS emitted, episode terminates immediately.
+        # Immediate reward is 1.0 iff required milestones reached and currently on-track!
+        eos_success = (state.milestone >= self.required_milestones[state.prompt_idx]) & (state.is_derailed == 0)
+        eos_reward = jnp.where(eos_success, 1.0, 0.0)
+
+        # 3. Horizon termination fallback (reached max_steps without EOS):
+        max_step_done = (step_count >= self.max_steps)
+        max_step_success = (step_milestone >= self.required_milestones[state.prompt_idx]) & (step_derailed == 0)
+        max_step_reward = jnp.where(max_step_success, 1.0, 0.0)
+
+        # Overall termination and reward:
+        new_done = is_eos | max_step_done | state.done
+        raw_reward = jnp.where(is_eos, eos_reward, max_step_reward)
+        reward = jnp.where(state.done, 0.0, raw_reward)
+
+        # Final state attributes (frozen if previously done):
+        final_milestone = jnp.where(state.done, state.milestone, step_milestone)
+        final_derailed = jnp.where(state.done, state.is_derailed, step_derailed)
+        final_step_count = jnp.where(state.done, state.step_count, step_count)
 
         # Append emitted action token to sequence observation:
         token_id = self.evaluator.ACTION_TOKEN_OFFSET + action
         insert_pos = self.prompt_len + state.step_count
-        new_history = state.history_tokens.at[insert_pos].set(token_id)
-
-        # Check termination:
-        done = (new_step_count >= self.max_steps)
-
-        # Terminal reward at t = T: 1.0 iff required milestones completed and on-track!
-        reward = jnp.where(
-            done & (new_milestone >= self.required_milestones[state.prompt_idx]) & (new_derailed == 0),
-            1.0,
-            0.0,
+        new_history = jnp.where(
+            state.done,
+            state.history_tokens,
+            state.history_tokens.at[insert_pos].set(token_id),
         )
 
         next_state = DAGState(
             prompt_idx=state.prompt_idx,
-            milestone=new_milestone,
-            is_derailed=new_derailed,
-            step_count=new_step_count,
+            milestone=final_milestone,
+            is_derailed=final_derailed,
+            step_count=final_step_count,
             history_tokens=new_history,
-            done=done,
+            done=new_done,
         )
 
         info = {
-            "milestone": new_milestone,
-            "is_derailed": new_derailed,
-            "step": new_step_count,
+            "milestone": final_milestone,
+            "is_derailed": final_derailed,
+            "step": final_step_count,
             "exact_v": self.evaluator.get_exact_value(next_state),
         }
 
-        return new_history, next_state, reward, done, info
+        return new_history, next_state, reward, new_done, info
