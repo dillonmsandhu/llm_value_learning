@@ -106,11 +106,11 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
         next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
         v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
-        return next_o, r, v_next, d
+        return next_o, next_st, r, v_next, d
 
     all_acts = jnp.arange(env.num_actions)
-    next_obs_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
-    true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]
+    next_obs_all, next_states_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
+    true_adv = r_all + env.evaluator.gamma * (1.0 - d_all.astype(jnp.float32)) * v_next_all - exact_v[None, :]
 
     all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
 
@@ -120,6 +120,7 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         "exact_v": exact_v,
         "true_adv": true_adv,
         "next_obs_all": next_obs_all,
+        "next_states_all": next_states_all,
         "all_eval_tokens": all_eval_tokens,
         "r_all": r_all,
         "d_all": d_all,
@@ -197,10 +198,10 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
             step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
             next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
             v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
-            return next_o, r, v_next, d
+            return next_o, next_st, r, v_next, d
 
         all_acts = jnp.arange(env.num_actions)
-        next_obs_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
+        next_obs_all, next_states_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
         true_adv = r_all + env.evaluator.gamma * (1.0 - d_all.astype(jnp.float32)) * v_next_all - exact_v[None, :]
 
         all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
@@ -211,6 +212,7 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
             "exact_v": exact_v,
             "true_adv": true_adv,
             "next_obs_all": next_obs_all,
+            "next_states_all": next_states_all,
             "all_eval_tokens": all_eval_tokens,
             "r_all": r_all,
             "d_all": d_all,
@@ -326,6 +328,112 @@ def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dic
     return msve, adv_cos_sim, v_pred, msve_per_prob, adv_per_prob
 
 
+def _repeat_state(state: Any, k_branches: int, is_dag: bool) -> Any:
+    """Replicates a scalar DAGState or TreeState k_branches times along axis 0."""
+    if is_dag:
+        return DAGState(
+            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+            milestone=jnp.repeat(state.milestone, k_branches),
+            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+            step_count=jnp.repeat(state.step_count, k_branches),
+            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+            done=jnp.repeat(state.done, k_branches),
+        )
+    return TreeState(
+        prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
+        node_idx=jnp.repeat(state.node_idx, k_branches),
+        depth_count=jnp.repeat(state.depth_count, k_branches),
+        history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
+        done=jnp.repeat(state.done, k_branches),
+    )
+
+
+def evaluate_vine_mc_baseline(
+    env: Any,
+    eval_set: Dict[str, Any],
+    k_branches: int = 4,
+    n_seeds: int = 5,
+    seed: int = 42,
+    gamma: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Evaluates the non-parametric Vine MC estimator (K rollouts per state, no neural network
+    or gradient updates) on every state in eval_set and all 1-step action children over n_seeds.
+    """
+    eval_state = eval_set["eval_state"]
+    next_states_all = eval_set["next_states_all"]  # (num_actions, N)
+    exact_v = eval_set["exact_v"]                  # (N,)
+    true_adv = eval_set["true_adv"]                # (num_actions, N)
+    r_all = eval_set["r_all"]                      # (num_actions, N)
+    d_all = eval_set["d_all"]                      # (num_actions, N)
+    prompts = eval_set.get("prompts", None)
+    P = int(eval_set.get("num_problems", 1))
+    num_actions, N = r_all.shape
+    num_steps = env.max_steps
+    is_dag = isinstance(eval_state, DAGState)
+
+    def _rollout_value(state, r_key):
+        def _fork_step(carry, _):
+            st, k = carry
+            k, ak, sk = jax.random.split(k, 3)
+            a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
+            _, n_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
+            return (n_st, k), (r, d)
+
+        fork_st = _repeat_state(state, k_branches, is_dag)
+        _, (r_seq, d_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
+
+        def _back_return(next_g, rd):
+            r, d = rd
+            g = r + gamma * (1.0 - d.astype(jnp.float32)) * next_g
+            return g, g
+
+        _, ret_seq = jax.lax.scan(_back_return, jnp.zeros(k_branches, dtype=jnp.float32), (r_seq, d_seq), reverse=True)
+        return jnp.mean(ret_seq[0])
+
+    @jax.jit
+    def _eval_one_seed(rng):
+        k_curr, k_next = jax.random.split(rng)
+        curr_keys = jax.random.split(k_curr, N)
+        v_pred = jax.vmap(_rollout_value)(eval_state, curr_keys)
+
+        next_keys = jax.random.split(k_next, num_actions * N).reshape(num_actions, N, 2)
+        v_next_pred = jax.vmap(jax.vmap(_rollout_value))(next_states_all, next_keys)
+
+        msve = jnp.mean(jnp.square(v_pred - exact_v))
+        pred_adv = r_all + gamma * (1.0 - d_all.astype(jnp.float32)) * v_next_pred - v_pred[None, :]
+        dot = jnp.sum(true_adv * pred_adv)
+        adv_cos = dot / (jnp.linalg.norm(true_adv) * jnp.linalg.norm(pred_adv) + 1e-8)
+
+        if prompts is not None and P > 1:
+            def _prob_m(p):
+                mask = (prompts == p)
+                msve_p = jnp.sum(jnp.square(v_pred - exact_v) * mask) / jnp.maximum(1.0, jnp.sum(mask))
+                tp = jnp.where(mask[None, :], true_adv, 0.0)
+                pp = jnp.where(mask[None, :], pred_adv, 0.0)
+                adv_p = jnp.sum(tp * pp) / (jnp.linalg.norm(tp) * jnp.linalg.norm(pp) + 1e-8)
+                return msve_p, adv_p
+
+            msve_p, adv_p = jax.vmap(_prob_m)(jnp.arange(P))
+        else:
+            msve_p = msve[None]
+            adv_p = adv_cos[None]
+
+        return v_pred, msve, adv_cos, msve_p, adv_p
+
+    seed_keys = jax.random.split(jax.random.PRNGKey(seed + 777 + k_branches), n_seeds)
+    v_preds, msves, adv_coss, msve_ps, adv_ps = jax.vmap(_eval_one_seed)(seed_keys)
+
+    return {
+        "k_branches": int(k_branches),
+        "v_preds": np.asarray(v_preds),
+        "msve": np.asarray(msves),
+        "advantage_cosine_sim": np.asarray(adv_coss),
+        "msve_per_problem": np.asarray(msve_ps),
+        "adv_cos_per_problem": np.asarray(adv_ps),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Training Functions for Algorithms
 # -----------------------------------------------------------------------------
@@ -338,7 +446,7 @@ def make_train_loop(
 ):
     """
     Constructs a compiled training function for:
-      - algo in ['mc', 'vine_k2', 'vine_k4', 'fbi_lam0.0', 'fbi_lam0.5']
+      - algo in ['mc', 'td_lam0.0', 'td_lam0.8', 'vine_k2', 'vine_k4', 'fbi_lam0.0', 'fbi_lam0.8', ...]
       - env_type in ['dag', 'tree']
     """
     gamma = float(cfg.get("GAMMA", 1.0))
@@ -354,6 +462,7 @@ def make_train_loop(
 
     # Parse algo parameters
     is_mc = (algo == "mc")
+    is_td = algo.startswith("td")
     is_vine = algo.startswith("vine")
     is_fbi_staged = algo.startswith("fbi_staged")
     is_fbi_batched = algo.startswith("fbi") and not is_fbi_staged
@@ -365,7 +474,7 @@ def make_train_loop(
 
     if is_vine:
         k_branches = int(algo.split("_k")[1])
-    elif is_fbi:
+    elif is_fbi or is_td:
         lmbda = float(algo.split("_lam")[1])
 
     is_dag = (env_type in ("dag", "single_dag", "dag_spectrum"))
@@ -456,6 +565,32 @@ def make_train_loop(
                 )
                 active_infer_steps = trunk_active_steps
                 critic_eval_steps = jnp.array(0.0, dtype=jnp.float32)
+            elif is_td:
+                # Standard On-Policy TD(lambda) / GAE(lambda) along the single trunk trajectory (no extra branching)
+                n_trunk = num_steps * num_envs
+                flat_trunk_obs = traj_batch.obs.reshape(n_trunk, -1)
+                all_td_obs = jnp.concatenate([flat_trunk_obs, last_obs], axis=0)
+                all_td_v = jax.lax.stop_gradient(
+                    network.apply(train_state.params, all_td_obs, method=network.value)
+                )
+                v_base = all_td_v[:n_trunk].reshape(num_steps, num_envs)
+                v_last = all_td_v[n_trunk:]
+                v_next = jnp.concatenate([v_base[1:], v_last[None, :]], axis=0)
+
+                delta_td = traj_batch.reward + gamma * (1.0 - traj_batch.done.astype(jnp.float32)) * v_next - v_base
+
+                def _td_gae_back(next_adv, data):
+                    delta, d = data
+                    adv = delta + (gamma * lmbda) * (1.0 - d.astype(jnp.float32)) * next_adv
+                    return adv, adv
+
+                _, gae_adv = jax.lax.scan(
+                    _td_gae_back, jnp.zeros(num_envs, dtype=jnp.float32),
+                    (delta_td, traj_batch.done), reverse=True
+                )
+                targets = v_base + gae_adv
+                active_infer_steps = trunk_active_steps
+                critic_eval_steps = trunk_active_steps
             elif is_vine:
                 # Fork K rollouts to horizon T for each visited state
                 def _vine_rollout(state, r_key):
@@ -467,25 +602,7 @@ def make_train_loop(
                         active_f = jnp.sum(~st.done).astype(jnp.float32)
                         return (n_st, k), (r, d, active_f)
 
-                    # Repeat state k_branches times
-                    if is_dag:
-                        fork_st = DAGState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            milestone=jnp.repeat(state.milestone, k_branches),
-                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
-                            step_count=jnp.repeat(state.step_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
-                        )
-                    else:
-                        fork_st = TreeState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            node_idx=jnp.repeat(state.node_idx, k_branches),
-                            depth_count=jnp.repeat(state.depth_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
-                        )
-
+                    fork_st = _repeat_state(state, k_branches, is_dag)
                     _, (r_seq, d_seq, f_active_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
 
                     def _back_return(next_g, rd):
@@ -740,7 +857,7 @@ def run_benchmark(
     minibatch_size: int = 64,
     num_updates: int = None,
     grad_steps_per_update: int = None,
-    compute_matched_mc: bool = True,
+    compute_matched_mc: bool = False,
     lr: float = 5e-4,
     weight_decay: float = 1e-4,
     warmup_ratio: float = 0.10,
@@ -755,7 +872,10 @@ def run_benchmark(
     Compute-Matched MC baseline.
     """
     os.makedirs(save_dir, exist_ok=True)
-    algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.8", "fbi_staged_lam0.0", "fbi_staged_lam0.8"]
+    algos = algos or [
+        "mc", "td_lam0.0", "td_lam0.8", "vine_k2", "vine_k4",
+        "fbi_lam0.0", "fbi_lam0.8", "fbi_staged_lam0.0", "fbi_staged_lam0.8",
+    ]
     resolved_updates = int(num_updates) if num_updates is not None else (25 if env_type == "single_dag" else 100)
 
     print("=" * 85)
@@ -778,9 +898,9 @@ def run_benchmark(
             difficulties = diff_val
             num_probs = 1
         else:
-            dag_params = dag_params or {"num_problems": 10, "num_milestones": 6, "max_steps": 24, "num_actions": 8}
-            num_probs = dag_params.get("num_problems", 10)
-            env_title = f"Difficulty Spectrum Reasoning DAG (P={num_probs}, M={dag_params['num_milestones']}, T={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
+            dag_params = dag_params or {"num_problems": 20, "num_milestones": 12, "max_steps": 40, "num_actions": 8}
+            num_probs = dag_params.get("num_problems", 20)
+            env_title = f"LLM-Scale Reasoning DAG Spectrum (P={num_probs}, M_max={dag_params['num_milestones']}, T_max={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
             difficulties = "spectrum"
 
         env = ReasoningDAGEnv(
@@ -789,9 +909,10 @@ def run_benchmark(
             max_steps=dag_params["max_steps"],
             num_actions=dag_params["num_actions"],
             difficulties=difficulties,
+            variable_depth=(num_probs > 1),
             seed=master_seed,
         )
-        samples_per_p = max(8, 256 // num_probs)
+        samples_per_p = max(12, (256 if num_probs == 1 else 400) // num_probs)
         eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=env.eval_seed)
         num_steps = env.max_steps
     else:
@@ -865,11 +986,14 @@ def run_benchmark(
         "base_total_grad_steps": base_total_grad_steps,
         "flop_assumptions": flop_assumptions,
         "methods": {},
+        "reference_baselines": {},
     }
 
     def _format_algo_name(a: str) -> str:
         if a == "mc":
             return "Standard MC (K=1)"
+        if a.startswith("td_lam"):
+            return f"TD (lam={a.split('_lam')[1]})"
         if a.startswith("vine_k"):
             return f"Vine-Target (K={a.split('_k')[1]})"
         if a.startswith("fbi_staged_lam"):
@@ -974,17 +1098,39 @@ def run_benchmark(
                 is_compute_matched=True,
             )
 
-    # 3. Save Benchmark Data
+    # 4. Evaluate Non-Parametric Pure Vine MC Estimator (no network, no gradient) on all eval_set states
+    if "next_states_all" in eval_set:
+        vine_ks = sorted({int(a.split("_k")[1]) for a in algos if a.startswith("vine_k")} | {4})
+        for k_ref in vine_ks:
+            ref_name = f"Vine MC Estimator (K={k_ref})"
+            print(f"\n--- Evaluating Non-Parametric Reference: {ref_name} ({n_seeds} seeds) ---", flush=True)
+            ref_res = evaluate_vine_mc_baseline(
+                env=env,
+                eval_set=eval_set,
+                k_branches=k_ref,
+                n_seeds=n_seeds,
+                seed=master_seed,
+                gamma=1.0,
+            )
+            results["reference_baselines"][ref_name] = ref_res
+            print(
+                f"  MSVE: {np.mean(ref_res['msve']):.3e} ± {np.std(ref_res['msve'])/np.sqrt(n_seeds):.1e} | "
+                f"AdvCos: {np.mean(ref_res['advantage_cosine_sim']):.4f} ± {np.std(ref_res['advantage_cosine_sim'])/np.sqrt(n_seeds):.3f}",
+                flush=True,
+            )
+
+    # 5. Save Benchmark Data
     pkl_path = os.path.join(save_dir, "benchmark_results.pkl")
     with open(pkl_path, "wb") as f:
         pickle.dump(results, f)
     print(f"\n[Benchmark] Saved raw benchmark results to: {pkl_path}")
 
-    # 4. Generate Publication Figures & AUC Summary
+    # 6. Generate Publication Figures & AUC Summary
     plot_results.plot_comparison_curves(results, save_dir, prefix="benchmark")
     plot_results.plot_scatter_true_vs_estimated(results, save_dir, prefix="benchmark")
     plot_results.compute_and_save_auc_summary(results, save_dir, prefix="benchmark")
     plot_results.plot_difficulty_breakdown(results, save_dir, prefix="benchmark")
+    plot_results.plot_pareto_frontier(results, save_dir, prefix="benchmark")
 
     return results
 
@@ -995,18 +1141,18 @@ def main():
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
-    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8", help="Comma-separated algos")
+    parser.add_argument("--algos", type=str, default="mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     parser.add_argument("--save_dir", type=str, default=None, help="Explicit save directory (overrides --out_dir/--sweep_id)")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")
     
     # Shared difficulty / problem params
-    parser.add_argument("--num_problems", type=int, default=None, help="Number of problems (defaults: 1 for single_*, 10-20 for spectrum)")
+    parser.add_argument("--num_problems", type=int, default=None, help="Number of problems (defaults: 1 for single_*, 20 for dag, 10 for tree)")
     parser.add_argument("--difficulty", type=float, default=0.5, help="Difficulty theta in [0, 1] for single_* (default: 0.5)")
 
     # DAG specific params
-    parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 6 for dag)")
-    parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 24 for dag)")
+    parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 12 for dag)")
+    parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 40 for dag)")
     parser.add_argument("--num_actions", type=int, default=8, help="DAG: Number of discrete actions")
 
     # Tree specific params
@@ -1019,7 +1165,7 @@ def main():
     parser.add_argument("--epochs_per_update", type=int, default=2, help="Target critic epochs over active trunk buffer per update (default: 2)")
     parser.add_argument("--num_updates", type=int, default=None, help="Number of updates for main equal-gradient-steps comparison (default: 25 for single_dag, 100 otherwise)")
     parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Override gradient steps per update (default: calibrated to ~epochs_per_update)")
-    parser.add_argument("--no_compute_matched_mc", action="store_true", help="Disable bonus compute-matched Standard MC baseline")
+    parser.add_argument("--compute_matched_mc", action="store_true", default=False, help="Enable bonus compute-matched Standard MC baseline (default: False)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for warmup-cosine schedule (default: 5e-4)")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay (default: 1e-4)")
     parser.add_argument("--warmup_ratio", type=float, default=0.10, help="Warmup fraction of total gradient steps (default: 0.10)")
@@ -1039,9 +1185,10 @@ def main():
 
     # Set smart defaults based on env_type
     is_single = args.env_type in ("single_dag", "single_tree")
-    num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else 10)
-    num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 6)
-    max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 24)
+    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum")
+    num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else (20 if is_dag_cli else 10))
+    num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 12)
+    max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 40)
 
     dag_params = {
         "num_problems": num_prob,
@@ -1071,7 +1218,7 @@ def main():
         epochs_per_update=args.epochs_per_update,
         num_updates=args.num_updates,
         grad_steps_per_update=args.grad_steps_per_update,
-        compute_matched_mc=not args.no_compute_matched_mc,
+        compute_matched_mc=args.compute_matched_mc,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,

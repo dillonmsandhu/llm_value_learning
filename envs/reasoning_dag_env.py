@@ -47,6 +47,7 @@ class ReasoningDAGExactValue:
         max_steps: int = 16,
         num_actions: int = 8,
         difficulties: Any = None,
+        variable_depth: bool = True,
         gamma: float = 1.0,
         seed: int = 42,
     ):
@@ -57,7 +58,7 @@ class ReasoningDAGExactValue:
         self.gamma = float(gamma)
 
         # 1. Unified Difficulty Spectrum Parameterization: theta in [0, 1]
-        # theta = 0: trivial (Pass@1 ~ 85%), theta = 1: competition hard (Pass@1 ~ 1%)
+        # Calibrated to LLM reasoning: higher step-advance success, varied depths, low error recovery
         if difficulties is None:
             thetas = jnp.full(self.num_problems, 0.5, dtype=jnp.float32)
         elif isinstance(difficulties, (int, float)):
@@ -71,14 +72,32 @@ class ReasoningDAGExactValue:
             thetas = jnp.asarray(difficulties, dtype=jnp.float32)
 
         self.thetas = thetas
-        min_m = min(3, self.num_milestones)
-        self.required_milestones = jnp.round(min_m + self.thetas * (self.num_milestones - min_m)).astype(jnp.int32)
-        self.p_advance = 0.80 - self.thetas * 0.55
-        self.p_recover = 0.50 - self.thetas * 0.40
-        self.p_blunder = 0.10 + self.thetas * 0.55
+        rng = jax.random.PRNGKey(seed)
+        rng, depth_rng, mile_rng, p_rng = jax.random.split(rng, 4)
+
+        if variable_depth and self.num_problems > 1:
+            min_h = max(12, min(16, self.max_steps))
+            base_h = min_h + (self.max_steps - min_h) * (0.15 + 0.70 * self.thetas)
+            jitter_h = jax.random.randint(depth_rng, shape=(self.num_problems,), minval=-4, maxval=5)
+            self.problem_max_steps = jnp.clip(jnp.round(base_h).astype(jnp.int32) + jitter_h, min_h, self.max_steps)
+            min_m = min(4, self.num_milestones)
+            max_m_cap = jnp.maximum(min_m, jnp.minimum(self.num_milestones, self.problem_max_steps // 2 - 1))
+            base_m = min_m + (max_m_cap - min_m) * self.thetas
+            jitter_m = jax.random.randint(mile_rng, shape=(self.num_problems,), minval=-1, maxval=2)
+            self.required_milestones = jnp.clip(jnp.round(base_m).astype(jnp.int32) + jitter_m, min_m, max_m_cap)
+        else:
+            self.problem_max_steps = jnp.full(self.num_problems, self.max_steps, dtype=jnp.int32)
+            min_m = min(4, self.num_milestones)
+            max_m_cap = min(self.num_milestones, max(min_m, self.max_steps // 2))
+            self.required_milestones = jnp.round(min_m + self.thetas * (max_m_cap - min_m)).astype(jnp.int32)
+
+        # Higher step success prob, moderate blunder rate, and low recovery probability in general
+        self.p_advance = 0.85 - self.thetas * 0.30
+        self.p_recover = 0.15 - self.thetas * 0.10
+        self.p_blunder = 0.07 + self.thetas * 0.23
         self.p_neutral = jnp.maximum(0.02, 1.0 - self.p_advance - self.p_blunder)
         # Base policy probability of emitting EOS once milestones are complete:
-        self.p_eos = 0.80 - self.thetas * 0.15
+        self.p_eos = 0.85 - self.thetas * 0.15
 
         # 2. Procedural generation of problem tables
         # Action (num_actions - 2) is designated as the Meta Self-Correction / Verification operator
@@ -89,8 +108,6 @@ class ReasoningDAGExactValue:
         num_standard_actions = self.num_actions - 2
 
         # For each problem and milestone, we define 2 valid advance tokens (allowing reconverging paths)
-        rng = jax.random.PRNGKey(seed)
-        rng, p_rng = jax.random.split(rng)
 
         def _make_problem_routes(k):
             keys = jax.random.split(k, self.num_milestones)
@@ -192,7 +209,8 @@ class ReasoningDAGExactValue:
                         )
                         expected_v = jnp.where(m < self.required_milestones, self.gamma * expected_v_not_reached, expected_v_reached)
 
-                    v_table = v_table.at[:, t, m, d].set(expected_v)
+                    val_t = jnp.where(t >= self.problem_max_steps, terminal_rewards[:, m, d], expected_v)
+                    v_table = v_table.at[:, t, m, d].set(val_t)
 
         return v_table
 
@@ -216,6 +234,7 @@ class ReasoningDAGEnv:
         max_steps: int = 16,
         num_actions: int = 8,
         difficulties: Any = None,
+        variable_depth: bool = True,
         seed: int = 42,
         eval_seed: int = 12345,
     ):
@@ -226,11 +245,13 @@ class ReasoningDAGEnv:
             max_steps=max_steps,
             num_actions=num_actions,
             difficulties=difficulties,
+            variable_depth=variable_depth,
             seed=seed,
         )
         self.num_problems = self.evaluator.num_problems
         self.num_milestones = self.evaluator.num_milestones
         self.max_steps = self.evaluator.max_steps
+        self.problem_max_steps = self.evaluator.problem_max_steps
         self.num_actions = self.evaluator.num_actions
         self.thetas = self.evaluator.thetas
         self.required_milestones = self.evaluator.required_milestones
@@ -371,8 +392,8 @@ class ReasoningDAGEnv:
         eos_success = (state.milestone >= self.required_milestones[state.prompt_idx]) & (state.is_derailed == 0)
         eos_reward = jnp.where(eos_success, 1.0, 0.0)
 
-        # 3. Horizon termination fallback (reached max_steps without EOS):
-        max_step_done = (step_count >= self.max_steps)
+        # 3. Horizon termination fallback (reached problem horizon without EOS):
+        max_step_done = (step_count >= self.problem_max_steps[state.prompt_idx])
         max_step_success = (step_milestone >= self.required_milestones[state.prompt_idx]) & (step_derailed == 0)
         max_step_reward = jnp.where(max_step_done & max_step_success, 1.0, 0.0)
 
