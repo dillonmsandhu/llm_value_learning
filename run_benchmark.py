@@ -703,17 +703,20 @@ def run_benchmark(
     save_dir: str = "results/benchmark",
     dag_params: Dict[str, Any] = None,
     tree_params: Dict[str, Any] = None,
-    num_updates: int = 100,
+    trajectories_per_update: int = 256,
+    epochs_per_update: int = 2,
+    minibatch_size: int = 64,
+    num_updates: int = None,
     grad_steps_per_update: int = None,
     lr: float = 5e-4,
     weight_decay: float = 1e-4,
     warmup_ratio: float = 0.10,
     max_grad_norm: float = 1.0,
-    minibatch_size: int = 64,
 ):
     """
     Executes the comprehensive Value Learning & Advantage Alignment benchmark suite.
-    Enforces identical transitions per update and identical gradient steps across all algorithms.
+    Enforces identical transitions per update and identical gradient steps across all algorithms,
+    matching modern LLM fine-tuning library standards (OpenRLHF, TRL, verl).
     """
     os.makedirs(save_dir, exist_ok=True)
     algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.5"]
@@ -797,13 +800,26 @@ def run_benchmark(
     algo_costs = {a: get_algo_cost(a) for a in algos}
     max_algo_cost = max(algo_costs.values())
 
-    # Guarantee at least 4 parallel envs for statistical diversity
+    # Align with modern LLM fine-tuning libraries (TRL / OpenRLHF / verl):
+    # 1. Base rollout scale: trajectories_per_update (default: 256 trajectories per update)
+    base_trans_per_update = trajectories_per_update * num_steps
+
+    # 2. Statistical diversity floor: guarantee at least 4 parallel envs even for heavy branching (Vine K=4)
     min_parallel_envs = 4
     min_trans_per_update = min_parallel_envs * max_algo_cost
-    nominal_trans_per_update = max(1000, total_transitions_budget // int(num_updates))
-    target_trans_per_update = max(nominal_trans_per_update, min_trans_per_update)
-    target_num_updates = max(5, total_transitions_budget // target_trans_per_update)
-    actual_grad_steps = int(grad_steps_per_update) if grad_steps_per_update is not None else num_steps
+    target_trans_per_update = max(base_trans_per_update, min_trans_per_update)
+
+    # 3. Total updates derived from total budget, or overridden
+    if num_updates is not None:
+        target_num_updates = int(num_updates)
+    else:
+        target_num_updates = max(5, total_transitions_budget // target_trans_per_update)
+
+    # 4. Gradient steps per update: modern LLM libraries run 1-2 epochs over rollout buffer
+    if grad_steps_per_update is not None:
+        actual_grad_steps = int(grad_steps_per_update)
+    else:
+        actual_grad_steps = max(1, (trajectories_per_update * epochs_per_update) // minibatch_size)
 
     results: Dict[str, Any] = {
         "env_type": env_type,
@@ -940,9 +956,11 @@ def main():
     parser.add_argument("--p_correct", type=float, default=None, help="Tree: Base policy transition probability (default: derived from difficulty theta)")
     parser.add_argument("--percent_correct", type=float, default=None, help="Tree: Percentage of correct leaves (default: derived from difficulty theta)")
 
-    # RLVR Training & Fair Comparison params
-    parser.add_argument("--num_updates", type=int, default=100, help="Number of updates / gradient batches (default: 100)")
-    parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Number of gradient steps per update (default: num_steps)")
+    # RLVR Training & Fair Comparison params (matching modern LLM fine-tuning libraries)
+    parser.add_argument("--trajectories_per_update", type=int, default=256, help="Trajectories collected per update matching modern LLM fine-tuning libraries (default: 256)")
+    parser.add_argument("--epochs_per_update", type=int, default=2, help="Number of critic epochs over rollout buffer per update (default: 2)")
+    parser.add_argument("--num_updates", type=int, default=None, help="Number of updates / gradient batches (default: derived from total budget and trajectories_per_update)")
+    parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Number of gradient steps per update (default: derived from trajectories and epochs)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for warmup-cosine schedule (default: 5e-4)")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay (default: 1e-4)")
     parser.add_argument("--warmup_ratio", type=float, default=0.10, help="Warmup fraction of total gradient steps (default: 0.10)")
@@ -986,6 +1004,8 @@ def main():
         save_dir=save_dir,
         dag_params=dag_params,
         tree_params=tree_params,
+        trajectories_per_update=args.trajectories_per_update,
+        epochs_per_update=args.epochs_per_update,
         num_updates=args.num_updates,
         grad_steps_per_update=args.grad_steps_per_update,
         lr=args.lr,

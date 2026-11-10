@@ -76,8 +76,10 @@ DEPTH="${DEPTH:-7}"
 P_CORRECT="${P_CORRECT:-}"
 PERCENT_CORRECT="${PERCENT_CORRECT:-}"
 
-# RLVR Optimizer & Schedule Parameters
-NUM_UPDATES="${NUM_UPDATES:-100}"
+# RLVR Optimizer & Schedule Parameters (matching modern LLM fine-tuning standards)
+TRAJECTORIES_PER_UPDATE="${TRAJECTORIES_PER_UPDATE:-256}"
+EPOCHS_PER_UPDATE="${EPOCHS_PER_UPDATE:-2}"
+NUM_UPDATES="${NUM_UPDATES:-}"
 GRAD_STEPS_PER_UPDATE="${GRAD_STEPS_PER_UPDATE:-}"
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -116,6 +118,8 @@ $PYTHON run_benchmark.py \
     --depth "$DEPTH" \
     ${P_CORRECT:+--p_correct "$P_CORRECT"} \
     ${PERCENT_CORRECT:+--percent_correct "$PERCENT_CORRECT"} \
+    ${TRAJECTORIES_PER_UPDATE:+--trajectories_per_update "$TRAJECTORIES_PER_UPDATE"} \
+    ${EPOCHS_PER_UPDATE:+--epochs_per_update "$EPOCHS_PER_UPDATE"} \
     ${NUM_UPDATES:+--num_updates "$NUM_UPDATES"} \
     ${GRAD_STEPS_PER_UPDATE:+--grad_steps_per_update "$GRAD_STEPS_PER_UPDATE"} \
     ${LR:+--lr "$LR"} \
