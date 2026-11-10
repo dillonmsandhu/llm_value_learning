@@ -26,13 +26,17 @@ METHOD_COLORS = {
     "Vine-Target (K=4)": "#d62728",              # Red
     "Batched FBI (lam=0.0)": "#2ca02c",          # Green
     "Batched FBI (lam=0.5)": "#9467bd",          # Purple
+    "Batched FBI (lam=0.8)": "#8c564b",          # Brown
     "Staged FBI (lam=0.0)": "#17becf",           # Cyan
     "Staged FBI (lam=0.5)": "#e377c2",           # Magenta
+    "Staged FBI (lam=0.8)": "#bcbd22",           # Olive-Gold
     "FBI (lam=0.0)": "#2ca02c",
     "FBI (lam=0.5)": "#9467bd",
+    "FBI (lam=0.8)": "#8c564b",
     "Standard MC (K=1)": "#1f77b4",
     "FBI (K=4, lam=0.0)": "#2ca02c",
     "FBI (K=4, lam=0.5)": "#9467bd",
+    "FBI (K=4, lam=0.8)": "#8c564b",
 }
 
 DEFAULT_PALETTE = ["#1f77b4", "#ff7f0e", "#d62728", "#2ca02c", "#9467bd", "#8c564b", "#e377c2"]

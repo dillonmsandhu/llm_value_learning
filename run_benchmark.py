@@ -859,17 +859,16 @@ def run_benchmark(
         "methods": {},
     }
 
-    ALGO_NAMES = {
-        "mc": "Standard MC (K=1)",
-        "vine_k2": "Vine-Target (K=2)",
-        "vine_k4": "Vine-Target (K=4)",
-        "fbi_lam0.0": "Batched FBI (lam=0.0)",
-        "fbi_lam0.5": "Batched FBI (lam=0.5)",
-        "fbi_batched_lam0.0": "Batched FBI (lam=0.0)",
-        "fbi_batched_lam0.5": "Batched FBI (lam=0.5)",
-        "fbi_staged_lam0.0": "Staged FBI (lam=0.0)",
-        "fbi_staged_lam0.5": "Staged FBI (lam=0.5)",
-    }
+    def _format_algo_name(a: str) -> str:
+        if a == "mc":
+            return "Standard MC (K=1)"
+        if a.startswith("vine_k"):
+            return f"Vine-Target (K={a.split('_k')[1]})"
+        if a.startswith("fbi_staged_lam"):
+            return f"Staged FBI (lam={a.split('_lam')[1]})"
+        if a.startswith("fbi_batched_lam") or a.startswith("fbi_lam"):
+            return f"Batched FBI (lam={a.split('_lam')[1]})"
+        return a
 
     def _execute_algo_run(algo_key: str, display_name: str, n_updates_run: int, is_compute_matched: bool = False):
         print(f"\n--- Running: {display_name} ---", flush=True)
@@ -950,12 +949,12 @@ def run_benchmark(
 
     # 2. Iterate Over Main Algorithms (identical trunk B, identical grad steps, identical replay ratio)
     for algo in algos:
-        display_name = ALGO_NAMES.get(algo, algo)
+        display_name = _format_algo_name(algo)
         _execute_algo_run(algo, display_name, target_num_updates, is_compute_matched=False)
 
     # 3. Optional Bonus: Compute-Matched MC Baseline (same B & replay ratio, scaled updates to match max LLM FLOPs)
     if compute_matched_mc and ("mc" in algos) and len(results["methods"]) > 1:
-        mc_flops = float(results["methods"][ALGO_NAMES["mc"]]["x_llm_flops"][-1])
+        mc_flops = float(results["methods"][_format_algo_name("mc")]["x_llm_flops"][-1])
         max_flops = max(float(m["x_llm_flops"][-1]) for m in results["methods"].values())
         flops_per_mc_update = mc_flops / float(target_num_updates)
         matched_updates = int(round(max_flops / max(1.0, flops_per_mc_update)))
