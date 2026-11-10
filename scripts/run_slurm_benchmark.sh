@@ -71,9 +71,10 @@ MAX_STEPS="${MAX_STEPS:-24}"
 NUM_ACTIONS="${NUM_ACTIONS:-8}"
 DIFFICULTY="${DIFFICULTY:-0.25}"
 
-# Large Tree MRP Hyperparameters
-DEPTH="${DEPTH:-12}"
-P_SUCCESS="${P_SUCCESS:-0.8}"
+# Procedural Tree Hyperparameters
+DEPTH="${DEPTH:-7}"
+P_CORRECT="${P_CORRECT:-}"
+PERCENT_CORRECT="${PERCENT_CORRECT:-}"
 
 # Sweep / Run ID
 SWEEP_ID="${SWEEP_ID:-${SLURM_ARRAY_JOB_ID:+bench_${SLURM_ARRAY_JOB_ID}}}"
@@ -107,7 +108,8 @@ $PYTHON run_benchmark.py \
     --num_actions "$NUM_ACTIONS" \
     --difficulty "$DIFFICULTY" \
     --depth "$DEPTH" \
-    --p "$P_SUCCESS"
+    ${P_CORRECT:+--p_correct "$P_CORRECT"} \
+    ${PERCENT_CORRECT:+--percent_correct "$PERCENT_CORRECT"}
 
 STATUS=$?
 if [ $STATUS -eq 0 ]; then

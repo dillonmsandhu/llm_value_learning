@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import jax
 import jax.numpy as jnp
-from typing import Tuple, Any, List, Set, Sequence, Dict
+from typing import Tuple, Any, List, Set, Sequence, Dict, NamedTuple
 
 from envs.tabular_matrix_env import TabularMatrixEnv, TabularParams, TabularState
 
@@ -390,3 +390,296 @@ class TreeMRP(TabularMatrixEnv):
         )
         env_name = name or f"TreeMRP-d{depth}-p{p}"
         super().__init__(evaluator, name=env_name)
+
+
+# -----------------------------------------------------------------------------
+# Procedural Reasoning Tree Environment (RLVR-Style Procedural Generation)
+# -----------------------------------------------------------------------------
+class TreeState(NamedTuple):
+    """
+    Markov state for the procedurally generated binary reasoning tree.
+    History tokens contain pre-tokenized integers: [BOS, PROMPT_p, SEP, b0, b1, ...]
+    """
+    prompt_idx: jnp.ndarray      # int32 scalar: problem ID in 0 .. num_problems - 1
+    node_idx: jnp.ndarray        # int32 scalar: current node in 0 .. 2^(depth+1) - 2
+    depth_count: jnp.ndarray     # int32 scalar: step count in 0 .. max_depth
+    history_tokens: jnp.ndarray  # int32 array: (max_seq_len,) full sequence of token IDs
+    done: jnp.ndarray            # bool scalar: whether trajectory has terminated
+
+
+class ProceduralTreeExactValue:
+    """
+    Exact analytical dynamic programming solver for Procedural Reasoning Trees.
+    Supports a difficulty spectrum theta in [0, 1] governing:
+      1. Depth: D(theta) = round(depth_min + theta * (depth_max - depth_min)) (or fixed depth)
+      2. Base policy transition accuracy: p(theta) = p_max - theta * (p_max - p_min)
+      3. Percentage of leaves that are correct: f(theta) = f_max * (f_min / f_max)^theta
+      4. Procedural leaf placement: PRNG-seeded clusters of correct leaves per problem
+    """
+
+    def __init__(
+        self,
+        num_problems: int = 10,
+        depth: int = 7,
+        depth_range: Tuple[int, int] | None = None,
+        difficulties: Any = "spectrum",
+        p_correct: float | None = None,
+        percent_correct: float | None = None,
+        p_min: float = 0.55,
+        p_max: float = 0.90,
+        f_max: float = 0.35,
+        gamma: float = 1.0,
+        seed: int = 42,
+    ):
+        self.num_problems = int(num_problems)
+        self.gamma = float(gamma)
+
+        # 1. Unified Difficulty Spectrum: theta in [0, 1]
+        if difficulties is None:
+            thetas = jnp.full(self.num_problems, 0.5, dtype=jnp.float32)
+        elif isinstance(difficulties, (int, float)):
+            thetas = jnp.full(self.num_problems, float(difficulties), dtype=jnp.float32)
+        elif str(difficulties) == "spectrum":
+            if self.num_problems == 1:
+                thetas = jnp.array([0.5], dtype=jnp.float32)
+            else:
+                thetas = jnp.linspace(0.0, 1.0, self.num_problems, dtype=jnp.float32)
+        else:
+            thetas = jnp.asarray(difficulties, dtype=jnp.float32)
+
+        self.thetas = thetas
+
+        # 2. Depth per problem
+        if depth_range is not None:
+            d_min, d_max = depth_range
+            self.target_depths = jnp.round(d_min + self.thetas * (d_max - d_min)).astype(jnp.int32)
+            self.max_depth = int(d_max)
+        else:
+            self.target_depths = jnp.full(self.num_problems, depth, dtype=jnp.int32)
+            self.max_depth = int(depth)
+
+        self.num_total_nodes = (1 << (self.max_depth + 1)) - 1
+        self.num_actions = 2  # 0: Left, 1: Right
+
+        # 3. Transition probability p(theta)
+        if p_correct is not None:
+            self.p_advance = jnp.full(self.num_problems, float(p_correct), dtype=jnp.float32)
+        else:
+            self.p_advance = float(p_max) - self.thetas * float(p_max - p_min)
+
+        # 4. Correct leaves fraction f(theta) and counts
+        thetas_np = np.asarray(self.thetas)
+        depths_np = np.asarray(self.target_depths)
+        p_adv_np = np.asarray(self.p_advance)
+
+        correct_mask = np.zeros((self.num_problems, self.num_total_nodes), dtype=bool)
+        n_correct_list = []
+
+        for p_idx in range(self.num_problems):
+            th = thetas_np[p_idx]
+            d_p = int(depths_np[p_idx])
+            n_leaves_p = 1 << d_p
+            leaf_offset_p = (1 << d_p) - 1
+
+            if percent_correct is not None:
+                nc = max(1, int(round(n_leaves_p * float(percent_correct))))
+            else:
+                f_min_p = 1.0 / n_leaves_p
+                f_p = float(f_max) * ((f_min_p / float(f_max)) ** th)
+                nc = max(1, int(round(n_leaves_p * f_p)))
+
+            n_correct_list.append(nc)
+
+            # Procedurally place the cluster of correct leaves using PRNG
+            rng = np.random.RandomState(seed + p_idx * 1000)
+            max_start = max(0, n_leaves_p - nc)
+            start_leaf = rng.randint(0, max_start + 1)
+            for k in range(nc):
+                leaf_node = leaf_offset_p + start_leaf + k
+                correct_mask[p_idx, leaf_node] = True
+
+        self.correct_leaves_mask = jnp.asarray(correct_mask, dtype=jnp.bool_)
+        self.n_correct = jnp.asarray(n_correct_list, dtype=jnp.int32)
+
+        # 5. Precompute Reachability & Exact Backward Induction V_table
+        reach = np.zeros((self.num_problems, self.num_total_nodes), dtype=np.int32)
+        v_table = np.zeros((self.num_problems, self.num_total_nodes), dtype=np.float32)
+
+        for p_idx in range(self.num_problems):
+            d_p = int(depths_np[p_idx])
+            leaf_offset_p = (1 << d_p) - 1
+            n_leaves_p = 1 << d_p
+            p_val = float(p_adv_np[p_idx])
+
+            # Leaf level
+            for l in range(leaf_offset_p, leaf_offset_p + n_leaves_p):
+                if correct_mask[p_idx, l]:
+                    reach[p_idx, l] = 1
+                    v_table[p_idx, l] = 1.0
+
+            # Internal levels bottom-up from d_p - 1 down to 0
+            for d in range(d_p - 1, -1, -1):
+                start = (1 << d) - 1
+                end = (1 << (d + 1)) - 1
+                for s in range(start, end):
+                    l_child = 2 * s + 1
+                    r_child = 2 * s + 2
+                    cl = reach[p_idx, l_child]
+                    cr = reach[p_idx, r_child]
+                    reach[p_idx, s] = cl + cr
+
+                    vl = v_table[p_idx, l_child]
+                    vr = v_table[p_idx, r_child]
+
+                    if cl > 0 and cr > 0:
+                        v_table[p_idx, s] = self.gamma * (0.5 * vl + 0.5 * vr)
+                    elif cl > 0 and cr == 0:
+                        v_table[p_idx, s] = self.gamma * (p_val * vl + (1.0 - p_val) * vr)
+                    elif cl == 0 and cr > 0:
+                        v_table[p_idx, s] = self.gamma * ((1.0 - p_val) * vl + p_val * vr)
+                    else:
+                        v_table[p_idx, s] = 0.0
+
+        self.reach_table = jnp.asarray(reach, dtype=jnp.int32)
+        self.V_table = jnp.asarray(v_table, dtype=jnp.float32)
+
+        # 6. Vocabulary Constants
+        self.PAD_TOKEN = 0
+        self.BOS_TOKEN = 1
+        self.SEP_TOKEN = 2
+        self.PROMPT_TOKEN_OFFSET = 3
+        self.ACTION_TOKEN_OFFSET = self.PROMPT_TOKEN_OFFSET + self.num_problems
+        self.vocab_size = self.ACTION_TOKEN_OFFSET + self.num_actions + 4
+        self.prompt_len = 3  # [BOS, prompt_token, SEP]
+        self.max_seq_len = self.prompt_len + self.max_depth
+
+    def get_exact_value(self, state: TreeState) -> jnp.ndarray:
+        """Looks up the exact ground-truth value V*(s) for any state (scalar or batched)."""
+        return self.V_table[state.prompt_idx, state.node_idx]
+
+
+class ProceduralTreeEnv:
+    """
+    Procedurally Generated Binary Reasoning Tree Environment.
+    Supports single trees or multi-problem spectra where difficulty determines:
+      - depth
+      - transition success probability p_correct
+      - percent of leaves that are correct
+      - procedural PRNG-seeded solution placement
+    """
+
+    def __init__(
+        self,
+        num_problems: int = 10,
+        depth: int = 7,
+        depth_range: Tuple[int, int] | None = None,
+        difficulties: Any = "spectrum",
+        p_correct: float | None = None,
+        percent_correct: float | None = None,
+        p_min: float = 0.55,
+        p_max: float = 0.90,
+        f_max: float = 0.35,
+        gamma: float = 1.0,
+        seed: int = 42,
+    ):
+        self.evaluator = ProceduralTreeExactValue(
+            num_problems=num_problems,
+            depth=depth,
+            depth_range=depth_range,
+            difficulties=difficulties,
+            p_correct=p_correct,
+            percent_correct=percent_correct,
+            p_min=p_min,
+            p_max=p_max,
+            f_max=f_max,
+            gamma=gamma,
+            seed=seed,
+        )
+        self.num_problems = self.evaluator.num_problems
+        self.max_depth = self.evaluator.max_depth
+        self.max_steps = self.max_depth
+        self.num_actions = 2
+        self.vocab_size = self.evaluator.vocab_size
+        self.max_seq_len = self.evaluator.max_seq_len
+        self.thetas = self.evaluator.thetas
+        self.gamma = self.evaluator.gamma
+
+    def reset(self, key: jax.random.PRNGKey) -> Tuple[jnp.ndarray, TreeState]:
+        p_key, _ = jax.random.split(key)
+        p = jax.random.randint(p_key, (), 0, self.num_problems)
+
+        history = jnp.zeros(self.max_seq_len, dtype=jnp.int32)
+        history = history.at[0].set(self.evaluator.BOS_TOKEN)
+        history = history.at[1].set(self.evaluator.PROMPT_TOKEN_OFFSET + p)
+        history = history.at[2].set(self.evaluator.SEP_TOKEN)
+
+        state = TreeState(
+            prompt_idx=p,
+            node_idx=jnp.array(0, dtype=jnp.int32),
+            depth_count=jnp.array(0, dtype=jnp.int32),
+            history_tokens=history,
+            done=jnp.array(False),
+        )
+        return history, state
+
+    def sample_base_action(self, key: jax.random.PRNGKey, state: TreeState) -> jnp.ndarray:
+        p = state.prompt_idx
+        s = state.node_idx
+        l_child = 2 * s + 1
+        r_child = 2 * s + 2
+
+        cl = self.evaluator.reach_table[p, l_child]
+        cr = self.evaluator.reach_table[p, r_child]
+        p_adv = self.evaluator.p_advance[p]
+
+        p_left = jnp.where(
+            (cl > 0) & (cr > 0),
+            0.5,
+            jnp.where(
+                (cl > 0) & (cr == 0),
+                p_adv,
+                jnp.where(
+                    (cl == 0) & (cr > 0),
+                    1.0 - p_adv,
+                    0.5,
+                ),
+            ),
+        )
+
+        u = jax.random.uniform(key)
+        return jnp.where(u < p_left, 0, 1)
+
+    def step(
+        self,
+        key: jax.random.PRNGKey,
+        state: TreeState,
+        action: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, TreeState, jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
+        p = state.prompt_idx
+        s = state.node_idx
+        d = state.depth_count
+        target_d = self.evaluator.target_depths[p]
+
+        next_s = 2 * s + 1 + action
+        next_d = d + 1
+        is_leaf = (next_d >= target_d)
+        is_correct = self.evaluator.correct_leaves_mask[p, next_s]
+
+        reward = jnp.where(is_leaf & is_correct & (~state.done), 1.0, 0.0)
+        done = is_leaf | state.done
+
+        act_token = self.evaluator.ACTION_TOKEN_OFFSET + action
+        next_history = jnp.where(
+            state.done,
+            state.history_tokens,
+            state.history_tokens.at[3 + d].set(act_token),
+        )
+
+        next_state = TreeState(
+            prompt_idx=p,
+            node_idx=jnp.where(state.done, s, next_s),
+            depth_count=jnp.where(state.done, d, next_d),
+            history_tokens=next_history,
+            done=done,
+        )
+        return next_history, next_state, reward, done, {}
