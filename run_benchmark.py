@@ -99,10 +99,10 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         step_keys = jax.random.split(jax.random.PRNGKey(a), num_samples)
         next_o, next_st, r, d, _ = jax.vmap(env.step)(step_keys, eval_state, act_arr)
         v_next = jax.vmap(env.evaluator.get_exact_value)(next_st)
-        return next_o, r, v_next
+        return next_o, r, v_next, d
 
     all_acts = jnp.arange(env.num_actions)
-    next_obs_all, r_all, v_next_all = jax.vmap(_action_target)(all_acts)
+    next_obs_all, r_all, v_next_all, d_all = jax.vmap(_action_target)(all_acts)
     true_adv = r_all + env.evaluator.gamma * v_next_all - exact_v[None, :]
 
     all_eval_tokens = jnp.concatenate([flat_obs, next_obs_all.reshape(-1, env.max_seq_len)], axis=0)
@@ -115,6 +115,7 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         "next_obs_all": next_obs_all,
         "all_eval_tokens": all_eval_tokens,
         "r_all": r_all,
+        "d_all": d_all,
         "num_actions": env.num_actions,
         "prompts": flat_prompt,
         "num_problems": P,
@@ -251,7 +252,11 @@ def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict
     v_next_pred = all_v[N:].reshape(num_actions, N)
 
     msve = jnp.mean(jnp.square(v_pred - exact_v))
-    pred_adv = r_all + gamma * v_next_pred - v_pred[None, :]
+    d_all = eval_set.get("d_all", None)
+    if d_all is not None:
+        pred_adv = r_all + gamma * (1.0 - d_all.astype(jnp.float32)) * v_next_pred - v_pred[None, :]
+    else:
+        pred_adv = r_all + gamma * v_next_pred - v_pred[None, :]
 
     # Advantage Cosine Similarity across all (action, state) pairs
     dot = jnp.sum(true_adv * pred_adv)
