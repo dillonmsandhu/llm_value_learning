@@ -412,7 +412,12 @@ def make_train_loop(
         last_obs, env_state = jax.vmap(env.reset)(reset_keys)
 
         def _update_step(runner_state, update_idx):
-            train_state, env_state, last_obs, rng, snap_1_val, snap_4_val = runner_state
+            train_state, _, _, rng, snap_1_val, snap_4_val = runner_state
+
+            # Freshly reset all environments at the start of every update (episodes are bounded by num_steps)
+            rng, reset_rng = jax.random.split(rng)
+            reset_keys = jax.random.split(reset_rng, num_envs)
+            last_obs, env_state = jax.vmap(env.reset)(reset_keys)
 
             # --- A. Collect Primary Base Trajectory (Pure Environment Rollout, Zero Network Calls) ---
             def _step_fn(carry, _):
@@ -428,6 +433,7 @@ def make_train_loop(
             (env_state, last_obs, rng), (traj_batch, visited_states) = jax.lax.scan(
                 _step_fn, (env_state, last_obs, rng), None, length=num_steps
             )
+            trunk_active_steps = jnp.sum(~visited_states.done).astype(jnp.float32)
 
             # --- B. Compute Targets ---
             if is_mc:
@@ -441,6 +447,8 @@ def make_train_loop(
                     _mc_back, jnp.zeros(num_envs, dtype=jnp.float32),
                     (traj_batch.reward, traj_batch.done), reverse=True
                 )
+                active_infer_steps = trunk_active_steps
+                critic_eval_steps = jnp.array(0.0, dtype=jnp.float32)
             elif is_vine:
                 # Fork K rollouts to horizon T for each visited state
                 def _vine_rollout(state, r_key):
@@ -449,7 +457,8 @@ def make_train_loop(
                         k, ak, sk = jax.random.split(k, 3)
                         a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
                         _, n_st, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
-                        return (n_st, k), (r, d)
+                        active_f = jnp.sum(~st.done).astype(jnp.float32)
+                        return (n_st, k), (r, d, active_f)
 
                     # Repeat state k_branches times
                     if is_dag:
@@ -470,7 +479,7 @@ def make_train_loop(
                             done=jnp.repeat(state.done, k_branches),
                         )
 
-                    _, (r_seq, d_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
+                    _, (r_seq, d_seq, f_active_seq) = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
 
                     def _back_return(next_g, rd):
                         r, d = rd
@@ -478,11 +487,13 @@ def make_train_loop(
                         return g, g
 
                     _, ret_seq = jax.lax.scan(_back_return, jnp.zeros(k_branches, dtype=jnp.float32), (r_seq, d_seq), reverse=True)
-                    return jnp.mean(ret_seq[0])
+                    return jnp.mean(ret_seq[0]), jnp.sum(f_active_seq)
 
                 rng, v_rng = jax.random.split(rng)
                 v_keys = jax.random.split(v_rng, num_steps * num_envs).reshape(num_steps, num_envs, 2)
-                targets = jax.vmap(jax.vmap(_vine_rollout))(visited_states, v_keys)
+                targets, fork_active_counts = jax.vmap(jax.vmap(_vine_rollout))(visited_states, v_keys)
+                active_infer_steps = trunk_active_steps + jnp.sum(fork_active_counts)
+                critic_eval_steps = jnp.array(0.0, dtype=jnp.float32)
 
             elif is_fbi_batched:
                 # Synchronous / Batched 1-step branching target:
@@ -541,6 +552,8 @@ def make_train_loop(
                     (delta_branch, traj_batch.done), reverse=True
                 )
                 targets = v_base + gae_adv
+                active_infer_steps = trunk_active_steps * (1.0 + float(k_branches))
+                critic_eval_steps = trunk_active_steps * (1.0 + float(k_branches))
 
             elif is_fbi_staged:
                 # Staged / Sequential FBI (XLA-optimized with jax.lax.scan & active-pool minibatching):
@@ -625,6 +638,8 @@ def make_train_loop(
                     (train_state, init_targets, init_adv, stage_scan_rng),
                     rev_levels,
                 )
+                active_infer_steps = trunk_active_steps * (1.0 + float(k_branches))
+                critic_eval_steps = trunk_active_steps * (1.0 + float(k_branches))
 
             # --- C. Critic Network Update (MSE Loss for non-staged methods on active states) ---
             if not is_fbi_staged:
@@ -653,6 +668,12 @@ def make_train_loop(
 
                 (train_state, rng), _ = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
 
+            # Estimated LLM FLOPs (units of N = model parameters):
+            # 2N per inference / target-eval step, 6N per trained state-step (forward + backward)
+            actual_step_grads = (stage_steps * num_steps) if is_fbi_staged else grad_steps_per_update
+            trained_steps = jnp.array(float(actual_step_grads * minibatch_size), dtype=jnp.float32)
+            llm_flops_per_n = 2.0 * (active_infer_steps + critic_eval_steps) + 6.0 * trained_steps
+
             # --- D. Evaluation across Fixed Eval Set ---
             if "all_eval_tokens" in eval_set:
                 msve, adv_cos, v_eval_preds, msve_per_prob, adv_per_prob = evaluate_dag_metrics(network, train_state.params, eval_set, gamma=gamma)
@@ -668,6 +689,10 @@ def make_train_loop(
                 "advantage_cosine_sim": adv_cos,
                 "msve_per_problem": msve_per_prob,
                 "adv_cos_per_problem": adv_per_prob,
+                "active_infer_steps": active_infer_steps,
+                "critic_eval_steps": critic_eval_steps,
+                "trained_steps": trained_steps,
+                "llm_flops_per_n": llm_flops_per_n,
             }
 
             return (train_state, env_state, last_obs, rng, snap_1_val, snap_4_val), metrics_step
@@ -703,11 +728,12 @@ def run_benchmark(
     save_dir: str = "results/benchmark",
     dag_params: Dict[str, Any] = None,
     tree_params: Dict[str, Any] = None,
-    trajectories_per_update: int = 256,
+    trajectories_per_update: int = 64,
     epochs_per_update: int = 2,
     minibatch_size: int = 64,
     num_updates: int = None,
     grad_steps_per_update: int = None,
+    compute_matched_mc: bool = True,
     lr: float = 5e-4,
     weight_decay: float = 1e-4,
     warmup_ratio: float = 0.10,
@@ -715,8 +741,11 @@ def run_benchmark(
 ):
     """
     Executes the comprehensive Value Learning & Advantage Alignment benchmark suite.
-    Enforces identical transitions per update and identical gradient steps across all algorithms,
-    matching modern LLM fine-tuning library standards (OpenRLHF, TRL, verl).
+    Runs all algorithms with identical trunk batch size (B trajectories/update),
+    identical gradient steps per update, and identical buffer replay ratio, then
+    compares optimization per gradient step alongside active rollout transitions
+    and Estimated LLM FLOPs (in units of N parameters), plus an optional
+    Compute-Matched MC baseline.
     """
     os.makedirs(save_dir, exist_ok=True)
     algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.5"]
@@ -784,48 +813,49 @@ def run_benchmark(
         eval_set = build_tree_eval_set(env, samples_per_problem=samples_per_p, seed=master_seed)
         num_steps = env.max_depth
 
-    def get_algo_cost(a: str) -> int:
-        if a == "mc":
-            return num_steps
-        elif a.startswith("vine"):
-            k = int(a.split("_k")[1])
-            fork_trans = sum(k * (num_steps - t) for t in range(num_steps))
-            return num_steps + fork_trans
-        elif a.startswith("fbi"):
-            k = 4
-            return num_steps * (1 + k)
-        else:
-            return num_steps
+    # Measure empirical active trunk length per trajectory to calibrate buffer replay ratio (~epochs_per_update)
+    probe_rng = jax.random.PRNGKey(master_seed + 999)
+    probe_obs, probe_st = jax.vmap(env.reset)(jax.random.split(probe_rng, trajectories_per_update))
 
-    algo_costs = {a: get_algo_cost(a) for a in algos}
-    max_algo_cost = max(algo_costs.values())
+    def _probe_step(carry, _):
+        st, o, k = carry
+        k, ak, sk = jax.random.split(k, 3)
+        a = jax.vmap(env.sample_base_action)(jax.random.split(ak, trajectories_per_update), st)
+        no, nst, _, _, _ = jax.vmap(env.step)(jax.random.split(sk, trajectories_per_update), st, a)
+        return (nst, no, k), ~st.done
 
-    # Align with modern LLM fine-tuning libraries (TRL / OpenRLHF / verl):
-    # 1. Base rollout scale: trajectories_per_update (default: 256 trajectories per update)
-    base_trans_per_update = trajectories_per_update * num_steps
+    _, probe_active = jax.lax.scan(_probe_step, (probe_st, probe_obs, probe_rng), None, length=num_steps)
+    avg_active_per_traj = float(jnp.mean(jnp.sum(probe_active, axis=0)))
+    est_active_buffer = trajectories_per_update * avg_active_per_traj
 
-    # 2. Statistical diversity floor: guarantee at least 4 parallel envs even for heavy branching (Vine K=4)
-    min_parallel_envs = 4
-    min_trans_per_update = min_parallel_envs * max_algo_cost
-    target_trans_per_update = max(base_trans_per_update, min_trans_per_update)
-
-    # 3. Total updates derived from total budget, or overridden
-    if num_updates is not None:
-        target_num_updates = int(num_updates)
-    else:
-        target_num_updates = max(5, total_transitions_budget // target_trans_per_update)
-
-    # 4. Gradient steps per update: modern LLM libraries run 1-2 epochs over rollout buffer
     if grad_steps_per_update is not None:
         actual_grad_steps = int(grad_steps_per_update)
     else:
-        actual_grad_steps = max(1, (trajectories_per_update * epochs_per_update) // minibatch_size)
+        raw_grad_steps = max(1, round(est_active_buffer * epochs_per_update / minibatch_size))
+        # Align to nearest positive multiple of num_steps so Staged FBI executes identical grad steps
+        actual_grad_steps = max(1, round(raw_grad_steps / num_steps)) * num_steps
+
+    # Fixed updates across all main algorithms (default 100, or derived if total_transitions_budget overridden cleanly)
+    target_num_updates = int(num_updates) if num_updates is not None else 100
+    base_total_grad_steps = target_num_updates * actual_grad_steps
+    eff_epochs = (actual_grad_steps * minibatch_size) / max(1.0, est_active_buffer)
+
+    print(f"  [Protocol] Fixed Trunk Batch B={trajectories_per_update} traj/update | Avg active steps/traj={avg_active_per_traj:.1f} (~{est_active_buffer:.0f} active states/update)")
+    print(f"  [Protocol] Grad steps/update={actual_grad_steps} (minibatch={minibatch_size}, ~{eff_epochs:.2f} buffer epochs) | Updates={target_num_updates} | Total grad steps={base_total_grad_steps:,}")
+
+    flop_assumptions = (
+        f"LLM FLOPs Model (units of N params): 2N/inference step (KV-cached), "
+        f"2N/target-eval step (FBI), 6N/trained state (fwd+bwd) | "
+        f"B={trajectories_per_update} trunk traj/update, {actual_grad_steps} grad steps/update (~{eff_epochs:.1f} epochs)"
+    )
 
     results: Dict[str, Any] = {
         "env_type": env_type,
         "env_title": env_title,
         "eval_true_values": np.asarray(eval_set["exact_v"]),
         "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
+        "base_total_grad_steps": base_total_grad_steps,
+        "flop_assumptions": flop_assumptions,
         "methods": {},
     }
 
@@ -841,25 +871,19 @@ def run_benchmark(
         "fbi_staged_lam0.5": "Staged FBI (lam=0.5)",
     }
 
-    # 2. Iterate Over Algorithms
-    for algo in algos:
-        display_name = ALGO_NAMES.get(algo, algo)
-        algo_trans_per_env = algo_costs[algo]
-
-        # Dynamically scale parallel environments so ALL algorithms consume the same transitions per update
-        algo_num_envs = max(min_parallel_envs, target_trans_per_update // algo_trans_per_env)
-        trans_per_update = algo_num_envs * algo_trans_per_env
-        actual_total_transitions = target_num_updates * trans_per_update
-
+    def _execute_algo_run(algo_key: str, display_name: str, n_updates_run: int, is_compute_matched: bool = False):
         print(f"\n--- Running: {display_name} ---", flush=True)
-        print(f"  Transitions per update: {trans_per_update:,} (envs: {algo_num_envs}) | Updates: {target_num_updates} | Total transitions: {actual_total_transitions:,}", flush=True)
-        print(f"  Gradient steps per update: {actual_grad_steps} | Total grad steps: {target_num_updates * actual_grad_steps:,} | Trans/GradStep: {trans_per_update / actual_grad_steps:.1f}", flush=True)
+        print(
+            f"  Trunk envs/update: {trajectories_per_update} | Updates: {n_updates_run} | "
+            f"Grad steps/update: {actual_grad_steps} | Total grad steps: {n_updates_run * actual_grad_steps:,}",
+            flush=True,
+        )
 
         cfg = {
             "GAMMA": 1.0,
-            "NUM_ENVS": algo_num_envs,
+            "NUM_ENVS": trajectories_per_update,
             "NUM_STEPS": num_steps,
-            "NUM_UPDATES": target_num_updates,
+            "NUM_UPDATES": n_updates_run,
             "GRAD_STEPS_PER_UPDATE": actual_grad_steps,
             "MINIBATCH_SIZE": minibatch_size,
             "LR": lr,
@@ -872,50 +896,76 @@ def run_benchmark(
             "FINAL_HIDDEN_DIM": 32,
         }
 
-        train_fn = make_train_loop(algo, "dag" if is_dag_family else "tree", env, eval_set, cfg)
+        train_fn = make_train_loop(algo_key, "dag" if is_dag_family else "tree", env, eval_set, cfg)
         vmapped_train = jax.jit(jax.vmap(train_fn))
 
         rng = jax.random.PRNGKey(master_seed)
         seed_keys = jax.random.split(rng, n_seeds)
 
-        # Measure wall-clock compute time accurately
         print("  Compiling & Executing on Device...", flush=True)
         t0 = time.perf_counter()
         out = vmapped_train(seed_keys)
-        # Block device execution
         _ = jax.block_until_ready(out["metrics"]["msve"])
         elapsed = time.perf_counter() - t0
-        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / target_num_updates:.4f} s/update).", flush=True)
+        print(f"  Finished {n_seeds} seeds in {elapsed:.2f} seconds ({elapsed / n_updates_run:.4f} s/update).", flush=True)
 
-        msve_arr = np.asarray(out["metrics"]["msve"]) # shape: (n_seeds, num_updates)
+        msve_arr = np.asarray(out["metrics"]["msve"])  # (n_seeds, n_updates_run)
         adv_cos_arr = np.asarray(out["metrics"]["advantage_cosine_sim"])
-        snap_1 = np.asarray(out["snap_1_5"])           # shape: (n_seeds, num_eval_states)
+        snap_1 = np.asarray(out["snap_1_5"])            # (n_seeds, num_eval_states)
         snap_4 = np.asarray(out["snap_4_5"])
 
-        # Per-problem final MSVE and AdvCos across difficulty tiers
-        msve_p_arr = np.asarray(out["metrics"]["msve_per_problem"])      # (n_seeds, num_updates, P)
-        adv_p_arr = np.asarray(out["metrics"]["adv_cos_per_problem"])    # (n_seeds, num_updates, P)
-        final_msve_p = msve_p_arr[:, -1, :]                              # (n_seeds, P)
-        final_adv_p = adv_p_arr[:, -1, :]                                # (n_seeds, P)
+        infer_arr = np.asarray(out["metrics"]["active_infer_steps"])  # (n_seeds, n_updates_run)
+        flops_arr = np.asarray(out["metrics"]["llm_flops_per_n"])     # (n_seeds, n_updates_run)
 
-        x_updates = np.arange(1, target_num_updates + 1)
-        x_samples = x_updates * trans_per_update
-        # Linear wall-clock interpolation per update
-        x_wallclock = np.linspace(elapsed / target_num_updates, elapsed, target_num_updates)
+        msve_p_arr = np.asarray(out["metrics"]["msve_per_problem"])
+        adv_p_arr = np.asarray(out["metrics"]["adv_cos_per_problem"])
+        final_msve_p = msve_p_arr[:, -1, :]
+        final_adv_p = adv_p_arr[:, -1, :]
+
+        x_updates = np.arange(1, n_updates_run + 1) * actual_grad_steps
+        x_samples = np.mean(np.cumsum(infer_arr, axis=1), axis=0)
+        x_llm_flops = np.mean(np.cumsum(flops_arr, axis=1), axis=0)
+        x_wallclock = np.linspace(elapsed / n_updates_run, elapsed, n_updates_run)
+
+        print(
+            f"  Active Rollout Steps: {x_samples[-1]:,.0f} | Est. LLM Compute: {x_llm_flops[-1]:,.0f} N-FLOPs",
+            flush=True,
+        )
 
         results["methods"][display_name] = {
             "x_updates": x_updates,
             "x_samples": x_samples,
+            "x_llm_flops": x_llm_flops,
             "x_wallclock": x_wallclock,
             "msve": msve_arr,
             "advantage_cosine_sim": adv_cos_arr,
             "msve_per_problem": final_msve_p,
             "adv_cos_per_problem": final_adv_p,
+            "is_compute_matched_mc": is_compute_matched,
             "scatter_snapshots": {
                 "1_5": snap_1,
                 "4_5": snap_4,
             },
         }
+
+    # 2. Iterate Over Main Algorithms (identical trunk B, identical grad steps, identical replay ratio)
+    for algo in algos:
+        display_name = ALGO_NAMES.get(algo, algo)
+        _execute_algo_run(algo, display_name, target_num_updates, is_compute_matched=False)
+
+    # 3. Optional Bonus: Compute-Matched MC Baseline (same B & replay ratio, scaled updates to match max LLM FLOPs)
+    if compute_matched_mc and ("mc" in algos) and len(results["methods"]) > 1:
+        mc_flops = float(results["methods"][ALGO_NAMES["mc"]]["x_llm_flops"][-1])
+        max_flops = max(float(m["x_llm_flops"][-1]) for m in results["methods"].values())
+        flops_per_mc_update = mc_flops / float(target_num_updates)
+        matched_updates = int(round(max_flops / max(1.0, flops_per_mc_update)))
+        if matched_updates > int(round(1.25 * target_num_updates)):
+            _execute_algo_run(
+                "mc",
+                "Standard MC (Compute-Matched)",
+                matched_updates,
+                is_compute_matched=True,
+            )
 
     # 3. Save Benchmark Data
     pkl_path = os.path.join(save_dir, "benchmark_results.pkl")
@@ -956,11 +1006,12 @@ def main():
     parser.add_argument("--p_correct", type=float, default=None, help="Tree: Base policy transition probability (default: derived from difficulty theta)")
     parser.add_argument("--percent_correct", type=float, default=None, help="Tree: Percentage of correct leaves (default: derived from difficulty theta)")
 
-    # RLVR Training & Fair Comparison params (matching modern LLM fine-tuning libraries)
-    parser.add_argument("--trajectories_per_update", type=int, default=256, help="Trajectories collected per update matching modern LLM fine-tuning libraries (default: 256)")
-    parser.add_argument("--epochs_per_update", type=int, default=2, help="Number of critic epochs over rollout buffer per update (default: 2)")
-    parser.add_argument("--num_updates", type=int, default=None, help="Number of updates / gradient batches (default: derived from total budget and trajectories_per_update)")
-    parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Number of gradient steps per update (default: derived from trajectories and epochs)")
+    # RLVR Training & Fair Comparison params (fixed trunk batch & replay ratio across all algos)
+    parser.add_argument("--trajectories_per_update", type=int, default=64, help="Fixed trunk trajectories B collected per update across all algorithms (default: 64)")
+    parser.add_argument("--epochs_per_update", type=int, default=2, help="Target critic epochs over active trunk buffer per update (default: 2)")
+    parser.add_argument("--num_updates", type=int, default=100, help="Number of updates for main equal-gradient-steps comparison (default: 100)")
+    parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Override gradient steps per update (default: calibrated to ~epochs_per_update)")
+    parser.add_argument("--no_compute_matched_mc", action="store_true", help="Disable bonus compute-matched Standard MC baseline")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for warmup-cosine schedule (default: 5e-4)")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay (default: 1e-4)")
     parser.add_argument("--warmup_ratio", type=float, default=0.10, help="Warmup fraction of total gradient steps (default: 0.10)")
@@ -1008,6 +1059,7 @@ def main():
         epochs_per_update=args.epochs_per_update,
         num_updates=args.num_updates,
         grad_steps_per_update=args.grad_steps_per_update,
+        compute_matched_mc=not args.no_compute_matched_mc,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,

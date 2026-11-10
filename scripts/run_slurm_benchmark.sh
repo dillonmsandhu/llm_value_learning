@@ -76,10 +76,10 @@ DEPTH="${DEPTH:-7}"
 P_CORRECT="${P_CORRECT:-}"
 PERCENT_CORRECT="${PERCENT_CORRECT:-}"
 
-# RLVR Optimizer & Schedule Parameters (matching modern LLM fine-tuning standards)
-TRAJECTORIES_PER_UPDATE="${TRAJECTORIES_PER_UPDATE:-256}"
+# RLVR Optimizer & Schedule Parameters (fixed trunk batch & replay ratio across algorithms)
+TRAJECTORIES_PER_UPDATE="${TRAJECTORIES_PER_UPDATE:-64}"
 EPOCHS_PER_UPDATE="${EPOCHS_PER_UPDATE:-2}"
-NUM_UPDATES="${NUM_UPDATES:-}"
+NUM_UPDATES="${NUM_UPDATES:-100}"
 GRAD_STEPS_PER_UPDATE="${GRAD_STEPS_PER_UPDATE:-}"
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"

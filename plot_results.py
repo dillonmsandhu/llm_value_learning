@@ -20,13 +20,14 @@ plt.rcParams.update({
 })
 
 METHOD_COLORS = {
-    "Standard MC": "#1f77b4",              # Blue
-    "Vine-Target (K=2)": "#ff7f0e",        # Orange
-    "Vine-Target (K=4)": "#d62728",        # Red
-    "Batched FBI (lam=0.0)": "#2ca02c",    # Green
-    "Batched FBI (lam=0.5)": "#9467bd",    # Purple
-    "Staged FBI (lam=0.0)": "#17becf",     # Cyan
-    "Staged FBI (lam=0.5)": "#e377c2",     # Magenta
+    "Standard MC (Compute-Matched)": "#0b3c5d",  # Dark Navy (dashed)
+    "Standard MC": "#1f77b4",                    # Blue
+    "Vine-Target (K=2)": "#ff7f0e",              # Orange
+    "Vine-Target (K=4)": "#d62728",              # Red
+    "Batched FBI (lam=0.0)": "#2ca02c",          # Green
+    "Batched FBI (lam=0.5)": "#9467bd",          # Purple
+    "Staged FBI (lam=0.0)": "#17becf",           # Cyan
+    "Staged FBI (lam=0.5)": "#e377c2",           # Magenta
     "FBI (lam=0.0)": "#2ca02c",
     "FBI (lam=0.5)": "#9467bd",
     "Standard MC (K=1)": "#1f77b4",
@@ -38,6 +39,8 @@ DEFAULT_PALETTE = ["#1f77b4", "#ff7f0e", "#d62728", "#2ca02c", "#9467bd", "#8c56
 
 
 def get_color(method_name: str, idx: int = 0) -> str:
+    if method_name in METHOD_COLORS:
+        return METHOD_COLORS[method_name]
     for key, c in METHOD_COLORS.items():
         if key in method_name or method_name in key:
             return c
@@ -62,36 +65,42 @@ def plot_comparison_curves(
 ) -> None:
     """
     Produces a publication-quality 2x3 grid:
-      Row 1: MSVE vs Gradient Step | MSVE vs Sample Budget | MSVE vs Total Compute (Wall-Clock Seconds)
-      Row 2: Advantage Cosine Sim vs Gradient Step | Adv Cos Sim vs Sample Budget | Adv Cos Sim vs Total Compute
+      Row 1: MSVE vs Gradient Steps | MSVE vs Active Rollout Transitions (Log) | MSVE vs Estimated LLM FLOPs (Log)
+      Row 2: Advantage Cosine Sim across the same three X-axes
     """
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5), dpi=300)
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9.0), dpi=300)
     fig.suptitle(f"Value Learning & Advantage Alignment Benchmark ({results.get('env_title', 'Reasoning Environment')})", y=0.98)
 
     method_names = list(results["methods"].keys())
+    has_llm_flops = all("x_llm_flops" in results["methods"][m] for m in method_names)
+    base_total_grad_steps = results.get("base_total_grad_steps", None)
+    has_compute_matched = any(results["methods"][m].get("is_compute_matched_mc", False) for m in method_names)
 
     # Row 1: MSVE
     ax_msve_step = axes[0, 0]
     ax_msve_sample = axes[0, 1]
-    ax_msve_time = axes[0, 2]
+    ax_msve_compute = axes[0, 2]
 
     # Row 2: Advantage Cosine Similarity
     ax_adv_step = axes[1, 0]
     ax_adv_sample = axes[1, 1]
-    ax_adv_time = axes[1, 2]
+    ax_adv_compute = axes[1, 2]
 
     for idx, name in enumerate(method_names):
         data = results["methods"][name]
         color = get_color(name, idx)
+        is_matched_mc = data.get("is_compute_matched_mc", False)
+        linestyle = "--" if is_matched_mc else "-"
+        lw = 1.8 if is_matched_mc else 2.0
 
         # X-axes:
         x_steps = np.asarray(data["x_updates"])
         x_samples = np.asarray(data["x_samples"])
-        x_times = np.asarray(data["x_wallclock"])  # shape: (n_seeds, num_evals) or (num_evals,)
-        if x_times.ndim == 2:
-            mean_time = np.mean(x_times, axis=0)
+        if has_llm_flops:
+            x_compute = np.asarray(data["x_llm_flops"])
         else:
-            mean_time = x_times
+            x_times = np.asarray(data["x_wallclock"])
+            x_compute = np.mean(x_times, axis=0) if x_times.ndim == 2 else x_times
 
         # Metrics (shape: (n_seeds, num_evals))
         msve = np.asarray(data["msve"])
@@ -103,59 +112,85 @@ def plot_comparison_curves(
         mean_adv = np.mean(adv_cos, axis=0)
         sem_adv = np.std(adv_cos, axis=0) / np.sqrt(adv_cos.shape[0])
 
-        # --- Panel 1: MSVE vs Updates ---
-        ax_msve_step.plot(x_steps, mean_msve, label=name, color=color, lw=2.0)
-        ax_msve_step.fill_between(x_steps, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.18)
+        # --- Panel 1: MSVE vs Gradient Steps ---
+        ax_msve_step.plot(x_steps, mean_msve, label=name, color=color, lw=lw, ls=linestyle)
+        ax_msve_step.fill_between(x_steps, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
-        # --- Panel 2: MSVE vs Samples ---
-        ax_msve_sample.plot(x_samples, mean_msve, label=name, color=color, lw=2.0)
-        ax_msve_sample.fill_between(x_samples, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.18)
+        # --- Panel 2: MSVE vs Active Rollout Transitions ---
+        ax_msve_sample.plot(x_samples, mean_msve, label=name, color=color, lw=lw, ls=linestyle)
+        ax_msve_sample.fill_between(x_samples, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
-        # --- Panel 3: MSVE vs Wall-Clock Time ---
-        ax_msve_time.plot(mean_time, mean_msve, label=name, color=color, lw=2.0)
-        ax_msve_time.fill_between(mean_time, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.18)
+        # --- Panel 3: MSVE vs Estimated LLM FLOPs (or Wall-Clock Time) ---
+        ax_msve_compute.plot(x_compute, mean_msve, label=name, color=color, lw=lw, ls=linestyle)
+        ax_msve_compute.fill_between(x_compute, np.maximum(1e-7, mean_msve - sem_msve), mean_msve + sem_msve, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
-        # --- Panel 4: Adv Cos Sim vs Updates ---
-        ax_adv_step.plot(x_steps, mean_adv, label=name, color=color, lw=2.0)
-        ax_adv_step.fill_between(x_steps, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.18)
+        # --- Panel 4: Adv Cos Sim vs Gradient Steps ---
+        ax_adv_step.plot(x_steps, mean_adv, label=name, color=color, lw=lw, ls=linestyle)
+        ax_adv_step.fill_between(x_steps, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
-        # --- Panel 5: Adv Cos Sim vs Samples ---
-        ax_adv_sample.plot(x_samples, mean_adv, label=name, color=color, lw=2.0)
-        ax_adv_sample.fill_between(x_samples, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.18)
+        # --- Panel 5: Adv Cos Sim vs Active Rollout Transitions ---
+        ax_adv_sample.plot(x_samples, mean_adv, label=name, color=color, lw=lw, ls=linestyle)
+        ax_adv_sample.fill_between(x_samples, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
-        # --- Panel 6: Adv Cos Sim vs Wall-Clock Time ---
-        ax_adv_time.plot(mean_time, mean_adv, label=name, color=color, lw=2.0)
-        ax_adv_time.fill_between(mean_time, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.18)
+        # --- Panel 6: Adv Cos Sim vs Estimated LLM FLOPs (or Wall-Clock Time) ---
+        ax_adv_compute.plot(x_compute, mean_adv, label=name, color=color, lw=lw, ls=linestyle)
+        ax_adv_compute.fill_between(x_compute, mean_adv - sem_adv, mean_adv + sem_adv, color=color, alpha=0.14 if is_matched_mc else 0.18)
 
     # Subplot formatting
-    for ax in [ax_msve_step, ax_msve_sample, ax_msve_time]:
+    for ax in [ax_msve_step, ax_msve_sample, ax_msve_compute]:
         ax.set_yscale("log")
         ax.set_ylabel("Mean Squared Value Error (MSVE)")
         ax.grid(True, which="both", ls="--", lw=0.5, alpha=0.6)
 
-    for ax in [ax_adv_step, ax_adv_sample, ax_adv_time]:
+    for ax in [ax_adv_step, ax_adv_sample, ax_adv_compute]:
         ax.set_ylabel(r"Advantage Cosine Similarity $\cos(\hat{\mathbf{A}}, \mathbf{A}^*)$")
         ax.set_ylim(-0.1, 1.05)
         ax.axhline(1.0, color="gray", ls=":", lw=1.0)
-        ax.grid(True, ls="--", lw=0.5, alpha=0.6)
+        ax.grid(True, which="both", ls="--", lw=0.5, alpha=0.6)
 
-    ax_msve_step.set_title("MSVE vs. Gradient Updates")
-    ax_msve_step.set_xlabel("Parameter Updates")
+    ax_msve_sample.set_xscale("log")
+    ax_adv_sample.set_xscale("log")
+    if has_llm_flops:
+        ax_msve_compute.set_xscale("log")
+        ax_adv_compute.set_xscale("log")
+
+    if has_compute_matched and base_total_grad_steps is not None:
+        ax_msve_step.set_xlim(0, base_total_grad_steps * 1.03)
+        ax_adv_step.set_xlim(0, base_total_grad_steps * 1.03)
+
+    step_label = "Cumulative Gradient Steps"
+    sample_label = "Active Rollout Transitions (Log Scale)"
+    compute_label = "Estimated LLM FLOPs (Units of $N$ Params, Log Scale)" if has_llm_flops else "Elapsed Wall-Clock Time (s)"
+    compute_title_suffix = "Estimated LLM Compute" if has_llm_flops else "Total Compute (Seconds)"
+
+    ax_msve_step.set_title("MSVE vs. Gradient Steps")
+    ax_msve_step.set_xlabel(step_label)
     ax_msve_sample.set_title("MSVE vs. Sample Transitions")
-    ax_msve_sample.set_xlabel("Total Environment Transitions")
-    ax_msve_time.set_title("MSVE vs. Total Compute (Seconds)")
-    ax_msve_time.set_xlabel("Elapsed Wall-Clock Time (s)")
+    ax_msve_sample.set_xlabel(sample_label)
+    ax_msve_compute.set_title(f"MSVE vs. {compute_title_suffix}")
+    ax_msve_compute.set_xlabel(compute_label)
 
-    ax_adv_step.set_title("Advantage Alignment vs. Updates")
-    ax_adv_step.set_xlabel("Parameter Updates")
+    ax_adv_step.set_title("Advantage Alignment vs. Gradient Steps")
+    ax_adv_step.set_xlabel(step_label)
     ax_adv_sample.set_title("Advantage Alignment vs. Samples")
-    ax_adv_sample.set_xlabel("Total Environment Transitions")
-    ax_adv_time.set_title("Advantage Alignment vs. Total Compute")
-    ax_adv_time.set_xlabel("Elapsed Wall-Clock Time (s)")
+    ax_adv_sample.set_xlabel(sample_label)
+    ax_adv_compute.set_title(f"Advantage Alignment vs. {compute_title_suffix}")
+    ax_adv_compute.set_xlabel(compute_label)
 
-    ax_msve_step.legend(loc="upper right", framealpha=0.9)
+    ax_msve_step.legend(loc="upper right", framealpha=0.9, fontsize=8.5)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    flop_assumptions = results.get("flop_assumptions", None)
+    if has_llm_flops and flop_assumptions:
+        fig.text(
+            0.5, 0.012,
+            flop_assumptions,
+            ha="center", va="bottom", fontsize=8.5, color="#333333",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="#f8f9fa", edgecolor="#cccccc", alpha=0.95),
+        )
+        plt.tight_layout(rect=[0, 0.055, 1, 0.95])
+    else:
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
     pdf_path = os.path.join(save_dir, f"{prefix}_comparison_curves.pdf")
     png_path = os.path.join(save_dir, f"{prefix}_comparison_curves.png")
     plt.savefig(pdf_path, bbox_inches="tight")
@@ -275,8 +310,11 @@ def compute_and_save_auc_summary(
     for name, data in results["methods"].items():
         x_steps = np.asarray(data["x_updates"])
         x_samples = np.asarray(data["x_samples"])
-        x_times = np.asarray(data["x_wallclock"])
-        mean_time = np.mean(x_times, axis=0) if x_times.ndim == 2 else x_times
+        if "x_llm_flops" in data:
+            x_compute = np.asarray(data["x_llm_flops"])
+        else:
+            x_times = np.asarray(data["x_wallclock"])
+            x_compute = np.mean(x_times, axis=0) if x_times.ndim == 2 else x_times
 
         msve = np.asarray(data["msve"])
         adv_cos = np.asarray(data["advantage_cosine_sim"])
@@ -291,11 +329,11 @@ def compute_and_save_auc_summary(
 
         # Normalized AUCs:
         auc_s_msve = compute_normalized_auc(x_samples, mean_msve)
-        auc_c_msve = compute_normalized_auc(mean_time, mean_msve)
+        auc_c_msve = compute_normalized_auc(x_compute, mean_msve)
         auc_u_msve = compute_normalized_auc(x_steps, mean_msve)
 
         auc_s_adv = compute_normalized_auc(x_samples, mean_adv)
-        auc_c_adv = compute_normalized_auc(mean_time, mean_adv)
+        auc_c_adv = compute_normalized_auc(x_compute, mean_adv)
         auc_u_adv = compute_normalized_auc(x_steps, mean_adv)
 
         rows.append({
