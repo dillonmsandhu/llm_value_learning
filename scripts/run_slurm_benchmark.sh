@@ -57,9 +57,14 @@ fi
 
 # Environment Configuration (Accept positional CLI arguments or environment variables)
 ENV_TYPE="${1:-${ENV_TYPE:-single_dag}}"
-TOTAL_TRANSITIONS="${2:-${TOTAL_TRANSITIONS:-1000000}}"
+if [ "$ENV_TYPE" = "single_dag" ]; then
+    DEFAULT_UPDATES=25
+else
+    DEFAULT_UPDATES=100
+fi
+NUM_UPDATES="${2:-${NUM_UPDATES:-$DEFAULT_UPDATES}}"
 N_SEEDS="${3:-${N_SEEDS:-5}}"
-ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0, fbi_staged_lam0.5}}"
+ALGOS="${4:-${ALGOS:-mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
 OUT_DIR="${5:-${OUT_DIR:-results}}"
 SWEEP_ID="${6:-${SWEEP_ID:-}}"
 MASTER_SEED="${7:-${MASTER_SEED:-42}}"
@@ -79,7 +84,6 @@ PERCENT_CORRECT="${PERCENT_CORRECT:-}"
 # RLVR Optimizer & Schedule Parameters (fixed trunk batch & replay ratio across algorithms)
 TRAJECTORIES_PER_UPDATE="${TRAJECTORIES_PER_UPDATE:-64}"
 EPOCHS_PER_UPDATE="${EPOCHS_PER_UPDATE:-2}"
-NUM_UPDATES="${NUM_UPDATES:-100}"
 GRAD_STEPS_PER_UPDATE="${GRAD_STEPS_PER_UPDATE:-}"
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -95,7 +99,7 @@ echo "  Host:             $(hostname)"
 echo "  Date:             $(date)"
 echo "  Python:           $PYTHON"
 echo "  Environment:      $ENV_TYPE"
-echo "  Total Budget:     $TOTAL_TRANSITIONS transitions"
+echo "  Updates:          $NUM_UPDATES"
 echo "  Seeds:            $N_SEEDS (Master: $MASTER_SEED)"
 echo "  Algorithms:       $ALGOS"
 echo "  Sweep / Run ID:   $SWEEP_ID"
@@ -104,7 +108,6 @@ echo "=================================================================="
 
 $PYTHON run_benchmark.py \
     --env_type "$ENV_TYPE" \
-    --total_transitions "$TOTAL_TRANSITIONS" \
     --n_seeds "$N_SEEDS" \
     --master_seed "$MASTER_SEED" \
     --algos "$ALGOS" \

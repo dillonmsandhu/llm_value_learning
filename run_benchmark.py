@@ -748,12 +748,13 @@ def run_benchmark(
     Compute-Matched MC baseline.
     """
     os.makedirs(save_dir, exist_ok=True)
-    algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.5"]
+    algos = algos or ["mc", "vine_k2", "vine_k4", "fbi_lam0.0", "fbi_lam0.8", "fbi_staged_lam0.0", "fbi_staged_lam0.8"]
+    resolved_updates = int(num_updates) if num_updates is not None else (25 if env_type == "single_dag" else 100)
 
     print("=" * 85)
     print(f"BENCHMARK SUITE: VALUE LEARNING & ADVANTAGE ALIGNMENT")
     print(f"  Target Environment: {env_type.upper()}")
-    print(f"  Total Transitions:  {total_transitions_budget:,}")
+    print(f"  Updates / Trunk B:  {resolved_updates} updates x {trajectories_per_update} traj/update")
     print(f"  Seeds:              {n_seeds} (Master Seed: {master_seed})")
     print(f"  Algorithms:         {algos}")
     print(f"  JAX Platform:       {jax.default_backend().upper()} | Devices: {jax.devices()}")
@@ -835,8 +836,8 @@ def run_benchmark(
         # Align to nearest positive multiple of num_steps so Staged FBI executes identical grad steps
         actual_grad_steps = max(1, round(raw_grad_steps / num_steps)) * num_steps
 
-    # Fixed updates across all main algorithms (default 100, or derived if total_transitions_budget overridden cleanly)
-    target_num_updates = int(num_updates) if num_updates is not None else 100
+    # Fixed outer updates across all main algorithms (default: 25 for single_dag, 100 for full suites)
+    target_num_updates = resolved_updates
     base_total_grad_steps = target_num_updates * actual_grad_steps
     eff_epochs = (actual_grad_steps * minibatch_size) / max(1.0, est_active_buffer)
 
@@ -984,10 +985,10 @@ def run_benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
     parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "single_tree", "tree"], help="Environment type: single_dag, dag, single_tree, tree")
-    parser.add_argument("--total_transitions", type=int, default=150000, help="Total transition budget")
+    parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
-    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0", help="Comma-separated algos")
+    parser.add_argument("--algos", type=str, default="mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")
     
@@ -1008,7 +1009,7 @@ def main():
     # RLVR Training & Fair Comparison params (fixed trunk batch & replay ratio across all algos)
     parser.add_argument("--trajectories_per_update", type=int, default=64, help="Fixed trunk trajectories B collected per update across all algorithms (default: 64)")
     parser.add_argument("--epochs_per_update", type=int, default=2, help="Target critic epochs over active trunk buffer per update (default: 2)")
-    parser.add_argument("--num_updates", type=int, default=100, help="Number of updates for main equal-gradient-steps comparison (default: 100)")
+    parser.add_argument("--num_updates", type=int, default=None, help="Number of updates for main equal-gradient-steps comparison (default: 25 for single_dag, 100 otherwise)")
     parser.add_argument("--grad_steps_per_update", type=int, default=None, help="Override gradient steps per update (default: calibrated to ~epochs_per_update)")
     parser.add_argument("--no_compute_matched_mc", action="store_true", help="Disable bonus compute-matched Standard MC baseline")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for warmup-cosine schedule (default: 5e-4)")

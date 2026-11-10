@@ -7,11 +7,12 @@
 # Automatically chains a dependent CPU post-processing job upon completion.
 #
 # Usage:
-#   bash scripts/submit_benchmark.sh [ENV_TYPE] [TOTAL_TRANSITIONS] [N_SEEDS] [OUT_DIR]
+#   bash scripts/submit_benchmark.sh [ENV_TYPE] [NUM_UPDATES] [N_SEEDS] [OUT_DIR] [ALGOS] [MASTER_SEED]
 #
 # Examples:
-#   bash scripts/submit_benchmark.sh dag 250000 5 results
-#   bash scripts/submit_benchmark.sh tree 250000 5 results
+#   bash scripts/submit_benchmark.sh single_dag 25 8 results
+#   bash scripts/submit_benchmark.sh dag 100 8 results
+#   bash scripts/submit_benchmark.sh tree 100 8 results
 # ==============================================================================
 
 set -e
@@ -28,13 +29,18 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 # CLI Parameters
 ENV_TYPE=${1:-single_dag}
-TOTAL_TRANSITIONS=${2:-250000}
+if [ "$ENV_TYPE" = "single_dag" ]; then
+    DEFAULT_UPDATES=25
+else
+    DEFAULT_UPDATES=100
+fi
+NUM_UPDATES=${2:-$DEFAULT_UPDATES}
 N_SEEDS=${3:-5}
 OUT_DIR=${4:-"results"}
-ALGOS=${5:-"mc,vine_k2,vine_k4,fbi_lam0.0,fbi_staged_lam0.0"}
+ALGOS=${5:-"mc,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
 MASTER_SEED=${6:-42}
 
-export ENV_TYPE TOTAL_TRANSITIONS N_SEEDS OUT_DIR ALGOS MASTER_SEED
+export ENV_TYPE NUM_UPDATES N_SEEDS OUT_DIR ALGOS MASTER_SEED
 
 # Python interpreter discovery
 if [ -f "/home/users/ds541/.pyenv/versions/3.10.15/envs/gymnax/bin/python" ]; then
@@ -59,7 +65,7 @@ TARGET_DIR="${OUT_DIR}/benchmark_${ENV_TYPE}_${SWEEP_ID}"
 echo "================================================================"
 echo "Submitting Comprehensive Value Benchmark to SLURM Cluster"
 echo "  Target Env:       $ENV_TYPE"
-echo "  Total Budget:     $TOTAL_TRANSITIONS transitions"
+echo "  Updates:          $NUM_UPDATES"
 echo "  Seeds:            $N_SEEDS (Master: $MASTER_SEED)"
 echo "  Algorithms:       $ALGOS"
 echo "  Sweep ID:         $SWEEP_ID"
@@ -77,7 +83,7 @@ SBATCH_CMD="sbatch --parsable \
     --output=\"${LOG_DIR}/%j_${ENV_TYPE}.out\" \
     --error=\"${LOG_DIR}/%j_${ENV_TYPE}.err\" \
     --export=ALL \
-    \"$BENCH_SCRIPT\" \"$ENV_TYPE\" \"$TOTAL_TRANSITIONS\" \"$N_SEEDS\" \"$ALGOS\" \"$OUT_DIR\" \"$SWEEP_ID\" \"$MASTER_SEED\""
+    \"$BENCH_SCRIPT\" \"$ENV_TYPE\" \"$NUM_UPDATES\" \"$N_SEEDS\" \"$ALGOS\" \"$OUT_DIR\" \"$SWEEP_ID\" \"$MASTER_SEED\""
 
 JOB_ID=$(eval "$SBATCH_CMD")
 echo "Submitted GPU Benchmark Job ID: $JOB_ID"
