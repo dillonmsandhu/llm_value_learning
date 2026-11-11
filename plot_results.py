@@ -154,33 +154,24 @@ def plot_comparison_curves(
         m_msve, s_msve = float(np.mean(r_msve)), float(np.std(r_msve) / np.sqrt(len(r_msve)))
         m_adv, s_adv = float(np.mean(r_adv)), float(np.std(r_adv) / np.sqrt(len(r_adv)))
 
-        # Gradient-step panels take 0 critic updates: keep horizontal reference lines
-        ax_msve_step.axhline(m_msve, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
-        ax_msve_step.axhspan(max(1e-7, m_msve - s_msve), m_msve + s_msve, color=color, alpha=0.09)
-        ax_adv_step.axhline(m_adv, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
-        ax_adv_step.axhspan(m_adv - s_adv, min(1.05, m_adv + s_adv), color=color, alpha=0.09)
+        # Direct estimation has no learning curve: show one use, never repeated spending.
+        ax_msve_step.errorbar(0, m_msve, yerr=s_msve, fmt="D", color=color,
+                             capsize=3, label=ref_name + " (one batch)")
+        ax_adv_step.errorbar(0, m_adv, yerr=s_adv, fmt="D", color=color, capsize=3)
 
-        def _plot_budgeted_ref(ax, x_key, mean_val, sem_val, is_msve_ax: bool):
-            if x_key in ref_data and (x_key != "x_llm_flops" or has_llm_flops):
-                rx = np.asarray(ref_data[x_key], dtype=np.float64)
-                ry = np.full_like(rx, mean_val, dtype=np.float64)
-                lo = np.maximum(1e-7, ry - sem_val) if is_msve_ax else (ry - sem_val)
-                hi = (ry + sem_val) if is_msve_ax else np.minimum(1.05, ry + sem_val)
-                ax.plot(rx, ry, color=color, ls=ls_ref, lw=2.0, alpha=0.92)
-                ax.fill_between(rx, lo, hi, color=color, alpha=0.10)
-                # Mark u=1 (hollow diamond: first PPO update possible) and u=U (filled diamond: final PPO update)
-                ax.plot(rx[0], mean_val, marker="D", ms=6.0, mfc="white", mec=color, mew=1.8, zorder=6)
-                ax.plot(rx[-1], mean_val, marker="D", ms=6.0, mfc=color, mec=color, zorder=6)
-            else:
-                ax.axhline(mean_val, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
-                lo = max(1e-7, mean_val - sem_val) if is_msve_ax else (mean_val - sem_val)
-                hi = (mean_val + sem_val) if is_msve_ax else min(1.05, mean_val + sem_val)
-                ax.axhspan(lo, hi, color=color, alpha=0.09)
+        def _plot_budgeted_ref(ax, x_key, mean_val, sem_val):
+            # First entry also supports older files containing cumulative budgets.
+            if x_key in ref_data:
+                rx = np.asarray(ref_data[x_key], dtype=np.float64).reshape(-1)
+                if rx.size:
+                    ax.errorbar(rx[0], mean_val, yerr=sem_val, fmt="D",
+                                color=color, capsize=3,
+                                label=ref_name + " (one batch; generation cost)")
 
-        _plot_budgeted_ref(ax_msve_sample, "x_samples", m_msve, s_msve, True)
-        _plot_budgeted_ref(ax_adv_sample, "x_samples", m_adv, s_adv, False)
-        _plot_budgeted_ref(ax_msve_compute, "x_llm_flops", m_msve, s_msve, True)
-        _plot_budgeted_ref(ax_adv_compute, "x_llm_flops", m_adv, s_adv, False)
+        _plot_budgeted_ref(ax_msve_sample, "x_samples", m_msve, s_msve)
+        _plot_budgeted_ref(ax_adv_sample, "x_samples", m_adv, s_adv)
+        _plot_budgeted_ref(ax_msve_compute, "x_llm_flops", m_msve, s_msve)
+        _plot_budgeted_ref(ax_adv_compute, "x_llm_flops", m_adv, s_adv)
 
     # Subplot formatting
     for ax in [ax_msve_step, ax_msve_sample, ax_msve_compute]:

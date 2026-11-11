@@ -983,8 +983,8 @@ def run_benchmark(
     """
     os.makedirs(save_dir, exist_ok=True)
     algos = algos or [
-        "mc", "td_lam0.0", "td_lam0.8", "vine_k2", "vine_k4",
-        "fbi_lam0.0", "fbi_lam0.8", "fbi_staged_lam0.0", "fbi_staged_lam0.8",
+        "mc", "td_lam0.8", "vine_k2", "vine_k4",
+        "fbi_lam0.0", "fbi_lam0.8",
     ]
     resolved_updates = int(num_updates) if num_updates is not None else (25 if env_type == "single_dag" else 100)
 
@@ -1238,7 +1238,7 @@ def run_benchmark(
 
     # 4. Evaluate Non-Parametric Pure Vine MC Estimator (no network, no gradient) on all eval_set states
     if "next_states_all" in eval_set:
-        vine_ks = sorted({int(a.split("_k")[1]) for a in algos if a.startswith("vine_k")} | {2, 4})
+        vine_ks = [2]
         for k_ref in vine_ks:
             ref_name = f"Vine MC Estimator (K={k_ref})"
             print(f"\n--- Evaluating Non-Parametric Reference: {ref_name} ({n_seeds} seeds) ---", flush=True)
@@ -1258,8 +1258,9 @@ def run_benchmark(
                 n_batches=8,
                 seed=master_seed,
             )
-            u_grid = np.arange(1, target_num_updates + 1, dtype=np.float64)
-            ref_res["num_updates"] = int(target_num_updates)
+            u_grid = np.array([1.0], dtype=np.float64)
+            ref_res["num_updates"] = 1
+            ref_res["cost_basis"] = "one trunk batch plus K full continuations per active state; generation only"
             ref_res["samples_per_update"] = budget["samples_per_update"]
             ref_res["flops_per_update"] = budget["flops_per_update"]
             ref_res["x_samples"] = u_grid * budget["samples_per_update"]
@@ -1299,7 +1300,7 @@ def main():
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
-    parser.add_argument("--algos", type=str, default="mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8", help="Comma-separated algos")
+    parser.add_argument("--algos", type=str, default="mc,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     parser.add_argument("--save_dir", type=str, default=None, help="Explicit save directory (overrides --out_dir/--sweep_id)")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")

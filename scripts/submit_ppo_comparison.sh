@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four matched, trunk-only PPO runs; only the critic estimator changes.
+# Five matched, trunk-only PPO runs; only the critic estimator changes.
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -7,7 +7,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Usage: bash scripts/submit_ppo_comparison.sh [DAG_TYPE] [OUTPUT_BASE]
 
 Defaults: dag_approach, results/ppo_comparison/dag_approach.
-Submits four GPU jobs: Vine-target K=2, MC, TD(lambda=.8), FBI(lambda=.8,K=2).
+Submits five GPU jobs: Vine-target K=2 and K=4, MC, TD(lambda=.8), FBI(lambda=.8,K=2).
 FBI includes the trunk transition plus one fresh branch. Actor GAE lambda=1
 and all other PPO settings are identical across methods.
 
@@ -29,7 +29,7 @@ Examples:
   DRY_RUN=1 bash scripts/submit_ppo_comparison.sh
 
 Activate the cluster JAX environment first, or set PYTHON_BIN.
-Results go into OUTPUT_BASE/{vine_k2,mc,td_lam08,fbi_lam08_k2}/.
+Results go into OUTPUT_BASE/{vine_k2,vine_k4,mc,td_lam08,fbi_lam08_k2}/.
 HELP
     exit 0
 fi
@@ -46,7 +46,7 @@ case "$COMPARE_ENV" in
 esac
 
 # Keep every setting in one shared array: no per-estimator PPO overrides.
-# MC/Vine ignore critic_lambda; MC/TD ignore K. They remain identical in configs.
+# MC/Vine ignore critic_lambda; MC/TD ignore K. Only Vine K=4 overrides K.
 COMMON_ARGS=(
     --num_problems "${NUM_PROBLEMS:-1}"
     --num_milestones "${NUM_MILESTONES:-4}"
@@ -67,20 +67,23 @@ COMMON_ARGS=(
     --n_heads "${N_HEADS:-4}"
     --n_layers "${N_LAYERS:-1}"
     --final_hidden_dim "${FINAL_HIDDEN_DIM:-32}"
-    --actor_lambda 1.0 --critic_lambda 0.8 --k 2
+    --actor_lambda 1.0 --critic_lambda 0.8
     --gamma 1.0 --clip_eps 0.2 --value_clip 0.2
     --entropy_coef 0.01 --max_grad_norm 1.0
 )
 
-for method in vine mc td fbi; do
-    case "$method" in
-        vine) label=vine_k2 ;;
+for variant in vine_k2 vine_k4 mc td fbi; do
+    k=2
+    method=$variant
+    case "$variant" in
+        vine_k2) method=vine; label=vine_k2 ;;
+        vine_k4) method=vine; label=vine_k4; k=4 ;;
         mc) label=mc ;;
         td) label=td_lam08 ;;
         fbi) label=fbi_lam08_k2 ;;
     esac
     command=(bash scripts/submit_dag_ppo.sh "$COMPARE_ENV" "$method"
-             "${COMMON_ARGS[@]}" --save_dir "${COMPARE_OUT}/${label}")
+             "${COMMON_ARGS[@]}" --k "$k" --save_dir "${COMPARE_OUT}/${label}")
     printf '\n%s\n' "PPO comparison: ${label}"
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
         printf '%q ' "${command[@]}"
