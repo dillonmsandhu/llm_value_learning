@@ -378,3 +378,24 @@ class TransformerCritic(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Returns V(s)."""
         return self.value(x)
+
+
+class TransformerPolicy(nn.Module):
+    """Independent prefix-only actor using the same feature architecture as the critic."""
+    vocab_size: int
+    num_actions: int
+    max_len: int
+    d_model: int = 64
+    n_heads: int = 4
+    n_layers: int = 2
+    final_hidden_dim: int = 32
+
+    @nn.compact
+    def __call__(self, x):
+        features = TransformerCritic(
+            vocab_size=self.vocab_size, max_len=self.max_len, d_model=self.d_model,
+            n_heads=self.n_heads, n_layers=self.n_layers,
+            final_hidden_dim=self.final_hidden_dim, add_bos=False,
+        ).value_features(x)
+        return nn.Dense(self.num_actions, kernel_init=orthogonal(0.01),
+                        bias_init=constant(0.0))(features)
