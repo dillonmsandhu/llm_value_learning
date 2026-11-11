@@ -1,11 +1,12 @@
 \documentclass[11pt,a4paper]{article}
 
-\usepackage[margin=0.85in]{geometry}
+\usepackage[margin=0.80in]{geometry}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{mathtools}
 \usepackage{booktabs}
 \usepackage{enumitem}
 \usepackage{xcolor}
+\usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{cleveref}
 \usepackage{tikz}
@@ -27,236 +28,249 @@
     urlcolor=primaryblue
 }
 
-\title{\textbf{Plain-English Guide to the VinePPO Testbed:\\Environments, Transformer Critic, Batched FBI, and Staged FBI}}
-\author{Project Overview \& Visual Walkthrough}
-\date{\today}
+\title{\textbf{Scalable Step-Level Value Estimation for LLM Reasoning:\\Environments, Transformer Critic, Batched FBI, and Empirical Benchmarks}}
+\author{\textbf{Research Technical Guide \& Benchmark Report}}
+\date{November 2026}
 
 \begin{document}
 
 \maketitle
 
-\section{What This Project Is Doing (Big Picture)}
+\begin{abstract}
+Step-level value estimation is crucial for credit assignment when training Large Language Models (LLMs) on multi-step reasoning tasks with Reinforcement Learning (RLVR / PPO). While Monte Carlo rollouts exhibit high target variance and VinePPO branching incurs a prohibitive $\mathcal{O}(K \cdot T^2)$ quadratic token generation overhead, \textbf{1-Step Fitted Backward Induction (FBI)} reduces rollout sample complexity to $\mathcal{O}(K \cdot T)$ by branching only for a single step and bootstrapping off a neural value function. In this report, we document the complete VinePPO benchmark testbed: the procedural difficulty-spectrum Reasoning DAG (\texttt{dag\_full}) and Binary Tree (\texttt{tree\_full}) suites, the modern causal Transformer critic with learned token embeddings and Rotary Position Embeddings (RoPE), and the algorithmic formulations of Standard MC, Vine-Target, Batched FBI, and Staged FBI. We present extensive empirical benchmarks across 8 random seeds on NVIDIA RTX A5000 GPUs. Our findings demonstrate that \textbf{Batched FBI ($\lambda=0.8$)} achieves equal or superior advantage cosine alignment ($\text{AdvCos} \approx 0.88 - 0.92$) compared to Vine-Target ($K=4$) while consuming $3.3\times$ fewer FLOPs and $8.6\times$ fewer rollout samples on the DAG benchmark, establishing it as the Pareto-optimal critic target for LLM compute. Finally, in an appendix section, we analyze the theoretical and empirical dynamics of Staged FBI, showing that while reverse-time staging accelerates learning under low $\lambda=0.0$, a higher $\lambda=0.8$ provides superior performance without the overhead of staged backward fitting.
+\end{abstract}
 
-When training a Large Language Model (LLM) to solve multi-step math or reasoning problems using Reinforcement Learning (RL), we usually only get a reward at the very end of the solution: $R = 1$ if the final answer is right, and $R = 0$ if it is wrong. 
-
-To train the model effectively with PPO (Proximal Policy Optimization), we need a \textbf{Critic} (value function $V_\phi(s_t)$) that can look at an incomplete reasoning chain at step $t$ and estimate: \emph{``What is the probability that the model will eventually reach a correct final answer from this point?''} Once we know the value of every step, we can tell whether a specific reasoning step $a_t$ improved or hurt our chances of success via the step-level advantage:
-\[
-    \hat{A}(s_t, a_t) = r_t + \gamma V(s_{t+1}) - V(s_t).
-\]
-Rather than running expensive LLM decoding experiments to study how best to train this critic, this project builds a fast, exact, pure-JAX synthetic testbed where we \textbf{know the exact ground-truth value $V^*(s)$ of every state} via dynamic programming, allowing us to directly measure how fast and accurately different RL value-learning algorithms converge.
-
-\bigskip
-
-\section{The Environments (MRPs / MDPs)}
-
-The codebase models multi-step reasoning using two synthetic Markov environments where observations are sequences of tokens fed into a Transformer, and rewards are sparse and binary ($R \in \{0, 1\}$ at the end of the episode):
-
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Binary Tree MRP (\texttt{envs/tree\_mrp.py}):}
-    \begin{itemize}
-        \item \textbf{Structure:} A complete binary tree of depth $D$ (e.g., $D=4$ or $D=7$) with $2^{D+1}-1$ states. Starting at the root $s_0$, at each step the trajectory branches Left (\texttt{0}) or Right (\texttt{1}).
-        \item \textbf{Rewards \& Dynamics:} Only a small cluster of leaf nodes at depth $D$ are ``correct solutions'' yielding $R = 1$; all other leaves yield $R = 0$. At any internal node where one child subtree contains a correct leaf and the other is a dead end, the base policy picks the correct branch with probability $p$ (e.g., $p = 0.8$) and blunders into the dead-end subtree with probability $1 - p$.
-        \item \textbf{Observation:} The sequence of binary choices taken so far, padded to length $D$ (e.g., \texttt{[1, 0, 1, PAD, PAD]}).
-    \end{itemize}
-
-    \item \textbf{Procedural Reasoning DAG (\texttt{envs/reasoning\_dag\_env.py}):}
-    \begin{itemize}
-        \item \textbf{Why a DAG instead of a Tree?} Real reasoning is not a strict tree: different valid chains of thought can reconverge to the same intermediate milestone, and if a model makes a mistake (derails), it can verify/self-correct and get back on track.
-        \item \textbf{Hidden Markov State:} Each problem requires completing $M$ sequential \textbf{milestones} within $T$ maximum steps ($T > M$). The true underlying state is tracked by the tuple $(\texttt{prompt\_idx},\, \text{step } t,\, \text{milestone } m \in \{0..M\},\, \texttt{is\_derailed } d \in \{0, 1\})$.
-        \item \textbf{Transitions:} At each step, the base policy chooses from $|A|$ discrete action tokens. When on-track ($d=0$), picking a valid advance token increments the milestone ($m \to m+1$, probability $p_{\text{advance}}=0.65$), picking a neutral token keeps $(m, d=0)$, and picking a blunder token derails the trajectory ($d \to 1$, probability $p_{\text{blunder}}=0.15$). Once derailed ($d=1$), normal actions fail to advance $m$; the trajectory can only return to $d=0$ by emitting a special \textbf{self-correction/verification action} (probability $p_{\text{recover}}=0.35$).
-        \item \textbf{What the Critic Sees:} Crucially, the network \textbf{never} sees the privileged $(m, d)$ variables. It only sees the raw sequence of emitted token IDs: \texttt{[BOS, PROMPT\_ID, SEP, $a_0$, $a_1$, \dots, $a_{t-1}$, PAD, \dots]}. It must infer which milestone has been reached and whether the chain of thought is currently derailed purely from the token history.
-    \end{itemize}
-\end{enumerate}
-
-In both environments, an exact backward-induction solver (\texttt{solve\_backward\_induction()}) precomputes the true value $V^*(s)$ and true action advantages $A^*(s, a)$ for every state so we can evaluate the critic's Mean Squared Value Error (MSVE) and Advantage Cosine Similarity at every training step.
-
-\bigskip
-
-\section{The Network (\texttt{transformer.py})}
-
-The critic $V_\phi(s_t)$ is a modern, miniature LLaMA-style causal Transformer (\texttt{TransformerCritic}):
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Token Embedding:} Maps the discrete observation sequence (and an optional prepended \texttt{BOS} token) into $d_{\text{model}}$-dimensional vectors (default $d_{\text{model}} = 64$).
-    \item \textbf{Causal Transformer Blocks ($N=2$ layers, $H=4$ heads):} Each layer applies Pre-RMSNorm, Multi-Head Causal Self-Attention with Rotary Position Embeddings (RoPE), and a SwiGLU feed-forward network.
-    \item \textbf{Last-Valid-Token Pooling:} Extracts the hidden state at the last non-padding token position (which summarizes the entire reasoning prefix up to step $t$).
-    \item \textbf{MLP \& Value Head:} Passes that pooled vector through a 2-layer SiLU MLP with RMSNorm and a zero-initialized linear projection head to output a scalar value prediction $V_\phi(s_t) \in \mathbb{R}$.
-\end{enumerate}
-
-\bigskip
-
-\section{The Value-Learning Algorithms}
-
-Every algorithm starts an outer training update by rolling out a batch of $B = 64$ primary ``base trajectories'' (chains) $\tau = (s_0, a_0, s_1, \dots, s_T)$, and differs in how it constructs and fits the regression targets $y(s_t)$ for the states along that chain.
-
-\subsection{Algorithm 1: Standard Monte Carlo}
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-    \item \textbf{How it works:} Generates only the single base trajectory ($K=1$). Every intermediate state $s_t$ along that trajectory is trained to predict the final binary reward $R(s_T) \in \{0, 1\}$ of that single rollout ($y_t^{\text{MC}} = R(s_T)$ for all $t \in \{0, \dots, T\}$).
-    \item \textbf{Trade-off:} Cheapest rollout cost ($\mathcal{O}(T)$ transitions per trajectory), but highest variance: the same intermediate state $s_t$ receives target $1$ on one trajectory and $0$ on another.
-\end{itemize}
-
-\subsection{Algorithm 2: Vine-Target (Full-Horizon Branching)}
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-    \item \textbf{How it works:} Inspired by VinePPO, at \emph{every} visited state $s_t$ along the base trajectory, the environment state is cloned $K$ times (e.g., $K=4$) and rolled out \textbf{all the way to the end of the episode ($t \to T$)}. The average terminal reward $\hat{V}_{\text{MC}}(s_t) = \frac{1}{K}\sum_{k=1}^K R(\tau_{t \to T}^{(k)})$ is used as a low-variance target.
-    \item \textbf{Optional Precision-Weighted Shrinkage:} Because $\hat{V}_{\text{MC}}(s_t)$ is an average of $K$ Bernoulli trials, its sampling variance is $\hat{\sigma}^2_{\text{MC}}(s_t) = \frac{\hat{V}_{\text{MC}}(1-\hat{V}_{\text{MC}})}{K-1}$. We can optionally blend $\hat{V}_{\text{MC}}(s_t)$ with the current critic prediction $V_\phi(s_t)$ using inverse-variance weights when the critic is already accurate.
-    \item \textbf{Trade-off:} Unbiased Monte Carlo targets (zero bootstrapping drift), but requires $\mathcal{O}(K \cdot T^2)$ environment transitions per trajectory because every intermediate branch must be rolled out all the way to horizon $T$.
-\end{itemize}
-
-\medskip
-\noindent\textbf{The Core Idea of Fitted Backward Induction (FBI) --- 1-Step Branching:}
-Instead of rolling out $K$ branches all the way to the end of the episode ($T$), \textbf{Fitted Backward Induction (FBI)} rolls out $K$ parallel branches for \textbf{only 1 step} from each state $s_t$ on the primary chain:
-\[
-    s_t \xrightarrow{a_t^{(k)} \sim \pi} \big(r_t^{(k)},\; s_{t+1}^{(k)}\big), \qquad k = 1, \dots, K,
-\]
-reducing the total rollout cost from $\mathcal{O}(K \cdot T^2)$ to $\mathcal{O}(K \cdot T)$. Given critic parameters $\theta$, we approximate the expected 1-step Bellman backup at $s_t$ by averaging over those $K$ children:
-\[
-    \hat{V}_{\text{branch}}(s_t; \theta) \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_\theta\big(s_{t+1}^{(k)}\big) \Big),
-\]
-where $V_\theta(s_T^{(k)}) \equiv 0$ after a terminal step (so at the penultimate step $t = T-1$, $\hat{V}_{\text{branch}}(s_{T-1}) = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ is an \textbf{exact} average of terminal rewards with no critic bootstrap).
-To optionally blend this 1-step branched backup with longer-horizon returns along the primary chain via $\lambda \in [0, 1]$, we define the branched TD residual $\delta_t^{\text{branch}}(\theta) = \hat{V}_{\text{branch}}(s_t; \theta) - V_\theta(s_t)$ and the general $\lambda$-return target:
-\[
-    y_t^{(\lambda)}(\theta) \;=\; \hat{V}_{\text{branch}}(s_t; \theta) \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\theta), \qquad
-    \text{where}\quad \hat{A}_t^{(\lambda)}(\theta) = \delta_t^{\text{branch}}(\theta) + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\theta) \quad (\hat{A}_T^{(\lambda)} = 0).
-\]
-When $\lambda = 0$, the target simplifies to pure 1-step backward induction: $y_t^{(0)}(\theta) = \hat{V}_{\text{branch}}(s_t; \theta)$. Depending on \emph{which critic parameters $\theta$} are plugged into $y_t^{(\lambda)}(\theta)$ and \emph{in what order} the critic is trained, we obtain two distinct algorithms: \textbf{Batched FBI} (Algorithm 3) and \textbf{Staged FBI} (Algorithm 4).
-
-\subsection{\texorpdfstring{Algorithm 3: Batched FBI --- $\text{FBI}_{\text{batched}}(\lambda)$}{Algorithm 3: Batched FBI}}
-
-\textbf{Batched FBI} is the simpler, synchronous algorithm (\Cref{fig:batched_fbi_visual}). Within each outer training iteration, it computes all targets across the entire trajectory first using the fixed pre-update critic parameters $\phi_{\text{old}}$, and then fits the network on all timesteps simultaneously:
-
-\begin{enumerate}[leftmargin=*, itemsep=2pt]
-    \item \textbf{Step 1 (Rollout Chain + $K$ 1-Step Branches):}
-    Roll out the primary chain $\tau = (s_0, s_1, \dots, s_T)$ and, at each state $s_t$ ($t \in \{0, \dots, T-1\}$), sample $K$ independent 1-step transitions $s_t \to s_{t+1}^{(1..K)}$.
-    \item \textbf{Step 2 (Compute All Targets Using Fixed $\phi_{\text{old}}$):}
-    Freeze the current critic weights $\theta = \phi_{\text{old}}$ and compute the target $y_t$ for every step $t \in \{0, \dots, T-1\}$:
-    \[
-        y_t \;=\; y_t^{(\lambda)}(\phi_{\text{old}}) \;=\; \hat{V}_{\text{branch}}(s_t; \phi_{\text{old}}) + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}(\phi_{\text{old}}), \qquad \forall\, t \in \{0, \dots, T-1\}.
-    \]
-    \item \textbf{Step 3 (Fit All Timesteps Simultaneously):}
-    Collect the full-trajectory dataset $\mathcal{D}_{\text{all}} = \big\{(s_t, y_t)\big\}_{t=0}^{T-1}$ and update $\phi$ by minimizing the mean squared error over all timesteps together for $E$ passes (epochs):
-    \[
-        \min_\phi \; \mathcal{L}_{\text{batched}}(\phi) \;=\; \frac{1}{T} \sum_{t=0}^{T-1} \Big( V_\phi(s_t) - y_t \Big)^2.
-    \]
-\end{enumerate}
-
-\subsection{\texorpdfstring{Algorithm 4: Staged FBI --- $\text{FBI}_{\text{staged}}(\lambda)$}{Algorithm 4: Staged FBI}}
-
-\textbf{Why Staged FBI?} In Batched FBI with $\lambda = 0$, the target at step $t$ is $y_t = \frac{1}{K}\sum_{k=1}^K \big(r_t^{(k)} + \gamma V_{\phi_{\text{old}}}(s_{t+1}^{(k)})\big)$. Early in training, before $V_\phi$ has learned the values at step $t+1$, querying the pre-update network $V_{\phi_{\text{old}}}(s_{t+1}^{(k)})$ yields uncalibrated predictions, so it takes at least $T$ separate outer rollout iterations for terminal reward information at step $T$ to propagate all the way back to $s_0$.
-
-\textbf{Staged FBI} eliminates this lag by solving the value function in \textbf{reverse backward-induction order ($t = T-1 \to 0$)} within a single iteration, updating the critic parameters $\phi^{(T-1)} \to \phi^{(T-2)} \to \dots \to \phi^{(0)}$ at step $t+1$ \emph{before} querying them to construct the target at step $t$ (\Cref{fig:staged_fbi_visual}):
-
-\begin{enumerate}[leftmargin=*, itemsep=2pt]
-    \item \textbf{Step 1 (Rollout Chain + $K$ 1-Step Branches):}
-    Identical to Batched FBI: roll out the primary chain $\tau = (s_0, \dots, s_T)$ and fork $K$ 1-step branches $s_{t+1}^{(1..K)}$ at each state $s_t$.
-    \item \textbf{Step 2A (Base Case at the End of the Chain, $t = T-1$):}
-    At the penultimate step $t = T-1$, all $K$ 1-step branches land on terminal states $s_T^{(1..K)}$ where exact terminal rewards $R(s_T^{(k)}) \in \{0, 1\}$ are observed directly from the environment. Thus the target $y_{T-1} = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ (and $y_T = R(s_T)$) requires no critic bootstrapping. Initialize the active training set $\mathcal{D}_{T-1} = \big\{(s_{T-1}, y_{T-1}),\; (s_T, y_T)\big\}$ and run $M$ gradient steps on $\mathcal{D}_{T-1}$ to obtain calibrated terminal-stage parameters $\phi^{(T-1)}$.
-    \item \textbf{Step 2B (Backward Induction Loop for $t = T-2 \text{ down to } 0$):}
-    Proceeding backward one step at a time from $t = T-2$ down to $0$:
-    \begin{itemize}[itemsep=2pt]
-        \item \textbf{Compute Target at Step $t$ Using Just-Fitted Parameters $\phi^{(t+1)}$:} Query the critic $V_{\phi^{(t+1)}}$ (which was just trained on step $t+1$) on the $K$ 1-step children of $s_t$:
-        \[
-            y_t \;=\; y_t^{(\lambda)}\big(\phi^{(t+1)}\big) \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big) \Big) \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}.
-        \]
-        \item \textbf{Add $(s_t, y_t)$ to Cumulative Active Set $\mathcal{D}_t$:} Because $V_\phi$ is a single shared neural network, training \emph{only} on step $t$ would overwrite what the network just learned at deeper steps $t+1 \dots T$. We therefore keep all resolved steps $[t \dots T]$ in the active set: $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \big\{(s_t, y_t)\big\} = \big\{(s_\tau, y_\tau)\big\}_{\tau = t}^{T}$.
-        \item \textbf{Run $M$ Gradient Steps to Obtain $\phi^{(t)}$:} Update the critic from $\phi^{(t+1)}$ to $\phi^{(t)}$ by taking $M$ gradient steps on the cumulative squared loss $\mathcal{L}_t(\phi) = \frac{1}{|\mathcal{D}_t|} \sum_{\tau = t}^{T} \big( V_\phi(s_\tau) - y_\tau \big)^2$, then step backward ($t \leftarrow t - 1$) until the root $t = 0$ is fitted.
-    \end{itemize}
-\end{enumerate}
-
-\subsection{Head-to-Head Summary: Batched FBI vs.\ Staged FBI}
-
-\begin{table}[ht!]
-\centering
-\small
-\renewcommand{\arraystretch}{1.2}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{@{}lll@{}}
-\toprule
-\textbf{Property} & \textbf{Algorithm 3: Batched FBI} & \textbf{Algorithm 4: Staged FBI} \\ \midrule
-\textbf{Rollout Data} & Primary chain + $K$ 1-step branches per state & Primary chain + $K$ 1-step branches per state \\
-\textbf{Target Formula at Step $t$} & $y_t = y_t^{(\lambda)}(\phi_{\text{old}})$ (uses fixed pre-update weights) & $y_t = y_t^{(\lambda)}(\phi^{(t+1)})$ (uses weights just fitted at $t+1$) \\
-\textbf{Training Objective} & $\frac{1}{T}\sum_{t=0}^{T-1} (V_\phi(s_t) - y_t)^2$ across all $t$ at once & Sequential stages $t = T-1 \to 0$ on resolved set $\mathcal{D}_t = [t \dots T]$ \\
-\textbf{Weighting Across Steps} & \textbf{Uniform:} Every step $t$ receives equal weight & \textbf{Bottom-heavy:} Deeper steps $\tau \approx T$ stay in $\mathcal{D}_t$ across more stages \\
-\textbf{Key Advantage} & \textbf{Lower final asymptotic error} (uniform weighting) & \textbf{Faster early learning} (rewards propagate $T \to 0$ in 1 iteration) \\ \bottomrule
-\end{tabular}%
-}
-\caption{\textbf{Mathematical comparison of Batched FBI and Staged FBI.}}
-\label{tab:batched_vs_staged}
-\end{table}
+\vspace{0.3cm}
+\tableofcontents
+\vspace{0.5cm}
 
 \newpage
-\section{Visual Diagram 1: Batched FBI ($\text{FBI}_{\text{batched}}(\lambda)$)}
 
-\vspace{0.15cm}
+% =============================================================================
+% SECTION 1: BIG PICTURE & MOTIVATION
+% =============================================================================
+\section{What This Project Is Doing (Big Picture)}
+
+When training a Large Language Model (LLM) to solve complex mathematical or logical reasoning problems via Reinforcement Learning with Verifiable Rewards (RLVR / PPO), feedback is intrinsically sparse: the environment only provides a binary terminal reward $R \in \{0, 1\}$ at the end of the entire reasoning chain indicating whether the final answer is correct or incorrect.
+
+To optimize the policy $\pi_\theta(a_t \mid s_t)$ effectively using Proximal Policy Optimization (PPO) or Generalized Advantage Estimation (GAE), the RL algorithm requires a \textbf{Critic} (value function $V_\phi(s_t)$) capable of assessing partial reasoning prefixes $s_t = (x, a_0, a_1, \dots, a_{t-1})$ and answering:
+\begin{quote}
+\emph{``Conditioned on the reasoning path taken so far, what is the probability that the policy will eventually produce a correct final answer?''}
+\end{quote}
+Accurate step-level values enable calculating fine-grained temporal-difference advantages:
+\[
+    \hat{A}(s_t, a_t) \;=\; r_t \;+\; \gamma \, V(s_{t+1}) \;-\; V(s_t),
+\]
+which attribute credit to individual deduction steps $a_t$ rather than uniformly crediting or penalizing all tokens in the sequence.
+
+\medskip
+\noindent\textbf{The LLM Rollout Bottleneck:}
+In LLM training, autoregressive token generation constitutes $>85\text{--}95\%$ of total compute and wall-clock time. Standard Monte Carlo (MC, $K=1$) generates a single rollout per prompt ($\mathcal{O}(T)$ tokens), but suffers from severe credit assignment variance. VinePPO mitigates variance by branching $K$ full rollouts from \emph{every} intermediate state $s_t$, yielding low-variance targets but scaling quadratically as $\mathcal{O}(K \cdot T^2)$ generated tokens per prompt. For long reasoning traces ($T = 512\dots 2048$ tokens), Vine rollouts become completely intractable.
+
+\medskip
+\noindent\textbf{The Solution: Fitted Backward Induction (FBI):}
+FBI replaces full-horizon rollouts with \textbf{1-step branched expectations} ($K \times 1$), scaling linearly as $\mathcal{O}(K \cdot T)$ tokens. By interpolating branched 1-step expectations with trajectory-level returns via $\lambda \in [0, 1]$, FBI provides low-variance, low-bias targets at a fraction of the inference cost. Rather than conducting slow and noisy experiments on 70B parameter models, this testbed implements pure-JAX procedural reasoning environments where the \textbf{exact ground-truth value $V^*(s)$ and advantage $A^*(s, a)$ are analytically known} via backward induction. This allows us to directly evaluate the value estimation accuracy and advantage alignment of each algorithm across gradient steps, active rollout samples, and estimated LLM FLOPs.
+
+\bigskip
+
+% =============================================================================
+% SECTION 2: THE ENVIRONMENTS
+% =============================================================================
+\section{The Benchmark Environments (MRPs / MDPs)}
+
+The testbed features two procedural synthetic Markov decision environments designed to isolate the core mathematical challenges of reasoning chains: dead-end blunders, self-correction/recovery, milestone convergence, and reward sparsity. Observations are token sequences processed by a Transformer, and rewards are strictly binary and terminal ($R \in \{0, 1\}$ at $t=T$).
+
+\subsection{\texorpdfstring{Difficulty Spectrum Reasoning DAG (\texttt{envs/reasoning\_dag\_env.py}, \texttt{dag\_full})}{Difficulty Spectrum Reasoning DAG (dag\_full)}}
+
+Real mathematical reasoning is not a tree: distinct reasoning chains can reconverge to the same intermediate milestone (DAG topology), and a model that makes an algebraic mistake (derails) can check its work, verify, and recover.
+\begin{itemize}[leftmargin=*, itemsep=2.5pt]
+    \item \textbf{Spectrum Setup:} A suite of $P = 10$ distinct reasoning problems spanning a continuous difficulty spectrum $\theta \in [0.0, 1.0]$. Each problem requires reaching $M = 6$ sequential milestones within a maximum horizon of $T = 24$ steps, selecting from $|A| = 8$ discrete action tokens per step.
+    \item \textbf{Latent Markov State:} The underlying environment state is governed by the tuple:
+    \[
+        s = \big(\texttt{prompt\_idx} \in \{0..P-1\},\; \text{step } t \in \{0..T\},\; \text{milestone } m \in \{0..M\},\; \texttt{is\_derailed } d \in \{0, 1\}\big).
+    \]
+    \item \textbf{Transitions \& Difficulty Modulation:} At difficulty $\theta \in [0, 1]$:
+    \begin{itemize}[itemsep=1.5pt]
+        \item When on-track ($d=0$), the policy advances the milestone with probability $p_{\text{advance}}(\theta) = 0.85 - 0.50\,\theta$ ($m \to m+1$), emits a neutral step with probability $p_{\text{neutral}}(\theta) = 0.10$, or commits a blunder and derails with probability $p_{\text{blunder}}(\theta) = 0.05 + 0.40\,\theta$ ($d \to 1$).
+        \item When derailed ($d=1$), normal actions cannot advance milestones ($m$ remains frozen). The policy can only recover by emitting a verification/self-correction action with probability $p_{\text{recover}}(\theta) = 0.50 - 0.45\,\theta$ ($d \to 0$).
+        \item At $\theta = 0.0$, solutions are straightforward with high recovery ($p_{\text{advance}}=0.85, p_{\text{recover}}=0.50$); at $\theta = 1.0$, needle-in-a-haystack sparsity emerges ($p_{\text{advance}}=0.35, p_{\text{blunder}}=0.45, p_{\text{recover}}=0.05$, yielding $\text{Pass@1} < 0.02\%$).
+    \end{itemize}
+    \item \textbf{Partially Observed Observation Tokenization:} The critic \textbf{never} observes the privileged $(m, d)$ state variables. It observes only the sequence of emitted token IDs:
+    \[
+        \mathbf{x}_t \;=\; \big[\texttt{BOS},\; \texttt{PROMPT\_ID},\; \texttt{SEP},\; a_0,\; a_1,\; \dots,\; a_{t-1},\; \texttt{PAD},\; \dots\big] \;\in\; \mathbb{Z}^{T_{\text{max}}}.
+    \]
+    The network must implicitly infer whether the trajectory is currently on-track or derailed purely through contextual self-attention over its token history.
+\end{itemize}
+
+\subsection{\texorpdfstring{Difficulty Spectrum Procedural Binary Tree (\texttt{envs/tree\_mrp.py}, \texttt{tree\_full})}{Difficulty Spectrum Procedural Binary Tree (tree\_full)}}
+
+To benchmark tree-search structures with branching paths and dead-ends, the suite includes a procedural binary tree family:
+\begin{itemize}[leftmargin=*, itemsep=2.5pt]
+    \item \textbf{Spectrum Setup:} A suite of $P = 10$ distinct tree problems spanning difficulty $\theta \in [0.0, 1.0]$. Each problem is a complete binary tree of depth $D = 7$, containing $2^{D+1}-1 = 255$ total states and $2^D = 128$ terminal leaves.
+    \item \textbf{Transitions \& Rewards:} At each internal node, the trajectory branches Left (\texttt{0}) or Right (\texttt{1}). A fraction of the 128 leaves are designated as correct solutions ($R = 1$), while all other leaves yield $R = 0$.
+    \item \textbf{Difficulty Modulation:} As difficulty $\theta$ scales from 0 to 1, the percentage of correct leaves decreases from $25\%$ down to $2\%$, and the base policy's probability of selecting the branch that leads to a winning subtree decreases from $p_{\text{correct}} = 0.90$ down to $p_{\text{correct}} = 0.52$.
+    \item \textbf{Observation Tokenization:} The critic receives the sequence of binary decisions taken so far:
+    \[
+        \mathbf{x}_t \;=\; \big[\texttt{BOS},\; \texttt{PROMPT\_ID},\; \texttt{SEP},\; c_0,\; c_1,\; \dots,\; c_{t-1},\; \texttt{PAD},\; \dots\big] \;\in\; \mathbb{Z}^{D+3}.
+    \]
+\end{itemize}
+
+\subsection{Exact Dynamic Programming Ground-Truth Solvers}
+For both environments, an analytical backward-induction solver precomputes the exact Bellman expectation $V^*(s_t) = \mathbb{E}_{\pi}[R \mid s_t]$ and exact advantage $A^*(s_t, a_t) = \mathbb{E}_{\pi}[R \mid s_t, a_t] - V^*(s_t)$ for all reachable states. During training, the critic is evaluated on a stratified evaluation set to track exact Mean Squared Value Error (MSVE) and Advantage Cosine Similarity:
+\[
+    \text{MSVE} \;=\; \frac{1}{|\mathcal{S}_{\text{eval}}|} \sum_{s \in \mathcal{S}_{\text{eval}}} \big(\hat{V}_\phi(s) - V^*(s)\big)^2, \qquad
+    \text{AdvCos} \;=\; \frac{\hat{\mathbf{A}} \cdot \mathbf{A}^*}{\|\hat{\mathbf{A}}\|_2 \, \|\mathbf{A}^*\|_2}.
+\]
+
+\bigskip
+
+% =============================================================================
+% SECTION 3: THE NETWORK ARCHITECTURE
+% =============================================================================
+\section{The Network Architecture (\texttt{transformer.py})}
+
+The critic $V_\phi$ is parameterized as a modern, miniature LLaMA-style causal Transformer (\texttt{TransformerCritic}):
+\begin{enumerate}[leftmargin=*, itemsep=3pt]
+    \item \textbf{Learned Token Embedding Layer:}
+    The token embedding is \textbf{learned end-to-end} from scratch using a dedicated embedding table:
+    \[
+        \mathbf{E} \in \mathbb{R}^{V \times d_{\text{model}}}, \qquad \mathbf{e}_i = \text{Embed}(w_i; \phi_{\text{embed}}),
+    \]
+    initialized with orthogonal weights ($\text{gain}=1.0$) and updated via AdamW backpropagation alongside the attention blocks. It is \textbf{not pre-computed or frozen}. An optional prepended \texttt{BOS} token ensures non-empty representation at the initial state $s_0$.
+    \item \textbf{Rotary Position Embeddings (RoPE):}
+    Unlike the token embeddings, positional information is \textbf{pre-computed and parameter-free}. We implement RoPE by precomputing sinusoidal rotation frequencies $\Theta = \{\theta_i = 10000^{-2(i-1)/d}\}$ and applying 2D complex rotations directly to the query and key vectors inside each attention head.
+    \item \textbf{Causal Transformer Blocks ($N=2$ layers, $H=4$ heads, $d_{\text{model}}=64$):}
+    Each transformer block employs Pre-RMSNorm, causal multi-head self-attention, and a SwiGLU feed-forward network with an expansion factor of $8/3$ ($d_{\text{ff}} = 170$):
+    \[
+        \text{SwiGLU}(\mathbf{x}) = \big(\text{SiLU}(\mathbf{x}\mathbf{W}_{\text{gate}}) \odot \mathbf{x}\mathbf{W}_{\text{up}}\big)\mathbf{W}_{\text{down}}.
+    \]
+    \item \textbf{Last-Valid-Token Pooling:}
+    Because sequences are padded to fixed maximum length for JAX XLA static shapes, the network identifies the index of the last non-padding token $t_{\text{last}}$ using a binary mask and extracts the hidden vector $\mathbf{h}_{t_{\text{last}}} \in \mathbb{R}^{d_{\text{model}}}$, which captures the full causal prefix.
+    \item \textbf{MLP Value Head:}
+    The pooled vector passes through an RMSNorm layer, a 2-layer SiLU MLP with hidden dimension $d_{\text{model}}$, and a zero-initialized final linear projection to output the scalar value prediction $\hat{V}_\phi(s_t) \in \mathbb{R}$. Zero initialization ensures that the initial critic outputs $V_\phi(s) \approx 0$, preventing large destabilizing gradients at step 0.
+\end{enumerate}
+
+\bigskip
+
+% =============================================================================
+% SECTION 4: VALUE-LEARNING ALGORITHMS
+% =============================================================================
+\section{Value-Learning Algorithms: Formulations \& Rollout Complexity}
+
+Every algorithm rolls out an identical trunk batch of $B = 64$ primary base trajectories $\tau = (s_0, a_0, s_1, \dots, s_T)$ per update. Algorithms differ in how they construct regression targets $y(s_t)$ for the states along that chain.
+
+\subsection{Algorithm 1: Standard Monte Carlo ($K=1$)}
+Standard MC uses only the single primary trajectory. Every intermediate state $s_t$ is trained to predict the terminal binary reward $R(s_T) \in \{0, 1\}$ observed at the end of that rollout:
+\[
+    y_t^{\text{MC}} \;=\; R(s_T), \qquad \forall\, t \in \{0, \dots, T\}.
+\]
+\begin{itemize}[leftmargin=*, itemsep=1.5pt]
+    \item \textbf{Rollout Cost:} $\mathcal{O}(T)$ environment transitions per trajectory.
+    \item \textbf{Limitations:} High target variance. A state with true value $V^*(s_t) = 0.5$ receives target $1.0$ or $0.0$ depending on downstream luck, leading to severe gradient noise.
+\end{itemize}
+
+\subsection{Algorithm 2: Vine-Target (Full-Horizon Branching, $K=2, 4$)}
+Vine-Target branches $K$ independent trajectories from \emph{every} visited state $s_t$ along the primary chain, rolling each branch \textbf{all the way to the end of the episode ($t \to T$)}:
+\[
+    y_t^{\text{Vine}} \;=\; \hat{V}_{\text{MC}}(s_t) \;=\; \frac{1}{K}\sum_{k=1}^K R\big(\tau_{t \to T}^{(k)}\big).
+\]
+\begin{itemize}[leftmargin=*, itemsep=1.5pt]
+    \item \textbf{Rollout Cost:} $\sum_{t=0}^{T-1} K(T-t) = \frac{1}{2} K T (T+1) = \mathcal{O}(K \cdot T^2)$ transitions per trajectory.
+    \item \textbf{Strengths \& Weaknesses:} Targets are completely unbiased Monte Carlo averages with no bootstrapping drift. However, on long token sequences ($T=512$), generating $K \cdot T^2 / 2 \approx 524,000$ tokens per prompt is computationally prohibitive for LLMs.
+\end{itemize}
+
+\subsection{\texorpdfstring{Algorithm 3: Batched Fitted Backward Induction ($\text{FBI}_{\text{batched}}(\lambda)$)}{Algorithm 3: Batched Fitted Backward Induction (FBI batched)}}
+Instead of rolling out full trajectories to the end of the episode, FBI forks $K$ branches for \textbf{only 1 environment step} from each state $s_t$:
+\[
+    s_t \xrightarrow{a_t^{(k)} \sim \pi} \big(r_t^{(k)},\; s_{t+1}^{(k)}\big), \qquad k = 1, \dots, K.
+\]
+The expected 1-step Bellman backup is approximated by averaging over the $K$ children:
+\[
+    \hat{V}_{\text{branch}}(s_t; \phi_{\text{old}}) \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_{\phi_{\text{old}}}\big(s_{t+1}^{(k)}\big) \Big),
+\]
+where $V(s_T) \equiv 0$ after a terminal step. At the penultimate step $t = T-1$, $\hat{V}_{\text{branch}}(s_{T-1}) = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ is an exact sample average of terminal rewards requiring no critic bootstrapping.
+
+To interpolate between the low-variance 1-step branched backup and long-horizon trajectory returns along the primary chain, we define the branched TD residual $\delta_t = \hat{V}_{\text{branch}}(s_t) - V_{\phi_{\text{old}}}(s_t)$ and accumulate the branched $\lambda$-return:
+\[
+    \hat{A}_t^{(\lambda)} \;=\; \delta_t \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}, \qquad
+    y_t^{(\lambda)} \;=\; V_{\phi_{\text{old}}}(s_t) \;+\; \hat{A}_t^{(\lambda)}.
+\]
+In \textbf{Batched FBI} (\Cref{fig:batched_fbi_diagram}), all targets $\{y_t^{(\lambda)}\}_{t=0}^{T-1}$ across all $B$ trajectories are computed first using the fixed pre-update critic parameters $\phi_{\text{old}}$. The full buffer $\mathcal{D}_{\text{all}} = \{(s_t, y_t)\}$ is then shuffled into random minibatches and optimized via AdamW for $E = 2$ passes (epochs):
+\[
+    \min_\phi \; \frac{1}{|\mathcal{D}_{\text{all}}|} \sum_{(s, y) \in \mathcal{D}_{\text{all}}} \big( V_\phi(s) - y \big)^2.
+\]
+\begin{itemize}[leftmargin=*, itemsep=1.5pt]
+    \item \textbf{Rollout Cost:} $T + K \cdot T = (K+1)T = \mathcal{O}(K \cdot T)$ transitions per trajectory (linear scaling).
+    \item \textbf{Optimization Advantage:} Shuffling transitions across all timesteps simultaneously enables global feature learning, training early and late reasoning steps concurrently.
+\end{itemize}
+
+% =============================================================================
+% TIKZ DIAGRAM: BATCHED FBI
+% =============================================================================
 \begin{figure}[ht!]
 \centering
-\resizebox{\textwidth}{!}{%
+\resizebox{0.96\textwidth}{!}{%
 \begin{tikzpicture}[
     >=Latex,
     font=\small,
-    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
-    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
-    branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.2mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
+    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.0mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
 ]
 
-% =============================================================================
-% PANEL 1: THE ROLLOUT CHAIN & PARALLEL 1-STEP BRANCHES
-% =============================================================================
-\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.4)
-    {Step 1 (Rollout): Primary Trajectory Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches per Node};
+% Panel 1: Rollout Chain
+\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.3)
+    {Step 1: Primary Rollout Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches ($\mathcal{O}(KT)$ Transitions)};
 
 \begin{scope}[shift={(0, 6.7)}]
-    \foreach \x/\step in {0/0, 3.0/1, 5.8/t, 8.8/t+1, 11.4/T-1, 14.4/T} {
-        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.9) {Time $\step$};
+    \foreach \x/\step in {0/0, 2.9/1, 5.7/t, 8.6/t+1, 11.4/T-1, 14.3/T} {
+        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.8) {Step $\step$};
     }
 
-    % Primary Base Trajectory Chain Nodes (blue = non-terminal, green = terminal)
     \node[chainnode] (s0) at (0, 1.0) {$s_0$};
-    \node[chainnode] (s1) at (3.0, 1.0) {$s_1$};
-    \node[chainnode] (st) at (5.8, 1.0) {$s_t$};
-    \node[chainnode] (st1) at (8.8, 1.0) {$s_{t+1}$};
+    \node[chainnode] (s1) at (2.9, 1.0) {$s_1$};
+    \node[chainnode] (st) at (5.7, 1.0) {$s_t$};
+    \node[chainnode] (st1) at (8.6, 1.0) {$s_{t+1}$};
     \node[chainnode] (sTm1) at (11.4, 1.0) {$s_{T-1}$};
-    \node[termnode]  (sT) at (14.4, 1.0) {$s_T$};
+    \node[termnode]  (sT) at (14.3, 1.0) {$s_T$};
 
-    % Primary Chain Edges
-    \draw[->, primaryblue, line width=1.6pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
-    \draw[->, primaryblue, line width=1.6pt, dotted] (s1) -- (st);
-    \draw[->, primaryblue, line width=1.6pt] (st) -- node[above, font=\scriptsize] {$a_t$} (st1);
-    \draw[->, primaryblue, line width=1.6pt, dotted] (st1) -- (sTm1);
-    \draw[->, primaryblue, line width=1.6pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
+    \draw[->, primaryblue, line width=1.5pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
+    \draw[->, primaryblue, line width=1.5pt, dotted] (s1) -- (st);
+    \draw[->, primaryblue, line width=1.5pt] (st) -- node[above, font=\scriptsize] {$a_t$} (st1);
+    \draw[->, primaryblue, line width=1.5pt, dotted] (st1) -- (sTm1);
+    \draw[->, primaryblue, line width=1.5pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
 
     % K 1-step branches from s_0
-    \node[branchnode] (b01) at (1.5, 2.15) {$s_1^{(1)}$};
-    \node[branchnode] (b0K) at (1.5, -0.15) {$s_1^{(K)}$};
+    \node[branchnode] (b01) at (1.45, 2.1) {$s_1^{(1)}$};
+    \node[branchnode] (b0K) at (1.45, -0.1) {$s_1^{(K)}$};
     \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[above, sloped, font=\tiny] {1 step} (b01);
     \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[below, sloped, font=\tiny] {1 step} (b0K);
-    \node[font=\scriptsize, text=branchorange!90!black] at (1.5, 0.5) {$\vdots$};
+    \node[font=\scriptsize, text=branchorange!90!black] at (1.45, 0.5) {$\vdots$};
 
     % K 1-step branches from s_t
-    \node[branchnode] (bt1) at (7.3, 2.15) {$s_{t+1}^{(1)}$};
-    \node[branchnode] (btK) at (7.3, -0.15) {$s_{t+1}^{(K)}$};
+    \node[branchnode] (bt1) at (7.15, 2.1) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (btK) at (7.15, -0.1) {$s_{t+1}^{(K)}$};
     \draw[->, branchorange!90!black, line width=1pt] (st) -- node[above, sloped, font=\tiny] {1 step} (bt1);
     \draw[->, branchorange!90!black, line width=1pt] (st) -- node[below, sloped, font=\tiny] {1 step} (btK);
-    \node[font=\scriptsize, text=branchorange!90!black] at (7.3, 0.5) {$\vdots$};
+    \node[font=\scriptsize, text=branchorange!90!black] at (7.15, 0.5) {$\vdots$};
 
-    % K 1-step branches from s_{T-1} (landing on terminal states)
-    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bT1) at (12.9, 2.15) {$s_T^{(1)}$};
-    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bTK) at (12.9, -0.15) {$s_T^{(K)}$};
+    % K 1-step branches from s_{T-1} (terminal leaves)
+    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bT1) at (12.85, 2.1) {$s_T^{(1)}$};
+    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bTK) at (12.85, -0.1) {$s_T^{(K)}$};
     \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[above, sloped, font=\tiny] {1 step} (bT1);
     \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[below, sloped, font=\tiny] {1 step} (bTK);
-    \node[font=\scriptsize, text=termgreen!80!black] at (12.9, 0.5) {$\vdots$};
+    \node[font=\scriptsize, text=termgreen!80!black] at (12.85, 0.5) {$\vdots$};
 \end{scope}
 
-% =============================================================================
-% PANEL 2: COMPUTE ALL TARGETS AT ONCE USING FIXED \phi_old
-% =============================================================================
+% Panel 2: Compute Targets with Fixed Critic
 \begin{scope}[shift={(0, 2.0)}]
-    \draw[rounded corners=6pt, draw=batchedteal!80!black, fill=boxbg, line width=1.0pt] (-0.4, -0.95) rectangle (16.4, 3.85);
-    \node[anchor=west, font=\footnotesize\bfseries, text=batchedteal!90!black] at (-0.1, 3.45)
-        {Step 2 (Compute All Targets First): Evaluate All Steps $t \in \{0, \dots, T-1\}$ Using Fixed Critic $V_{\phi_{\text{old}}}$};
+    \draw[rounded corners=6pt, draw=batchedteal!80!black, fill=boxbg, line width=1.0pt] (-0.4, -0.9) rectangle (16.2, 3.8);
+    \node[anchor=west, font=\footnotesize\bfseries, text=batchedteal!90!black] at (-0.1, 3.4)
+        {Step 2: Construct All Targets $\{y_t\}_{t=0}^{T-1}$ Simultaneously Using Frozen Critic Parameters $\phi_{\text{old}}$};
 
-    % Left: 1-Step Branched Backup Box
-    \node[draw=batchedteal!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (sync_eval) at (0.0, 1.05) {
-        \textbf{1. 1-Step Branched Backup at Every Node $s_t$:}\\[4pt]
-        Query the fixed pre-update critic $V_{\phi_{\text{old}}}$ on the $K$ 1-step children $s_{t+1}^{(1..K)}$ at every step $t$:
+    \node[draw=batchedteal!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.1cm, font=\scriptsize] (sync_eval) at (0.0, 1.05) {
+        \textbf{1. 1-Step Branched Expectation at Every Node $s_t$:}\\[3pt]
+        Evaluate fixed critic $V_{\phi_{\text{old}}}$ on all $K$ 1-step children $s_{t+1}^{(1..K)}$:
         \[
             \hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \Big(r_t^{(k)} + \gamma \, V_{\phi_{\text{old}}}\big(s_{t+1}^{(k)}\big)\Big)
         \]
@@ -265,50 +279,42 @@ When $\lambda = 0$, the target simplifies to pure 1-step backward induction: $y_
         \]
     };
 
-    % Right: Lambda Return Target Box
-    \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (sync_gae) at (8.4, 1.05) {
-        \textbf{2. Form Target $y_t$ for All Steps ($t = 0, \dots, T-1$):}\\[4pt]
-        Combine with downstream residuals via $\lambda \in [0, 1]$ (without changing $\phi_{\text{old}}$):
+    \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.1cm, font=\scriptsize] (sync_gae) at (8.3, 1.05) {
+        \textbf{2. Accumulate $\lambda$-Return Target for All Steps:}\\[3pt]
+        Blend 1-step branched backup with primary chain returns ($\lambda = 0.8$):
         \[
             \hat{A}_t^{(\lambda)} = \delta_t^{\text{branch}} + \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}
         \]
         \[
-            y_t = V_{\phi_{\text{old}}}(s_t) + \hat{A}_t^{(\lambda)} \quad \Big(\text{for } \lambda=0:\; y_t = \hat{V}_{\text{branch}}(s_t)\Big)
+            y_t = V_{\phi_{\text{old}}}(s_t) + \hat{A}_t^{(\lambda)} \quad \Big(\text{if } \lambda=0:\; y_t = \hat{V}_{\text{branch}}(s_t)\Big)
         \]
     };
 
     \draw[->, line width=1.3pt, batchedteal!90!black] (sync_eval.east) -- (sync_gae.west);
 \end{scope}
 
-% Connector Arrow between Step 2 and Step 3
-\draw[->, fitpurple, line width=1.5pt] (8.0, 1.05) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Collect all pairs $\mathcal{D}_{\text{all}} = \{(s_0, y_0), (s_1, y_1), \dots, (s_{T-1}, y_{T-1})\}$} (8.0, 0.25);
+\draw[->, fitpurple, line width=1.5pt] (7.9, 1.1) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Form $\mathcal{D}_{\text{all}} = \{(s_t, y_t)\}_{t=0}^{T-1}$} (7.9, 0.3);
 
-% =============================================================================
-% PANEL 3: FIT ALL STEPS SIMULTANEOUSLY
-% =============================================================================
-\begin{scope}[shift={(0, -3.4)}]
-    \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -0.9) rectangle (16.4, 3.65);
-    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.25)
-        {Step 3 (All-at-Once Fitting): Train $V_\phi$ on All Steps $\{0, \dots, T-1\}$ Simultaneously ($E$ Passes)};
+% Panel 3: Simultaneous Training
+\begin{scope}[shift={(0, -3.3)}]
+    \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -0.9) rectangle (16.2, 3.5);
+    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.1)
+        {Step 3: Global Multi-Epoch Mini-Batch Shuffling (All Steps Optimized Concurrently)};
 
-    % Left: Full-Trajectory Dataset
-    \node[draw=primaryblue, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (all_buffer) at (0.0, 1.0) {
-        \textbf{1. Full-Trajectory Training Set $\mathcal{D}_{\text{all}}$:}\\[3pt]
-        \[
-            \mathcal{D}_{\text{all}} = \big\{(s_0, y_0),\; (s_1, y_1),\; \dots,\; (s_{T-1}, y_{T-1})\big\}
-        \]
-        $\bullet$ All timesteps $t \in \{0, \dots, T-1\}$ are trained together.\\[2pt]
-        $\bullet$ \textbf{Uniform weighting:} Early states ($s_0$) and late states ($s_{T-1}$) receive the exact same weight in the loss.
+    \node[draw=primaryblue, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=7.1cm, font=\scriptsize] (all_buffer) at (0.0, 0.95) {
+        \textbf{1. Full Trajectory Replay Buffer:}\\[3pt]
+        $\mathcal{D}_{\text{all}} = \big\{(s_0, y_0),\; (s_1, y_1),\; \dots,\; (s_{T-1}, y_{T-1})\big\}$\\[3pt]
+        $\bullet$ Aggregates $B \times T$ state-target pairs per outer update.\\[2pt]
+        $\bullet$ Uniform weighting ensures early states ($s_0$) receive equal gradient focus as late states ($s_{T-1}$).
     };
 
-    % Right: Simultaneous Loss Minimization
-    \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=7.2cm, font=\scriptsize] (epochs_box) at (8.4, 1.0) {
-        \textbf{2. Minimize Squared Error Over $\mathcal{D}_{\text{all}}$ ($E = 4$ Passes):}\\[3pt]
-        Update critic parameters $\phi$ by minimizing:
+    \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=7.1cm, font=\scriptsize] (epochs_box) at (8.3, 0.95) {
+        \textbf{2. Train Transformer Critic ($E = 2$ Buffer Epochs):}\\[3pt]
+        Optimize $\phi$ over randomized minibatches via AdamW:
         \[
-            \min_\phi \; \frac{1}{T} \sum_{t=0}^{T-1} \Big( V_\phi(s_t) - y_t \Big)^2
+            \min_\phi \; \frac{1}{|\mathcal{D}_{\text{all}}|} \sum_{(s, y) \in \mathcal{D}_{\text{all}}} \Big( V_\phi(s) - y \Big)^2
         \]
-        over $E = 4$ passes through $\mathcal{D}_{\text{all}}$.
+        Representations across all reasoning depths are updated simultaneously.
     };
 
     \draw[->, line width=1.3pt, fitpurple] (all_buffer.east) -- (epochs_box.west);
@@ -316,176 +322,428 @@ When $\lambda = 0$, the target simplifies to pure 1-step backward induction: $y_
 
 \end{tikzpicture}%
 }
-\caption{\textbf{Algorithm 3: Batched FBI ($\text{FBI}_{\text{batched}}(\lambda)$).} \textbf{Top (Step 1):} Roll out the primary chain $\tau = (s_0, \dots, s_T)$ (blue/green circles) and fork $K$ parallel 1-step branches $s_{t+1}^{(1..K)}$ (orange/green circles) from each visited state $s_t$. \textbf{Middle (Step 2):} Using the fixed pre-update critic $V_{\phi_{\text{old}}}$, compute the targets $y_0, \dots, y_{T-1}$ for all steps first. \textbf{Bottom (Step 3):} Train $V_\phi$ on all steps $\{0, \dots, T-1\}$ simultaneously for $E=4$ passes.}
-\label{fig:batched_fbi_visual}
+\caption{\textbf{Architecture of Batched Fitted Backward Induction ($\text{FBI}_{\text{batched}}(\lambda)$).} \textbf{Top:} The policy generates primary trajectories $\tau$ and forks $K$ 1-step branches $s_{t+1}^{(1..K)}$ at each step ($\mathcal{O}(KT)$ rollout cost). \textbf{Middle:} Frozen critic $V_{\phi_{\text{old}}}$ evaluates the $K$ children to form 1-step branched expectations, and backward $\lambda$-accumulation forms targets $y_t$. \textbf{Bottom:} Targets and states across all steps are pooled and fitted concurrently over $E=2$ buffer epochs using AdamW.}
+\label{fig:batched_fbi_diagram}
 \end{figure}
 
 \newpage
-\section{Visual Diagram 2: Staged FBI ($\text{FBI}_{\text{staged}}(\lambda)$)}
 
-\vspace{0.15cm}
+% =============================================================================
+% SECTION 5: EMPIRICAL BENCHMARKS & ANALYSIS
+% =============================================================================
+\section{Empirical Results \& Benchmark Analysis}
+
+All benchmark runs were executed on NVIDIA RTX A5000 GPUs across 8 random seeds. Every algorithm received an identical trunk rollout batch of $B = 64$ primary trajectories per update, an identical gradient budget of 100 outer updates, and an identical minibatch size of 64 with AdamW cosine-decay scheduling.
+
+\subsection{\texorpdfstring{Monte Carlo vs. Vine MC Scaling ($K=1, 2, 4$)}{Monte Carlo vs. Vine MC Scaling (K=1, 2, 4)}}
+
+We first investigate the empirical trade-off between standard single-rollout Monte Carlo ($K=1$) and full-horizon branched Vine-Target with increasing branch factor $K \in \{2, 4\}$. \Cref{tab:mc_vs_vine_metrics} summarizes the final value accuracy and advantage alignment.
+
+\begin{table}[ht!]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+\textbf{Environment} & \textbf{Algorithm} & \textbf{Final MSVE} & \textbf{Final AdvCos} & \textbf{Rollout Samples} & \textbf{FLOPs} & \textbf{Adv AUC} \\ \midrule
+\textbf{DAG Full} & Standard MC ($K=1$) & $1.67\times 10^{-2} \pm 4.0\times 10^{-4}$ & $0.8552 \pm 0.002$ & 103,721 & 1.13M & 0.8023 \\
+($T=24, P=10$) & Vine-Target ($K=2$) & $1.07\times 10^{-2} \pm 2.0\times 10^{-4}$ & $0.8747 \pm 0.002$ & 2,293,494 & 5.51M & 0.8367 \\
+& Vine-Target ($K=4$) & $\mathbf{9.84\times 10^{-3} \pm 3.8\times 10^{-4}}$ & $\mathbf{0.8767 \pm 0.002}$ & 4,481,414 & 9.88M & $\mathbf{0.8424}$ \\ \midrule
+\textbf{Tree Full} & Standard MC ($K=1$) & $1.59\times 10^{-2} \pm 1.1\times 10^{-3}$ & $0.8490 \pm 0.007$ & 44,800 & 627k & 0.6487 \\
+($D=7, P=10$) & Vine-Target ($K=2$) & $8.23\times 10^{-3} \pm 7.0\times 10^{-4}$ & $0.9057 \pm 0.007$ & 403,200 & 1.34M & 0.7009 \\
+& Vine-Target ($K=4$) & $\mathbf{7.33\times 10^{-3} \pm 7.6\times 10^{-4}}$ & $\mathbf{0.9119 \pm 0.010}$ & 761,600 & 2.06M & $\mathbf{0.7149}$ \\ \bottomrule
+\end{tabular}%
+}
+\caption{\textbf{Empirical Comparison: Standard MC vs. Vine-Target ($K=2, 4$).} Across 8 seeds on DAG and Tree full suites. Adv AUC denotes the compute-normalized Area Under the Advantage Cosine curve.}
+\label{tab:mc_vs_vine_metrics}
+\end{table}
+
+\noindent\textbf{Key Takeaways on Vine Scaling:}
+\begin{enumerate}[leftmargin=*, itemsep=2pt]
+    \item \textbf{Significant Variance Reduction:} Moving from Standard MC ($K=1$) to Vine-Target reduces final MSVE by $41\%$ on the DAG ($1.67\times 10^{-2} \to 9.84\times 10^{-3}$) and $54\%$ on the Tree ($1.59\times 10^{-2} \to 7.33\times 10^{-3}$). Advantage cosine alignment improves significantly ($+0.0215$ on DAG, $+0.0629$ on Tree).
+    \item \textbf{Severe Diminishing Returns on $K$:} Increasing $K$ from $2$ to $4$ doubles the total rollout samples on DAG ($2.29\text{M} \to 4.48\text{M}$) and nearly doubles total FLOPs ($5.51\text{M} \to 9.88\text{M}$), but yields an almost negligible gain of $+0.0020$ in advantage correlation ($0.8747 \to 0.8767$).
+    \item \textbf{Quadratic Token Overhead:} On DAG ($T=24$), Vine ($K=4$) consumes \textbf{43 times more environment rollouts} than Standard MC, visually evident in the logarithmic sample axes of \Cref{fig:mc_vs_vine_dag,fig:mc_vs_vine_tree}.
+\end{enumerate}
+
 \begin{figure}[ht!]
 \centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/dag/dag_mc_vs_vine_comparison_curves.png}
+\caption{\textbf{Reasoning DAG: MC vs. Vine-Target ($K=1, 2, 4$).} \textbf{Top Row:} MSVE vs. Gradient Steps, Active Rollout Transitions (Log), and Estimated LLM FLOPs (Log). \textbf{Bottom Row:} Advantage Cosine Similarity across the same axes. Vine-Target achieves lower MSVE but requires orders of magnitude more rollout transitions.}
+\label{fig:mc_vs_vine_dag}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/tree/tree_mc_vs_vine_comparison_curves.png}
+\caption{\textbf{Procedural Tree: MC vs. Vine-Target ($K=1, 2, 4$).} Comparison curves on the procedural binary tree suite ($D=7, P=10$).}
+\label{fig:mc_vs_vine_tree}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/dag/dag_mc_vs_vine_difficulty_breakdown.png}
+\caption{\textbf{Reasoning DAG: Value Error and Advantage Alignment vs. Problem Difficulty $\theta \in [0, 1]$.} Standard MC collapses on harder problem instances ($\theta \ge 0.556$), where advantage cosine correlation degrades from $0.99 \to 0.65 \to 0.30$. Vine-Target maintains robust advantage alignment across all solvable tiers.}
+\label{fig:mc_vs_vine_dag_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/tree/tree_mc_vs_vine_difficulty_breakdown.png}
+\caption{\textbf{Procedural Tree: Value Error and Advantage Alignment vs. Problem Difficulty $\theta \in [0, 1]$.}}
+\label{fig:mc_vs_vine_tree_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/dag/dag_mc_vs_vine_scatter_true_vs_estimated.png}
+\caption{\textbf{Critic Calibration on DAG: Ground-Truth $V^*(s)$ vs. Predicted $\hat{V}_\phi(s)$.} Snapshots at 20\% and 80\% of the training budget for MC, Vine ($K=2$), and Vine ($K=4$). Vine-Target predictions tightly cluster around the ideal $y=x$ diagonal.}
+\label{fig:mc_vs_vine_dag_scatter}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/1_mc_vs_vine/tree/tree_mc_vs_vine_scatter_true_vs_estimated.png}
+\caption{\textbf{Critic Calibration on Tree: Ground-Truth $V^*(s)$ vs. Predicted $\hat{V}_\phi(s)$.}}
+\label{fig:mc_vs_vine_tree_scatter}
+\end{figure}
+
+\clearpage
+
+% =============================================================================
+% SUBSECTION 5.2: PARETO SHOWDOWN
+% =============================================================================
+\subsection{Head-to-Head Pareto Showdown: Best FBI vs. Best Vine MC}
+
+Next, we address the primary research question: \textbf{Which algorithm achieves the highest advantage alignment per unit of LLM compute?} We compare the baseline Standard MC ($K=1$), the top-performing Vine target on the Pareto frontier (\texttt{Vine-Target (K=4)}), the compute-efficient Vine target (\texttt{Vine-Target (K=2)}), and the optimal 1-step backward induction target (\texttt{Batched FBI (lam=0.8)}). Results are summarized in \Cref{tab:head_to_head_metrics}.
+
+\begin{table}[ht!]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
 \resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+\textbf{Environment} & \textbf{Algorithm} & \textbf{Final MSVE} & \textbf{Final AdvCos} & \textbf{Rollout Samples} & \textbf{FLOPs} & \textbf{Sample Reduction} \\ \midrule
+\textbf{DAG Full} & Standard MC ($K=1$) & $1.67\times 10^{-2}$ & 0.8552 & 103,721 & 1.13M & $1.0\times$ (High Variance) \\
+($T=24, P=10$) & Vine-Target ($K=2$) & $1.07\times 10^{-2}$ & 0.8747 & 2,293,494 & 5.51M & $22.1\times$ samples \\
+& Vine-Target ($K=4$) & $\mathbf{9.84\times 10^{-3}}$ & 0.8767 & 4,481,414 & 9.88M & $43.2\times$ samples \\
+& \textbf{Batched FBI ($\lambda=0.8$)} & $1.32\times 10^{-2}$ & $\mathbf{0.8789}$ & $\mathbf{518,417}$ & $\mathbf{3.00M}$ & $\mathbf{8.6\times \text{ fewer than Vine}}$ \\ \midrule
+\textbf{Tree Full} & Standard MC ($K=1$) & $1.59\times 10^{-2}$ & 0.8490 & 44,800 & 627k & $1.0\times$ \\
+($D=7, P=10$) & Vine-Target ($K=2$) & $8.23\times 10^{-3}$ & 0.9057 & 403,200 & 1.34M & $9.0\times$ samples \\
+& Vine-Target ($K=4$) & $\mathbf{7.33\times 10^{-3}}$ & 0.9119 & 761,600 & 2.06M & $17.0\times$ samples \\
+& \textbf{Batched FBI ($\lambda=0.8$)} & $9.15\times 10^{-3}$ & $\mathbf{0.9152}$ & $\mathbf{224,000}$ & $\mathbf{1.43M}$ & $\mathbf{3.4\times \text{ fewer than Vine}}$ \\ \bottomrule
+\end{tabular}%
+}
+\caption{\textbf{Head-to-Head Benchmark: Best FBI vs. Best Vine MC.} Batched FBI ($\lambda=0.8$) delivers superior advantage alignment than Vine ($K=4$) while requiring $3.3\times$ fewer FLOPs and $8.6\times$ fewer rollout samples on DAG.}
+\label{tab:head_to_head_metrics}
+\end{table}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/dag/dag_head_to_head_pareto_frontier.png}
+\caption{\textbf{Empirical Pareto Frontier on Reasoning DAG.} \textbf{Left:} Final Advantage Cosine Similarity vs. Total Active Rollout Transitions (Log Scale). \textbf{Right:} Final Advantage Cosine Similarity vs. Estimated LLM FLOPs (Log Scale). \textbf{Batched FBI ($\lambda=0.8$)} strictly Pareto-dominates Vine-Target on Advantage Alignment, achieving $\text{AdvCos} = 0.8789$ at $3.00\text{M}$ FLOPs, whereas Vine ($K=4$) consumes $9.88\text{M}$ FLOPs and achieves $0.8767$.}
+\label{fig:pareto_dag}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/tree/tree_head_to_head_pareto_frontier.png}
+\caption{\textbf{Empirical Pareto Frontier on Procedural Tree.} \textbf{Batched FBI ($\lambda=0.8$)} achieves the highest advantage alignment ($\text{AdvCos} = 0.9152$) while using $30\%$ fewer FLOPs and $3.4\times$ fewer rollout samples than Vine ($K=4$).}
+\label{fig:pareto_tree}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/dag/dag_head_to_head_comparison_curves.png}
+\caption{\textbf{Head-to-Head Learning Curves on Reasoning DAG.} Standard MC ($K=1$), Vine-Target ($K=4$), and Batched FBI ($\lambda=0.8$). Notice that Batched FBI tracks Vine-Target's advantage alignment throughout training while using a fraction of the compute.}
+\label{fig:h2h_dag_curves}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/tree/tree_head_to_head_comparison_curves.png}
+\caption{\textbf{Head-to-Head Learning Curves on Procedural Tree.}}
+\label{fig:h2h_tree_curves}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/dag/dag_head_to_head_difficulty_breakdown.png}
+\caption{\textbf{Head-to-Head Performance Across Problem Difficulties on DAG.} Batched FBI ($\lambda=0.8$) outperforms both MC and Vine ($K=4$) on difficult problems ($\theta = 0.556, 0.667, 0.778$). All algorithms collapse at $\theta=1.0$ due to extreme reward sparsity ($\text{Pass@1} < 0.02\%$), demonstrating that no critic can learn when positive reward is never encountered.}
+\label{fig:h2h_dag_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/tree/tree_head_to_head_difficulty_breakdown.png}
+\caption{\textbf{Head-to-Head Performance Across Problem Difficulties on Tree.}}
+\label{fig:h2h_tree_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/dag/dag_head_to_head_scatter_true_vs_estimated.png}
+\caption{\textbf{Head-to-Head Critic Calibration on DAG:} Snapshots at 20\% and 80\% of training budget.}
+\label{fig:h2h_dag_scatter}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/3_head_to_head_best/tree/tree_head_to_head_scatter_true_vs_estimated.png}
+\caption{\textbf{Head-to-Head Critic Calibration on Tree:} Snapshots at 20\% and 80\% of training budget.}
+\label{fig:h2h_tree_scatter}
+\end{figure}
+
+\clearpage
+
+% =============================================================================
+% SECTION 6: APPENDIX: STAGED FBI DYNAMICS
+% =============================================================================
+\section{Appendix: Analysis of Staged FBI vs. Batched FBI}
+\label{sec:appendix_staged}
+
+In this section, we analyze the theoretical motivation, algorithmic implementation, and empirical dynamics of \textbf{Staged Fitted Backward Induction ($\text{FBI}_{\text{staged}}(\lambda)$)}, and explain why Batched FBI with higher $\lambda$ ultimately proved superior.
+
+\subsection{Theoretical Motivation for Staged Fitting}
+
+In classical dynamic programming, backward induction solves a finite-horizon MDP by resolving values in strict reverse time: $t = T-1 \to T-2 \dots \to 0$. In Batched FBI with pure 1-step targets ($\lambda = 0$), the target for step $t$ queries the pre-update critic:
+\[
+    y_t \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_{\phi_{\text{old}}}\big(s_{t+1}^{(k)}\big) \Big).
+\]
+Early in training, before the critic has learned values at step $t+1$, querying $V_{\phi_{\text{old}}}(s_{t+1})$ returns near-zero, uncalibrated estimates. Consequently, terminal reward information at $t=T$ propagates backward by at most 1 time step per outer update, requiring at least $T$ outer iterations for reward signal to reach the root $s_0$.
+
+\textbf{Staged FBI} was designed to eliminate this propagation delay within a \emph{single} outer iteration by fitting the network in reverse backward-induction order (\Cref{fig:staged_fbi_diagram}):
+\begin{enumerate}[leftmargin=*, itemsep=2.5pt]
+    \item \textbf{Base Stage at Terminal Step ($t = T-1$):} At the penultimate step, all $K$ 1-step branches land on terminal states $s_T^{(1..K)}$ where exact environment rewards $R(s_T^{(k)}) \in \{0, 1\}$ are observed. The target $y_{T-1} = \frac{1}{K}\sum_{k=1}^K R(s_T^{(k)})$ requires no bootstrapping. The critic is trained for $M$ gradient steps on $\mathcal{D}_{T-1} = \{(s_{T-1}, y_{T-1}), (s_T, y_T)\}$ to produce calibrated terminal weights $\phi^{(T-1)}$.
+    \item \textbf{Backward Induction Loop ($t = T-2 \text{ down to } 0$):} Sweeping backward step-by-step:
+    \begin{itemize}[itemsep=1.5pt]
+        \item Compute the target at step $t$ using the \textbf{just-calibrated weights $\phi^{(t+1)}$}:
+        \[
+            y_t \;=\; \frac{1}{K}\sum_{k=1}^K \Big( r_t^{(k)} + \gamma \, V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big) \Big) \;+\; \gamma \lambda \, \hat{A}_{t+1}^{(\lambda)}.
+        \]
+        \item Add $(s_t, y_t)$ to the cumulative active resolved set: $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \{(s_t, y_t)\} = \{(s_\tau, y_\tau)\}_{\tau=t}^T$. Cumulatively retaining resolved steps prevents the shared neural network from catastrophically forgetting deeper steps $t+1 \dots T$.
+        \item Take $M$ gradient steps on $\mathcal{D}_t$ to obtain $\phi^{(t)}$, then proceed backward to $t-1$.
+    \end{itemize}
+\end{enumerate}
+
+% =============================================================================
+% TIKZ DIAGRAM: STAGED FBI
+% =============================================================================
+\begin{figure}[ht!]
+\centering
+\resizebox{0.96\textwidth}{!}{%
 \begin{tikzpicture}[
     >=Latex,
     font=\small,
-    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
-    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.8mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
-    branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.2mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
+    chainnode/.style={circle, draw=primaryblue, line width=1.2pt, fill=primaryblue!15, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    termnode/.style={circle, draw=termgreen!80!black, line width=1.2pt, fill=termgreen!20, minimum size=8.5mm, inner sep=0pt, font=\footnotesize\bfseries, text=black},
+    branchnode/.style={circle, draw=branchorange!90!black, line width=1pt, fill=branchorange!20, minimum size=7.0mm, inner sep=0pt, font=\scriptsize\bfseries, text=black}
 ]
 
-% =============================================================================
-% PANEL 1: THE ROLLOUT CHAIN & PARALLEL 1-STEP FORKS
-% =============================================================================
-\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.4)
-    {Step 1 (Rollout): Primary Trajectory Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches per Node};
+% Panel 1: Rollout
+\node[anchor=west, font=\normalsize\bfseries, text=primaryblue!90!black] at (-0.4, 10.3)
+    {Step 1: Primary Trajectory Chain $\tau = (s_0, \dots, s_T)$ + $K$ Parallel 1-Step Branches};
 
 \begin{scope}[shift={(0, 6.7)}]
-    \foreach \x/\step in {0/0, 2.8/1, 5.4/t, 8.2/t+1, 10.8/T-1, 13.6/T} {
-        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.9) {Time $\step$};
+    \foreach \x/\step in {0/0, 2.8/1, 5.5/t, 8.3/t+1, 11.0/T-1, 13.8/T} {
+        \node[font=\scriptsize\bfseries, text=black!60] at (\x, 2.8) {Step $\step$};
     }
 
-    % Primary Base Trajectory Chain Nodes
     \node[chainnode] (s0) at (0, 1.0) {$s_0$};
     \node[chainnode] (s1) at (2.8, 1.0) {$s_1$};
-    \node[chainnode] (st) at (5.4, 1.0) {$s_t$};
-    \node[chainnode] (st1) at (8.2, 1.0) {$s_{t+1}$};
-    \node[chainnode] (sTm1) at (10.8, 1.0) {$s_{T-1}$};
-    \node[termnode]  (sT) at (13.6, 1.0) {$s_T$};
+    \node[chainnode] (st) at (5.5, 1.0) {$s_t$};
+    \node[chainnode] (st1) at (8.3, 1.0) {$s_{t+1}$};
+    \node[chainnode] (sTm1) at (11.0, 1.0) {$s_{T-1}$};
+    \node[termnode]  (sT) at (13.8, 1.0) {$s_T$};
 
-    % Primary Chain Edges
-    \draw[->, primaryblue, line width=1.6pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
-    \draw[->, primaryblue, line width=1.6pt, dotted] (s1) -- (st);
-    \draw[->, primaryblue, line width=1.6pt] (st) -- node[above, font=\scriptsize] {$a_t$} (st1);
-    \draw[->, primaryblue, line width=1.6pt, dotted] (st1) -- (sTm1);
-    \draw[->, primaryblue, line width=1.6pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
+    \draw[->, primaryblue, line width=1.5pt] (s0) -- node[above, font=\scriptsize] {$a_0$} (s1);
+    \draw[->, primaryblue, line width=1.5pt, dotted] (s1) -- (st);
+    \draw[->, primaryblue, line width=1.5pt] (st) -- node[above, font=\scriptsize] {$a_t$} (st1);
+    \draw[->, primaryblue, line width=1.5pt, dotted] (st1) -- (sTm1);
+    \draw[->, primaryblue, line width=1.5pt] (sTm1) -- node[above, font=\scriptsize] {$a_{T-1}$} (sT);
 
-    % K 1-step branches at s_0
-    \node[branchnode] (b01) at (1.4, 2.15) {$s_1^{(1)}$};
-    \node[branchnode] (b0K) at (1.4, -0.15) {$s_1^{(K)}$};
-    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[above, sloped, font=\tiny] {1 step} (b01);
-    \draw[->, branchorange!90!black, line width=1pt] (s0) -- node[below, sloped, font=\tiny] {1 step} (b0K);
+    \node[branchnode] (b01) at (1.4, 2.1) {$s_1^{(1)}$};
+    \node[branchnode] (b0K) at (1.4, -0.1) {$s_1^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- (b01);
+    \draw[->, branchorange!90!black, line width=1pt] (s0) -- (b0K);
     \node[font=\scriptsize, text=branchorange!90!black] at (1.4, 0.5) {$\vdots$};
 
-    % K 1-step branches at intermediary node s_t
-    \node[branchnode] (bt1) at (6.8, 2.15) {$s_{t+1}^{(1)}$};
-    \node[branchnode] (btK) at (6.8, -0.15) {$s_{t+1}^{(K)}$};
-    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[above, sloped, font=\tiny] {1 step} (bt1);
-    \draw[->, branchorange!90!black, line width=1pt] (st) -- node[below, sloped, font=\tiny] {1 step} (btK);
-    \node[font=\scriptsize, text=branchorange!90!black] at (6.8, 0.5) {$\vdots$};
+    \node[branchnode] (bt1) at (6.9, 2.1) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (btK) at (6.9, -0.1) {$s_{t+1}^{(K)}$};
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- (bt1);
+    \draw[->, branchorange!90!black, line width=1pt] (st) -- (btK);
+    \node[font=\scriptsize, text=branchorange!90!black] at (6.9, 0.5) {$\vdots$};
 
-    % K 1-step branches at penultimate node s_{T-1} (landing on terminal leaves!)
-    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bT1) at (12.2, 2.15) {$s_T^{(1)}$};
-    \node[termnode, minimum size=7.2mm, font=\scriptsize\bfseries] (bTK) at (12.2, -0.15) {$s_T^{(K)}$};
-    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[above, sloped, font=\tiny] {1 step} (bT1);
-    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- node[below, sloped, font=\tiny] {1 step} (bTK);
-    \node[font=\scriptsize, text=termgreen!80!black] at (12.2, 0.5) {$\vdots$};
-
-    % Terminal reward labels
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, 2.15) {$R(s_T^{(1)}) \in \{0,1\}$};
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (14.1, 1.0) {$R(s_T) \in \{0,1\}$};
-    \node[anchor=west, font=\scriptsize, text=termgreen!70!black] at (12.7, -0.15) {$R(s_T^{(K)}) \in \{0,1\}$};
+    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bT1) at (12.4, 2.1) {$s_T^{(1)}$};
+    \node[termnode, minimum size=7.0mm, font=\scriptsize\bfseries] (bTK) at (12.4, -0.1) {$s_T^{(K)}$};
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- (bT1);
+    \draw[->, termgreen!80!black, line width=1pt] (sTm1) -- (bTK);
+    \node[font=\scriptsize, text=termgreen!80!black] at (12.4, 0.5) {$\vdots$};
 \end{scope}
 
-% =============================================================================
-% PANEL 2: INITIAL BASE CASE (END OF THE CHAIN: t = T - 1)
-% =============================================================================
+% Panel 2: Base Case at t = T - 1
 \begin{scope}[shift={(0, 2.3)}]
-    \draw[rounded corners=6pt, draw=termgreen!60!black, fill=boxbg, line width=0.9pt] (-0.4, -1.05) rectangle (16.4, 3.25);
-    \node[anchor=west, font=\footnotesize\bfseries, text=termgreen!70!black] at (-0.1, 2.85)
-        {Step 2A (Base Case at End of Chain, $t = T-1$): Exact Terminal Targets \& First Fitting Stage};
+    \draw[rounded corners=6pt, draw=termgreen!60!black, fill=boxbg, line width=0.9pt] (-0.4, -1.0) rectangle (16.2, 3.2);
+    \node[anchor=west, font=\footnotesize\bfseries, text=termgreen!70!black] at (-0.1, 2.8)
+        {Step 2A (Base Case at End of Chain, $t = T-1$): Exact Terminal Targets \& Initial Fitting};
 
-    % Mini diagram of s_{T-1} -> leaves
     \node[chainnode] (init_sTm1) at (0.8, 0.75) {$s_{T-1}$};
-    \node[termnode, minimum size=6.8mm, font=\scriptsize] (init_b1) at (2.8, 1.55) {$s_T^{(1)}$};
-    \node[termnode, minimum size=6.8mm, font=\scriptsize] (init_bK) at (2.8, -0.05) {$s_T^{(K)}$};
-    \node[font=\scriptsize, text=termgreen!80!black] at (2.8, 0.8) {$\vdots$};
-    \draw[->, termgreen!80!black, thick] (init_sTm1) -- node[above, sloped, font=\tiny] {1 step} (init_b1);
-    \draw[->, termgreen!80!black, thick] (init_sTm1) -- node[below, sloped, font=\tiny] {1 step} (init_bK);
+    \node[termnode, minimum size=6.6mm, font=\scriptsize] (init_b1) at (2.7, 1.5) {$s_T^{(1)}$};
+    \node[termnode, minimum size=6.6mm, font=\scriptsize] (init_bK) at (2.7, 0.0) {$s_T^{(K)}$};
+    \node[font=\scriptsize, text=termgreen!80!black] at (2.7, 0.75) {$\vdots$};
+    \draw[->, termgreen!80!black, thick] (init_sTm1) -- (init_b1);
+    \draw[->, termgreen!80!black, thick] (init_sTm1) -- (init_bK);
 
-    \node[anchor=west, font=\scriptsize] at (3.3, 1.55) {$R(s_T^{(1)}) = 1$};
-    \node[anchor=west, font=\scriptsize] at (3.3, -0.05) {$R(s_T^{(K)}) = 0$};
-
-    % Target box
-    \node[draw=termgreen!80!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (anchor_eq) at (5.6, 0.75) {
-        \textbf{1. Exact Terminal Targets:}\\[3pt]
-        No critic bootstrap needed at the end:\\[2pt]
-        $\bullet\; y_{T-1} = \frac{1}{K}\sum_{k=1}^K R\big(s_T^{(k)}\big)$\\[2pt]
-        $\bullet\; y_T = R(s_T)$\\[2pt]
-        $\bullet\; \mathcal{D}_{T-1} = \big\{(s_\tau, y_\tau)\big\}_{\tau=T-1}^{T}$
+    \node[draw=termgreen!80!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (anchor_eq) at (5.4, 0.75) {
+        \textbf{Exact Terminal Targets:}\\[2pt]
+        $y_{T-1} = \frac{1}{K}\sum_{k=1}^K R\big(s_T^{(k)}\big)$\\[2pt]
+        $y_T = R(s_T)$\\[2pt]
+        $\mathcal{D}_{T-1} = \big\{(s_{T-1}, y_{T-1}),\; (s_T, y_T)\big\}$
     };
 
-    % Fitting rounds box
-    \node[draw=fitpurple, fill=fitpurple!10, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.4cm, font=\scriptsize] (fit_init) at (11.3, 0.75) {
-        \textbf{2. Fit Critic ($M = 4$ Grad Steps):}\\[3pt]
-        Minimize squared error on $\mathcal{D}_{T-1}$ to obtain updated weights $\phi^{(T-1)}$:\\[4pt]
+    \node[draw=fitpurple, fill=fitpurple!10, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.5cm, font=\scriptsize] (fit_init) at (11.0, 0.75) {
+        \textbf{Fit Terminal Weights $\phi^{(T-1)}$:}\\[2pt]
+        Take $M$ gradient steps on $\mathcal{D}_{T-1}$:\\[3pt]
         $\phi^{(T-1)} \leftarrow \min_\phi \sum_{\tau=T-1}^{T} \big(V_\phi(s_\tau) - y_\tau\big)^2$
     };
 
-    \draw[->, thick, termgreen!80!black] (5.0, 0.75) -- (anchor_eq.west);
+    \draw[->, thick, termgreen!80!black] (4.8, 0.75) -- (anchor_eq.west);
     \draw[->, thick, fitpurple] (anchor_eq.east) -- (fit_init.west);
 \end{scope}
 
-% Backward Loop Connector Arrow between Step 2A and Step 2B
-\draw[->, fitpurple, line width=1.5pt] (8.0, 1.25) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Pass calibrated critic $V_{\phi^{(T-1)}}$ backward to $t = T-2, \dots, 0$} (8.0, 0.45);
+\draw[->, fitpurple, line width=1.5pt] (7.9, 1.25) -- node[right, font=\scriptsize\bfseries, text=fitpurple] {Pass calibrated critic $V_{\phi^{(T-1)}}$ backward} (7.9, 0.45);
 
-% =============================================================================
-% PANEL 3: THE INDUCTIVE LOOP AT INTERMEDIARY NODE s_t (REPEATED FOR t = T-2 .. 0)
-% =============================================================================
+% Panel 3: Inductive Loop
 \begin{scope}[shift={(0, -3.7)}]
-    \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -1.25) rectangle (16.4, 4.15);
-    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.75)
+    \draw[rounded corners=6pt, draw=fitpurple!80, fill=boxbg, line width=1.1pt] (-0.4, -1.2) rectangle (16.2, 4.0);
+    \node[anchor=west, font=\footnotesize\bfseries, text=fitpurple!90!black] at (-0.1, 3.6)
         {Step 2B (Backward Induction Loop, $t = T-2 \to 0$): Query $V_{\phi^{(t+1)}}$, Expand Set $\mathcal{D}_t$, \& Fit $\phi^{(t)}$};
 
-    % Left: Intermediary node s_t and its K parallel 1-step children
     \node[chainnode] (loop_st) at (0.7, 1.2) {$s_t$};
-    \node[branchnode] (loop_b1) at (2.4, 2.3) {$s_{t+1}^{(1)}$};
-    \node[branchnode] (loop_b2) at (2.4, 1.2) {$s_{t+1}^{(2)}$};
-    \node[branchnode] (loop_bK) at (2.4, 0.0) {$s_{t+1}^{(K)}$};
-    \node[font=\scriptsize, text=branchorange!90!black] at (2.4, 0.65) {$\vdots$};
-
+    \node[branchnode] (loop_b1) at (2.3, 2.2) {$s_{t+1}^{(1)}$};
+    \node[branchnode] (loop_bK) at (2.3, 0.2) {$s_{t+1}^{(K)}$};
+    \node[font=\scriptsize, text=branchorange!90!black] at (2.3, 0.75) {$\vdots$};
     \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_b1);
-    \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_b2);
     \draw[->, branchorange!90!black, thick] (loop_st) -- (loop_bK);
 
-    % Critic evaluation callouts on the K children using \phi^{(t+1)}
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v1) at (2.85, 2.3) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(1)}\big)$};
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (v2) at (2.85, 1.2) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(2)}\big)$};
-    \node[anchor=west, font=\scriptsize, text=fitpurple!90!black] (vK) at (2.85, 0.0) {$V_{\phi^{(t+1)}}\big(s_{t+1}^{(K)}\big)$};
-
-    % Center: Target construction at node s_t
-    \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (ind_target) at (5.6, 1.2) {
+    \node[draw=branchorange!90!black, fill=white, rounded corners=4pt, inner sep=6pt, anchor=west, text width=4.8cm, font=\scriptsize] (ind_target) at (5.4, 1.2) {
         \textbf{1. Target at $s_t$ Using $\phi^{(t+1)}$:}\\[2pt]
-        $\hat{V}_{\text{branch}}(s_t) = \frac{1}{K}\sum_{k=1}^K \Big(r_t^{(k)} + \gamma V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big)\Big)$\\[3pt]
-        $y_t = \hat{V}_{\text{branch}}(s_t) + \gamma\lambda \hat{A}_{t+1}^{(\lambda)}$\\[4pt]
-        \textbf{2. Add to Resolved Set $\mathcal{D}_t$:}\\[2pt]
-        $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \big\{(s_t, y_t)\big\} = \big\{(s_\tau, y_\tau)\big\}_{\tau=t}^{T}$\\[1pt]
-        {\tiny (Keeps resolved steps $[t \dots T]$ so deep steps aren't forgotten)}
+        $y_t = \frac{1}{K}\sum_{k=1}^K \Big(r_t^{(k)} + \gamma V_{\phi^{(t+1)}}\big(s_{t+1}^{(k)}\big)\Big) + \gamma\lambda \hat{A}_{t+1}^{(\lambda)}$\\[3pt]
+        \textbf{2. Expand Resolved Set $\mathcal{D}_t$:}\\[2pt]
+        $\mathcal{D}_t = \mathcal{D}_{t+1} \cup \{(s_t, y_t)\} = \{(s_\tau, y_\tau)\}_{\tau=t}^T$
     };
 
-    \draw[->, thick, branchorange!90!black] (5.05, 1.2) -- (ind_target.west);
-
-    % Right: M Fitting Rounds + Loop back arrow
-    \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.4cm, font=\scriptsize] (fit_loop) at (11.3, 1.2) {
-        \textbf{3. Fit Critic ($M = 4$ Grad Steps):}\\[3pt]
-        Take $M = 4$ gradient steps on the cumulative loss over $\mathcal{D}_t = [t \dots T]$:\\[4pt]
-        $\phi^{(t)} \leftarrow \min_\phi \frac{1}{|\mathcal{D}_t|} \sum_{\tau=t}^{T} \big(V_\phi(s_\tau) - y_\tau\big)^2$\\[4pt]
-        Now $V_{\phi^{(t)}}(s_t)$ is calibrated \emph{before} step $t-1$ queries it!
+    \node[draw=fitpurple, fill=fitpurple!12, rounded corners=4pt, line width=1pt, inner sep=6pt, anchor=west, text width=4.5cm, font=\scriptsize] (fit_loop) at (11.0, 1.2) {
+        \textbf{3. Fit Critic ($M$ Gradient Steps):}\\[2pt]
+        Take $M$ gradient steps on $\mathcal{D}_t$:\\[3pt]
+        $\phi^{(t)} \leftarrow \min_\phi \frac{1}{|\mathcal{D}_t|} \sum_{\tau=t}^T \big(V_\phi(s_\tau) - y_\tau\big)^2$\\[3pt]
+        $V_{\phi^{(t)}}(s_t)$ is calibrated \emph{before} step $t-1$ queries it!
     };
 
+    \draw[->, thick, branchorange!90!black] (4.8, 1.2) -- (ind_target.west);
     \draw[->, thick, fitpurple] (ind_target.east) -- (fit_loop.west);
 
-    % Loop back arrow showing decrement t <- t - 1
     \draw[->, fitpurple!90!black, line width=1.3pt, dashed]
-        (fit_loop.south) -- ++(0, -0.75) -| node[pos=0.25, below, font=\scriptsize\bfseries, fill=boxbg, inner sep=1.5pt]
-        {Next backward stage: $t \leftarrow t - 1$ (repeat until root $t = 0$ is fitted)} (loop_st.south);
+        (fit_loop.south) -- ++(0, -0.65) -| node[pos=0.25, below, font=\scriptsize\bfseries, fill=boxbg, inner sep=1.5pt]
+        {Decrement $t \leftarrow t - 1$ (repeat until root $t = 0$ is fitted)} (loop_st.south);
 \end{scope}
 
 \end{tikzpicture}%
 }
-\caption{\textbf{Algorithm 4: Staged FBI ($\text{FBI}_{\text{staged}}(\lambda)$).} \textbf{Top (Step 1):} Roll out the primary chain $\tau = (s_0, \dots, s_T)$ and fork $K$ parallel 1-step branches $s_{t+1}^{(1..K)}$ from each visited state $s_t$. \textbf{Middle (Step 2A):} At the end of the chain ($t=T-1$), the $K$ 1-step branches land on terminal states $s_T^{(1..K)}$ with exact rewards $R(s_T^{(k)})$, and the critic is trained for $M=4$ gradient steps to obtain $\phi^{(T-1)}$. \textbf{Bottom (Step 2B):} Sweeping backward for $t = T-2$ down to $0$, step $t$ queries the \emph{just-updated} critic $V_{\phi^{(t+1)}}$ on its $K$ 1-step children, adds $(s_t, y_t)$ to the resolved set $\mathcal{D}_t = \{(s_\tau, y_\tau)\}_{\tau=t}^T$, and takes $M=4$ gradient steps to produce $\phi^{(t)}$ before stepping backward to $t-1$.}
-\label{fig:staged_fbi_visual}
+\caption{\textbf{Architecture of Staged Fitted Backward Induction ($\text{FBI}_{\text{staged}}(\lambda)$).} Reverse-time backward induction sweeps from $t = T-1$ down to $0$, fitting $\phi^{(t+1)}$ before querying it to construct targets at step $t$.}
+\label{fig:staged_fbi_diagram}
+\end{figure}
+
+\subsection{\texorpdfstring{Why Staging Helps for Low $\lambda=0.0$, but Higher $\lambda=0.8$ Worked Best Anyway}{Why Staging Helps for Low lambda=0.0, but Higher lambda=0.8 Worked Best Anyway}}
+
+\Cref{tab:fbi_four_variants} presents the empirical comparison of all four FBI variants across the DAG and Tree benchmark suites.
+
+\begin{table}[ht!]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+\textbf{Environment} & \textbf{Algorithm} & \textbf{Final MSVE} & \textbf{Final AdvCos} & \textbf{Rollout Samples} & \textbf{FLOPs} & \textbf{Adv AUC} \\ \midrule
+\textbf{DAG Full} & Batched FBI ($\lambda=0.0$) & $1.50\times 10^{-2} \pm 2.9\times 10^{-4}$ & $\mathbf{0.8898 \pm 0.002}$ & 518,417 & 3.00M & 0.8280 \\
+($T=24, P=10$) & \textbf{Batched FBI ($\lambda=0.8$)} & $\mathbf{1.32\times 10^{-2} \pm 3.5\times 10^{-4}}$ & $0.8789 \pm 0.002$ & 518,417 & 3.00M & $\mathbf{0.8426}$ \\
+& Staged FBI ($\lambda=0.0$) & $1.89\times 10^{-2} \pm 5.0\times 10^{-4}$ & $0.8755 \pm 0.001$ & 517,882 & 2.99M & 0.8107 \\
+& Staged FBI ($\lambda=0.8$) & $1.64\times 10^{-2} \pm 4.3\times 10^{-4}$ & $0.8684 \pm 0.003$ & 517,882 & 2.99M & 0.8158 \\ \midrule
+\textbf{Tree Full} & Batched FBI ($\lambda=0.0$) & $1.35\times 10^{-2} \pm 2.0\times 10^{-3}$ & $0.8604 \pm 0.022$ & 224,000 & 1.43M & 0.5570 \\
+($D=7, P=10$) & \textbf{Batched FBI ($\lambda=0.8$)} & $\mathbf{9.15\times 10^{-3} \pm 9.0\times 10^{-4}}$ & $\mathbf{0.9152 \pm 0.007}$ & 224,000 & 1.43M & $\mathbf{0.6938}$ \\
+& Staged FBI ($\lambda=0.0$) & $1.04\times 10^{-2} \pm 1.5\times 10^{-3}$ & $0.9028 \pm 0.013$ & 224,000 & 1.43M & 0.6360 \\
+& Staged FBI ($\lambda=0.8$) & $1.12\times 10^{-2} \pm 1.7\times 10^{-3}$ & $0.8767 \pm 0.014$ & 224,000 & 1.43M & 0.6598 \\ \bottomrule
+\end{tabular}%
+}
+\caption{\textbf{Comparison of Four FBI Variants (Batched vs. Staged, $\lambda=0.0$ vs. $\lambda=0.8$).}}
+\label{tab:fbi_four_variants}
+\end{table}
+
+\noindent\textbf{1. Why Staging Helps for Low $\lambda=0.0$ Early in Training:}
+When $\lambda = 0$, the algorithm relies exclusively on 1-step Bellman bootstrapping. On the binary tree (\texttt{tree\_full}), Staged FBI ($\lambda=0.0$) significantly outperforms Batched FBI ($\lambda=0.0$):
+\begin{itemize}[itemsep=1.5pt]
+    \item Adv AUC is $\mathbf{0.6360}$ for Staged vs. only $\mathbf{0.5570}$ for Batched ($+14.2\%$ improvement).
+    \item Final MSVE is $1.04\times 10^{-2}$ for Staged vs. $1.35\times 10^{-2}$ for Batched.
+\end{itemize}
+Because terminal reward is observed at depth $D=7$, Batched FBI ($\lambda=0.0$) requires 7 full outer updates for reward information to bootstrap back to the root $s_0$. Staged FBI propagates this reward all the way to $s_0$ in update 1, producing far superior early calibration.
+
+\medskip
+\noindent\textbf{2. Why Higher $\lambda=0.8$ Worked Best Anyway (Making Staging Unnecessary):}
+However, when $\lambda$ is increased to $0.8$, the multi-step trajectory accumulator $\hat{A}_t^{(\lambda)}$ carries terminal reward signal directly up the primary chain without depending on recursive 1-step bootstrap passes.
+\begin{itemize}[itemsep=1.5pt]
+    \item On Tree Full, increasing $\lambda \to 0.8$ elevates Batched FBI's Adv AUC from $0.5570$ to $\mathbf{0.6938}$ ($+24.6\%$), completely eliminating the bootstrap lag.
+    \item Under $\lambda=0.8$, **Batched FBI strictly outperforms Staged FBI** on both DAG ($1.32\times 10^{-2}$ vs. $1.64\times 10^{-2}$ MSVE) and Tree ($9.15\times 10^{-3}$ vs. $1.12\times 10^{-2}$ MSVE).
+\end{itemize}
+
+\medskip
+\noindent\textbf{3. The Neural Optimization Flaw of Staged FBI:}
+Why does Batched FBI beat Staged FBI when $\lambda=0.8$?
+In Staged FBI, the active training set $\mathcal{D}_t = [t \dots T]$ is inherently **bottom-heavy**: late transitions ($\tau \approx T$) remain in $\mathcal{D}_t$ across all $T$ backward stages, receiving $T \times M$ gradient updates, whereas the root state $s_0$ enters only in the very last stage and receives only $M$ updates. Furthermore, updating $\phi$ sequentially breaks the i.i.d.\ shuffling assumption of stochastic gradient descent.
+
+In contrast, **Batched FBI shuffles all transition tuples across the entire rollout buffer for multiple global epochs**, ensuring that early, middle, and late reasoning tokens receive balanced gradient updates and learn shared causal representations simultaneously. Therefore, the combination of **Batched updates + $\lambda=0.8$** delivers the optimal balance of fast reward propagation, low target variance, and balanced neural representation learning.
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/dag/dag_fbi_variants_comparison_curves.png}
+\caption{\textbf{Reasoning DAG: Four FBI Variants (Batched vs. Staged, $\lambda=0.0$ vs. $\lambda=0.8$).}}
+\label{fig:fbi_variants_dag}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/tree/tree_fbi_variants_comparison_curves.png}
+\caption{\textbf{Procedural Tree: Four FBI Variants (Batched vs. Staged, $\lambda=0.0$ vs. $\lambda=0.8$).}}
+\label{fig:fbi_variants_tree}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/dag/dag_fbi_variants_difficulty_breakdown.png}
+\caption{\textbf{Reasoning DAG: Four FBI Variants vs. Problem Difficulty $\theta \in [0, 1]$.}}
+\label{fig:fbi_variants_dag_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/tree/tree_fbi_variants_difficulty_breakdown.png}
+\caption{\textbf{Procedural Tree: Four FBI Variants vs. Problem Difficulty $\theta \in [0, 1]$.}}
+\label{fig:fbi_variants_tree_diff}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/dag/dag_fbi_variants_scatter_true_vs_estimated.png}
+\caption{\textbf{Critic Calibration on DAG: Four FBI Variants.}}
+\label{fig:fbi_variants_dag_scatter}
+\end{figure}
+
+\begin{figure}[ht!]
+\centering
+\includegraphics[width=0.98\textwidth]{analysis/2_fbi_variants/tree/tree_fbi_variants_scatter_true_vs_estimated.png}
+\caption{\textbf{Critic Calibration on Tree: Four FBI Variants.}}
+\label{fig:fbi_variants_tree_scatter}
 \end{figure}
 
 \end{document}

@@ -4,6 +4,7 @@ import sys
 import time
 import argparse
 import pickle
+import json
 import datetime
 from typing import Tuple, Dict, Any, List, NamedTuple
 
@@ -16,6 +17,8 @@ from flax.training.train_state import TrainState
 from transformer import TransformerCritic
 from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
 from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTreeEnv, ProceduralTreeExactValue, TreeState
+from envs.quality_dag_env import QualityDAGEnv
+from envs.approach_error_dag_env import ApproachErrorDAGEnv
 import plot_results
 
 
@@ -36,13 +39,13 @@ class StepData(NamedTuple):
 def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed: int = 12345):
     """
     Constructs a balanced evaluation dataset for ReasoningDAGEnv covering
-    each problem index (difficulty tier) equally, spanning steps, milestones, and derailment conditions.
+    each problem index equally, spanning actual histories and latent quality levels.
     Filters out dummy post-termination states.
     """
     P = env.num_problems
     num_rollouts = max(16, (samples_per_problem // 6) + 4)
 
-    all_prompts, all_m, all_d, all_steps, all_hist, all_done = [], [], [], [], [], []
+    all_prompts, all_m, all_q, all_steps, all_hist, all_done = [], [], [], [], [], []
 
     for p in range(P):
         rng = jax.random.PRNGKey(seed + p * 1000)
@@ -64,7 +67,7 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
 
         flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)
         flat_p_m = jnp.concatenate([st.milestone for st in p_states], axis=0)
-        flat_p_d = jnp.concatenate([st.is_derailed for st in p_states], axis=0)
+        flat_p_q = jnp.concatenate([st.path_quality for st in p_states], axis=0)
         flat_p_s = jnp.concatenate([st.step_count for st in p_states], axis=0)
         flat_p_h = jnp.concatenate([st.history_tokens for st in p_states], axis=0)
         flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)
@@ -73,18 +76,29 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
         active_idx = jnp.where(~flat_p_done)[0]
         n_sel = min(samples_per_problem, int(active_idx.shape[0]))
         rng, sel_rng = jax.random.split(rng)
-        sel_idx = jax.random.choice(sel_rng, active_idx, shape=(n_sel,), replace=False)
+        if hasattr(env, "quality_levels"):
+            buckets = [np.asarray(active_idx)[np.asarray(flat_p_q[active_idx]) == q] for q in range(env.quality_levels)]
+            selection_rng = np.random.default_rng(seed + p * 1000)
+            buckets = [list(selection_rng.permutation(b)) for b in buckets]
+            selected = []
+            while len(selected) < n_sel:
+                for bucket in buckets:
+                    if bucket and len(selected) < n_sel:
+                        selected.append(bucket.pop())
+            sel_idx = jnp.asarray(selected)
+        else:
+            sel_idx = jax.random.choice(sel_rng, active_idx, shape=(n_sel,), replace=False)
 
         all_prompts.append(flat_p_prompt[sel_idx])
         all_m.append(flat_p_m[sel_idx])
-        all_d.append(flat_p_d[sel_idx])
+        all_q.append(flat_p_q[sel_idx])
         all_steps.append(flat_p_s[sel_idx])
         all_hist.append(flat_p_h[sel_idx])
         all_done.append(flat_p_done[sel_idx])
 
     flat_prompt = jnp.concatenate(all_prompts, axis=0)
     flat_milestone = jnp.concatenate(all_m, axis=0)
-    flat_derailed = jnp.concatenate(all_d, axis=0)
+    flat_quality = jnp.concatenate(all_q, axis=0)
     flat_steps = jnp.concatenate(all_steps, axis=0)
     flat_obs = jnp.concatenate(all_hist, axis=0)
     flat_done = jnp.concatenate(all_done, axis=0)
@@ -93,7 +107,7 @@ def build_dag_eval_set(env: ReasoningDAGEnv, samples_per_problem: int = 32, seed
     eval_state = DAGState(
         prompt_idx=flat_prompt,
         milestone=flat_milestone,
-        is_derailed=flat_derailed,
+        path_quality=flat_quality,
         step_count=flat_steps,
         history_tokens=flat_obs,
         done=flat_done,
@@ -161,7 +175,7 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
 
             flat_p_prompt = jnp.concatenate([st.prompt_idx for st in p_states], axis=0)
             flat_p_node = jnp.concatenate([st.node_idx for st in p_states], axis=0)
-            flat_p_depth = jnp.concatenate([st.depth_count for st in p_states], axis=0)
+            flat_p_qepth = jnp.concatenate([st.depth_count for st in p_states], axis=0)
             flat_p_hist = jnp.concatenate([st.history_tokens for st in p_states], axis=0)
             flat_p_done = jnp.concatenate([st.done for st in p_states], axis=0)
 
@@ -172,7 +186,7 @@ def build_tree_eval_set(env: Any, samples_per_problem: int = 32, seed: int = 123
 
             all_prompts.append(flat_p_prompt[sel_idx])
             all_nodes.append(flat_p_node[sel_idx])
-            all_depths.append(flat_p_depth[sel_idx])
+            all_depths.append(flat_p_qepth[sel_idx])
             all_hist.append(flat_p_hist[sel_idx])
             all_done.append(flat_p_done[sel_idx])
 
@@ -334,7 +348,7 @@ def _repeat_state(state: Any, k_branches: int, is_dag: bool) -> Any:
         return DAGState(
             prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
             milestone=jnp.repeat(state.milestone, k_branches),
-            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+            path_quality=jnp.repeat(state.path_quality, k_branches),
             step_count=jnp.repeat(state.step_count, k_branches),
             history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
             done=jnp.repeat(state.done, k_branches),
@@ -520,6 +534,9 @@ def make_train_loop(
     max_grad_norm = float(cfg.get("MAX_GRAD_NORM", 1.0))
 
     # Parse algo parameters
+    # Explicit K variants: fbi_kK_lamL (fresh branches), or
+    # fbi_trunk_kK_lamL (trunk transition plus K-1 fresh branches).
+    includes_trunk = algo.startswith("fbi_trunk_k")
     is_mc = (algo == "mc")
     is_td = algo.startswith("td")
     is_vine = algo.startswith("vine")
@@ -535,8 +552,16 @@ def make_train_loop(
         k_branches = int(algo.split("_k")[1])
     elif is_fbi or is_td:
         lmbda = float(algo.split("_lam")[1])
+        if "_k" in algo:
+            k_branches = int(algo.split("_k")[1].split("_")[0])
+            if k_branches < 1:
+                raise ValueError("K must be positive")
+        if includes_trunk and k_branches == 1:
+            # Identical targets, random stream, optimization, and cost to TD.
+            is_td = True
+            is_fbi_batched = False
 
-    is_dag = (env_type in ("dag", "single_dag", "dag_spectrum"))
+    is_dag = (env_type in ("dag", "single_dag", "dag_spectrum", "dag_quality", "dag_approach"))
     vocab_size = env.vocab_size
     max_seq_len = env.max_seq_len
     pad_token_id = 0
@@ -681,27 +706,29 @@ def make_train_loop(
             elif is_fbi_batched:
                 # Synchronous / Batched 1-step branching target:
                 # 1. Sample K 1-step branches across all (T, B) states in parallel
+                n_fresh = k_branches - int(includes_trunk)
+
                 def _sample_branch_1step(state, r_key):
                     ak, sk = jax.random.split(r_key)
                     if is_dag:
                         fork_st = DAGState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            milestone=jnp.repeat(state.milestone, k_branches),
-                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
-                            step_count=jnp.repeat(state.step_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
+                            prompt_idx=jnp.repeat(state.prompt_idx, n_fresh),
+                            milestone=jnp.repeat(state.milestone, n_fresh),
+                            path_quality=jnp.repeat(state.path_quality, n_fresh),
+                            step_count=jnp.repeat(state.step_count, n_fresh),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], n_fresh, axis=0),
+                            done=jnp.repeat(state.done, n_fresh),
                         )
                     else:
                         fork_st = TreeState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            node_idx=jnp.repeat(state.node_idx, k_branches),
-                            depth_count=jnp.repeat(state.depth_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
+                            prompt_idx=jnp.repeat(state.prompt_idx, n_fresh),
+                            node_idx=jnp.repeat(state.node_idx, n_fresh),
+                            depth_count=jnp.repeat(state.depth_count, n_fresh),
+                            history_tokens=jnp.repeat(state.history_tokens[None, :], n_fresh, axis=0),
+                            done=jnp.repeat(state.done, n_fresh),
                         )
-                    a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
-                    next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
+                    a = jax.vmap(env.sample_base_action)(jax.random.split(ak, n_fresh), fork_st)
+                    next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, n_fresh), fork_st, a)
                     return next_o, r, d
 
                 rng, b_rng = jax.random.split(rng)
@@ -711,15 +738,20 @@ def make_train_loop(
                 # 2. Single fused forward pass over all T * B trunk observations + T * B * K branch observations
                 n_trunk = num_steps * num_envs
                 flat_trunk_obs = traj_batch.obs.reshape(n_trunk, -1)
-                flat_b_next_obs = b_next_obs.reshape(n_trunk * k_branches, -1)
-                all_fbi_obs = jnp.concatenate([flat_trunk_obs, flat_b_next_obs], axis=0)
+                flat_b_next_obs = b_next_obs.reshape(n_trunk * n_fresh, -1)
+                all_fbi_obs = jnp.concatenate([flat_trunk_obs, flat_b_next_obs, last_obs], axis=0)
 
                 all_fbi_v = jax.lax.stop_gradient(
                     network.apply(train_state.params, all_fbi_obs, method=network.value)
                 )
                 v_base = all_fbi_v[:n_trunk].reshape(num_steps, num_envs)
-                v_next = all_fbi_v[n_trunk:].reshape(num_steps, num_envs, k_branches)
+                v_next = all_fbi_v[n_trunk:n_trunk * (1 + n_fresh)].reshape(num_steps, num_envs, n_fresh)
                 branch_ret = b_rew + gamma * (1.0 - b_done.astype(jnp.float32)) * v_next
+                if includes_trunk:
+                    v_last = all_fbi_v[n_trunk * (1 + n_fresh):]
+                    trunk_v_next = jnp.concatenate([v_base[1:], v_last[None, :]], axis=0)
+                    trunk_ret = traj_batch.reward + gamma * (1.0 - traj_batch.done.astype(jnp.float32)) * trunk_v_next
+                    branch_ret = jnp.concatenate([trunk_ret[..., None], branch_ret], axis=-1)
                 v_branch = jnp.mean(branch_ret, axis=-1)
 
                 # Formulation B: GAE over branched residuals
@@ -735,8 +767,8 @@ def make_train_loop(
                     (delta_branch, traj_batch.done), reverse=True
                 )
                 targets = v_base + gae_adv
-                active_infer_steps = trunk_active_steps * (1.0 + float(k_branches))
-                critic_eval_steps = trunk_active_steps * (1.0 + float(k_branches))
+                active_infer_steps = trunk_active_steps * (1.0 + float(n_fresh))
+                critic_eval_steps = trunk_active_steps * (1.0 + float(n_fresh))
 
             elif is_fbi_staged:
                 # Staged / Sequential FBI (XLA-optimized with jax.lax.scan & active-pool minibatching):
@@ -747,7 +779,7 @@ def make_train_loop(
                         fork_st = DAGState(
                             prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
                             milestone=jnp.repeat(state.milestone, k_branches),
-                            is_derailed=jnp.repeat(state.is_derailed, k_branches),
+                            path_quality=jnp.repeat(state.path_quality, k_branches),
                             step_count=jnp.repeat(state.step_count, k_branches),
                             history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
                             done=jnp.repeat(state.done, k_branches),
@@ -878,6 +910,25 @@ def make_train_loop(
                 "llm_flops_per_n": llm_flops_per_n,
             }
 
+            if hasattr(env, "quality_levels"):
+                st = eval_set["eval_state"]
+                err = jnp.square(v_eval_preds - eval_set["exact_v"])
+                remaining = env.problem_max_steps[st.prompt_idx] - st.step_count
+                all_v = network.apply(train_state.params, eval_set["all_eval_tokens"], method=network.value)
+                n_eval = st.prompt_idx.shape[0]
+                next_v = all_v[n_eval:].reshape(env.num_actions,n_eval)
+                pred_adv = eval_set["r_all"] + gamma*(1-eval_set["d_all"])*next_v-v_eval_preds[None,:]
+                true_adv = eval_set["true_adv"]
+                strata = env.evaluation_groups(st) if hasattr(env, "evaluation_groups") else (("quality", st.path_quality, env.quality_levels),)
+                for key, groups, count in (*strata, ("remaining_horizon", remaining, env.max_steps+1)):
+                    masks = groups[None,:] == jnp.arange(count)[:,None]
+                    counts = masks.sum(-1)
+                    metrics_step["msve_by_"+key] = (masks*err[None,:]).sum(-1) / jnp.maximum(counts,1)
+                    metrics_step["count_by_"+key] = counts
+                    ta = masks[:,None,:]*true_adv[None,:,:]
+                    pa = masks[:,None,:]*pred_adv[None,:,:]
+                    metrics_step["adv_cos_by_"+key] = (ta*pa).sum((1,2))/(jnp.sqrt((ta*ta).sum((1,2))*(pa*pa).sum((1,2)))+1e-8)
+
             return (train_state, env_state, last_obs, rng, snap_1_val, snap_4_val), metrics_step
 
         num_eval_states = eval_set["eval_obs"].shape[0]
@@ -948,7 +999,7 @@ def run_benchmark(
     print("=" * 85)
 
     # 1. Initialize Environment & Precompute Exact Evaluator
-    is_dag_family = (env_type in ("dag", "single_dag", "dag_spectrum"))
+    is_dag_family = (env_type in ("dag", "single_dag", "dag_spectrum", "dag_quality", "dag_approach"))
     if is_dag_family:
         if env_type == "single_dag":
             dag_params = dag_params or {"num_problems": 1, "num_milestones": 8, "max_steps": 32, "num_actions": 8, "difficulty": 0.5}
@@ -962,7 +1013,12 @@ def run_benchmark(
             env_title = f"LLM-Scale Reasoning DAG Spectrum (P={num_probs}, M_max={dag_params['num_milestones']}, T_max={dag_params['max_steps']}, |A|={dag_params['num_actions']})"
             difficulties = "spectrum"
 
-        env = ReasoningDAGEnv(
+        env_class = {"dag_quality": QualityDAGEnv, "dag_approach": ApproachErrorDAGEnv}.get(env_type, ReasoningDAGEnv)
+        quality_keys = ("quality_levels", "quality_change_rate", "quality_up_bias", "quality_jump", "absorbing_dead", "initial_quality", "success_quality")
+        quality_kwargs = {k: dag_params[k] for k in quality_keys if k in dag_params} if env_type == "dag_quality" else {}
+        if env_type == "dag_approach":
+            quality_kwargs = {k: dag_params[k] for k in ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight") if k in dag_params}
+        env = env_class(
             num_problems=num_probs,
             num_milestones=dag_params["num_milestones"],
             max_steps=dag_params["max_steps"],
@@ -970,7 +1026,12 @@ def run_benchmark(
             difficulties=difficulties,
             variable_depth=(num_probs > 1),
             seed=master_seed,
+            **quality_kwargs,
         )
+        if env_type == "dag_quality":
+            env_title = env_title.replace("Reasoning DAG", f"Path-Quality DAG (Q={env.quality_levels})")
+        if env_type == "dag_approach":
+            env_title = env_title.replace("Reasoning DAG", f"Approach-and-Error DAG (approaches={env.num_approaches})")
         samples_per_p = max(12, (256 if num_probs == 1 else 400) // num_probs)
         eval_set = build_dag_eval_set(env, samples_per_problem=samples_per_p, seed=env.eval_seed)
         num_steps = env.max_steps
@@ -1040,10 +1101,17 @@ def run_benchmark(
     results: Dict[str, Any] = {
         "env_type": env_type,
         "env_title": env_title,
+        "environment_config": getattr(env, "config", {"version": "binary_dag_v1" if is_dag_family else "tree_v1"}),
+        "evaluation_approach": np.asarray(eval_set["eval_state"].path_quality // 3) if env_type == "dag_approach" else None,
+        "evaluation_error_status": np.asarray(eval_set["eval_state"].path_quality % 3) if env_type == "dag_approach" else None,
+        "evaluation_latent_code": np.asarray(eval_set["eval_state"].path_quality) if env_type == "dag_approach" else None,
+        "evaluation_path_quality": np.asarray(eval_set["eval_state"].path_quality) if is_dag_family and env_type != "dag_approach" else None,
+        "evaluation_remaining_horizon": np.asarray(env.problem_max_steps[eval_set["eval_state"].prompt_idx] - eval_set["eval_state"].step_count) if is_dag_family else None,
         "eval_true_values": np.asarray(eval_set["exact_v"]),
         "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
         "base_total_grad_steps": base_total_grad_steps,
         "flop_assumptions": flop_assumptions,
+        "environment_diagnostics": env.diagnostics() if hasattr(env, "diagnostics") else None,
         "methods": {},
         "reference_baselines": {},
     }
@@ -1055,6 +1123,11 @@ def run_benchmark(
             return f"TD (lam={a.split('_lam')[1]})"
         if a.startswith("vine_k"):
             return f"Vine-Target (K={a.split('_k')[1]})"
+        if a.startswith("fbi_trunk_k") or a.startswith("fbi_k"):
+            k = a.split("_k")[1].split("_")[0]
+            mode = "trunk included" if a.startswith("fbi_trunk") else "fresh branches"
+            lam = a.split("_lam")[1]
+            return f"Batched FBI (K={k}, lam={lam}, {mode})"
         if a.startswith("fbi_staged_lam"):
             return f"Staged FBI (lam={a.split('_lam')[1]})"
         if a.startswith("fbi_batched_lam") or a.startswith("fbi_lam"):
@@ -1138,6 +1211,12 @@ def run_benchmark(
             },
         }
 
+        if hasattr(env, "quality_levels"):
+            strata_names = ("approach", "error_status", "remaining_horizon") if hasattr(env, "evaluation_groups") else ("quality", "remaining_horizon")
+            for key in strata_names:
+                for prefix in ("msve_by_", "count_by_", "adv_cos_by_"):
+                    results["methods"][display_name][prefix+key] = np.asarray(out["metrics"][prefix+key])
+
     # 2. Iterate Over Main Algorithms (identical trunk B, identical grad steps, identical replay ratio)
     for algo in algos:
         display_name = _format_algo_name(algo)
@@ -1200,6 +1279,10 @@ def run_benchmark(
         pickle.dump(results, f)
     print(f"\n[Benchmark] Saved raw benchmark results to: {pkl_path}")
 
+    with open(os.path.join(save_dir, "environment.json"), "w") as f:
+        json.dump({"config": results["environment_config"], "diagnostics": results["environment_diagnostics"]}, f, indent=2)
+    plot_results.plot_quality_breakdown(results, save_dir)
+
     # 6. Generate Publication Figures & AUC Summary
     plot_results.plot_comparison_curves(results, save_dir, prefix="benchmark")
     plot_results.plot_scatter_true_vs_estimated(results, save_dir, prefix="benchmark")
@@ -1212,7 +1295,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
-    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "single_tree", "tree"], help="Environment type: single_dag, dag, single_tree, tree")
+    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "dag_quality", "dag_approach", "single_tree", "tree"], help="Environment family, including dag_quality and dag_approach")
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
@@ -1229,6 +1312,22 @@ def main():
     parser.add_argument("--num_milestones", type=int, default=None, help="DAG: Number of milestones (defaults: 8 for single_dag, 12 for dag)")
     parser.add_argument("--max_steps", type=int, default=None, help="DAG: Max steps (defaults: 32 for single_dag, 40 for dag)")
     parser.add_argument("--num_actions", type=int, default=8, help="DAG: Number of discrete actions")
+
+    # Latent quality DAG (select with --env_type dag_quality)
+    parser.add_argument("--quality_levels", type=int, default=7)
+    parser.add_argument("--quality_change_rate", type=float, default=0.35)
+    parser.add_argument("--quality_up_bias", type=float, default=0.6)
+    parser.add_argument("--quality_jump", type=int, default=1)
+    parser.add_argument("--initial_quality", type=int, default=None)
+    parser.add_argument("--success_quality", type=int, default=None)
+    parser.add_argument("--absorbing_dead", action="store_true")
+
+    # Approach-and-error DAG
+    parser.add_argument("--num_approaches", type=int, default=3)
+    parser.add_argument("--error_rate", type=float, default=1.0)
+    parser.add_argument("--recovery_rate", type=float, default=1.0)
+    parser.add_argument("--shortcut_weight", type=float, default=0.04)
+    parser.add_argument("--wait_weight", type=float, default=0.10)
 
     # Tree specific params
     parser.add_argument("--depth", type=int, default=7, help="Tree: Depth of binary tree (default: 7)")
@@ -1260,7 +1359,7 @@ def main():
 
     # Set smart defaults based on env_type
     is_single = args.env_type in ("single_dag", "single_tree")
-    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum")
+    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum", "dag_quality", "dag_approach")
     num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else (20 if is_dag_cli else 10))
     num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 12)
     max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 40)
@@ -1272,6 +1371,10 @@ def main():
         "num_actions": args.num_actions,
         "difficulty": args.difficulty,
     }
+    for key in ("quality_levels", "quality_change_rate", "quality_up_bias", "quality_jump", "absorbing_dead", "initial_quality", "success_quality"):
+        dag_params[key] = getattr(args, key)
+    for key in ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"):
+        dag_params[key] = getattr(args, key)
     tree_params = {
         "num_problems": num_prob,
         "depth": args.depth,

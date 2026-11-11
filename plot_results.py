@@ -922,6 +922,50 @@ def main():
     compute_and_save_auc_summary(results, save_dir, prefix=args.prefix)
     plot_difficulty_breakdown(results, save_dir, prefix=args.prefix)
     plot_pareto_frontier(results, save_dir, prefix=args.prefix)
+    plot_quality_breakdown(results, save_dir)
+
+
+
+def plot_quality_breakdown(results, save_dir):
+    """Final critic errors by latent-state groups and remaining horizon."""
+    import csv
+    approach = any("msve_by_approach" in v for v in results["methods"].values())
+    groups = ("approach", "error_status", "remaining_horizon") if approach else ("quality", "remaining_horizon")
+    stem = "benchmark_state_breakdown" if approach else "benchmark_quality_breakdown"
+    methods = {k:v for k,v in results["methods"].items() if "msve_by_"+groups[0] in v}
+    if not methods:
+        return
+    fig,axes = plt.subplots(2,len(groups),figsize=(6.5*len(groups),8))
+    with open(os.path.join(save_dir,stem+'.csv'),'w') as f:
+        writer=csv.writer(f)
+        writer.writerow(['Algorithm','Stratum','Index','Eval_Count','MSVE_Mean','MSVE_SEM','AdvCos_Mean','AdvCos_SEM'])
+        for col,key in enumerate(groups):
+            for label,method in methods.items():
+                count=np.asarray(method['count_by_'+key])[0,-1]
+                mse=np.asarray(method['msve_by_'+key])[:,-1]
+                adv=np.asarray(method['adv_cos_by_'+key])[:,-1]
+                mean=mse.mean(0); amean=adv.mean(0)
+                se=mse.std(0)/np.sqrt(len(mse)); ase=adv.std(0)/np.sqrt(len(adv))
+                idx=np.flatnonzero(count>0)
+                categorical = key in ("approach", "error_status")
+                style = dict(marker="o", linestyle="none") if categorical else {}
+                axes[0,col].plot(idx,mean[idx],label=label,**style)
+                axes[1,col].plot(idx,amean[idx],label=label,**style)
+                for i in idx: writer.writerow([label,key,i,int(count[i]),mean[i],se[i],amean[i],ase[i]])
+            for row in range(2):
+                axes[row,col].set_xlabel(key.replace('_',' ').title())
+                axes[row,col].set_ylabel('Value MSE' if row==0 else 'Advantage cosine similarity')
+                axes[row,col].grid(alpha=.25)
+        if approach:
+            for row in range(2):
+                approaches = results.get("environment_config", {}).get("num_approaches", 3)
+                axes[row,0].set_xticks(np.arange(approaches))
+                axes[row,1].set_xticks([0,1,2], ["Sound", "Slip", "Misconception"])
+        axes[0,0].legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir,stem+'.png'),dpi=160)
+        fig.savefig(os.path.join(save_dir,stem+'.pdf'))
+        plt.close(fig)
 
 
 if __name__ == "__main__":
