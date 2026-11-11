@@ -154,12 +154,33 @@ def plot_comparison_curves(
         m_msve, s_msve = float(np.mean(r_msve)), float(np.std(r_msve) / np.sqrt(len(r_msve)))
         m_adv, s_adv = float(np.mean(r_adv)), float(np.std(r_adv) / np.sqrt(len(r_adv)))
 
-        for ax in [ax_msve_step, ax_msve_sample, ax_msve_compute]:
-            ax.axhline(m_msve, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
-            ax.axhspan(max(1e-7, m_msve - s_msve), m_msve + s_msve, color=color, alpha=0.09)
-        for ax in [ax_adv_step, ax_adv_sample, ax_adv_compute]:
-            ax.axhline(m_adv, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
-            ax.axhspan(m_adv - s_adv, min(1.05, m_adv + s_adv), color=color, alpha=0.09)
+        # Gradient-step panels take 0 critic updates: keep horizontal reference lines
+        ax_msve_step.axhline(m_msve, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
+        ax_msve_step.axhspan(max(1e-7, m_msve - s_msve), m_msve + s_msve, color=color, alpha=0.09)
+        ax_adv_step.axhline(m_adv, label=ref_name, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
+        ax_adv_step.axhspan(m_adv - s_adv, min(1.05, m_adv + s_adv), color=color, alpha=0.09)
+
+        def _plot_budgeted_ref(ax, x_key, mean_val, sem_val, is_msve_ax: bool):
+            if x_key in ref_data and (x_key != "x_llm_flops" or has_llm_flops):
+                rx = np.asarray(ref_data[x_key], dtype=np.float64)
+                ry = np.full_like(rx, mean_val, dtype=np.float64)
+                lo = np.maximum(1e-7, ry - sem_val) if is_msve_ax else (ry - sem_val)
+                hi = (ry + sem_val) if is_msve_ax else np.minimum(1.05, ry + sem_val)
+                ax.plot(rx, ry, color=color, ls=ls_ref, lw=2.0, alpha=0.92)
+                ax.fill_between(rx, lo, hi, color=color, alpha=0.10)
+                # Mark u=1 (hollow diamond: first PPO update possible) and u=U (filled diamond: final PPO update)
+                ax.plot(rx[0], mean_val, marker="D", ms=6.0, mfc="white", mec=color, mew=1.8, zorder=6)
+                ax.plot(rx[-1], mean_val, marker="D", ms=6.0, mfc=color, mec=color, zorder=6)
+            else:
+                ax.axhline(mean_val, color=color, ls=ls_ref, lw=1.8, alpha=0.9)
+                lo = max(1e-7, mean_val - sem_val) if is_msve_ax else (mean_val - sem_val)
+                hi = (mean_val + sem_val) if is_msve_ax else min(1.05, mean_val + sem_val)
+                ax.axhspan(lo, hi, color=color, alpha=0.09)
+
+        _plot_budgeted_ref(ax_msve_sample, "x_samples", m_msve, s_msve, True)
+        _plot_budgeted_ref(ax_adv_sample, "x_samples", m_adv, s_adv, False)
+        _plot_budgeted_ref(ax_msve_compute, "x_llm_flops", m_msve, s_msve, True)
+        _plot_budgeted_ref(ax_adv_compute, "x_llm_flops", m_adv, s_adv, False)
 
     # Subplot formatting
     for ax in [ax_msve_step, ax_msve_sample, ax_msve_compute]:
@@ -654,32 +675,101 @@ def plot_pareto_frontier(
         ax_compute.errorbar(final_compute, mean_adv, yerr=sem_adv, fmt="o", color=color, ecolor=color, elinewidth=1.6, capsize=4, ms=9, label=name)
         compute_pts.append((final_compute, mean_adv, name, color))
 
-    # Add non-parametric Vine MC reference lines and text annotations
+    # Add non-parametric Vine MC reference trajectories (u=1 -> u=U) and Pareto points
     ref_baselines = results.get("reference_baselines", {})
-    for pts, ax in [(sample_pts, ax_sample), (compute_pts, ax_compute)]:
+    for pts, ax, x_key in [(sample_pts, ax_sample, "x_samples"), (compute_pts, ax_compute, "x_llm_flops")]:
         ax.set_xscale("log")
         ax.set_ylim(-0.05, 1.05)
         ax.axhline(1.0, color="gray", ls=":", lw=1.0)
         ax.set_ylabel(r"Final Advantage Cosine Similarity $\cos(\hat{\mathbf{A}}, \mathbf{A}^*)$")
         ax.grid(True, which="both", ls="--", lw=0.5, alpha=0.6)
 
+        all_x_vals = [p[0] for p in pts]
+        all_pts_to_annotate = list(pts)
+
         for r_idx, (ref_name, ref_data) in enumerate(ref_baselines.items()):
             r_adv = np.asarray(ref_data["advantage_cosine_sim"])
             m_adv = float(np.mean(r_adv))
+            s_adv = float(np.std(r_adv) / np.sqrt(len(r_adv)))
             c_ref = get_color(ref_name, len(methods) + r_idx)
             ls_ref = ":" if "K=2" in ref_name else "-."
-            ax.axhline(m_adv, color=c_ref, ls=ls_ref, lw=1.6, alpha=0.85, label=f"{ref_name} ({m_adv:.4f})")
 
-        # Annotate each point
-        for x_val, y_val, name, c in pts:
+            if x_key in ref_data and (x_key != "x_llm_flops" or has_llm_flops):
+                rx = np.asarray(ref_data[x_key], dtype=np.float64)
+                all_x_vals.extend([float(rx[0]), float(rx[-1])])
+                ax.plot([rx[0], rx[-1]], [m_adv, m_adv], color=c_ref, ls=ls_ref, lw=1.6, alpha=0.8)
+                ax.plot(rx[0], m_adv, marker="D", ms=6.0, mfc="white", mec=c_ref, mew=1.6, zorder=5)
+                ax.errorbar(
+                    rx[-1], m_adv, yerr=s_adv, fmt="D", color=c_ref, ecolor=c_ref,
+                    elinewidth=1.6, capsize=4, ms=8.5, zorder=6,
+                    label=f"{ref_name} ({m_adv:.4f})",
+                )
+                all_pts_to_annotate.append((float(rx[-1]), m_adv, ref_name, c_ref))
+            else:
+                ax.axhline(m_adv, color=c_ref, ls=ls_ref, lw=1.6, alpha=0.85, label=f"{ref_name} ({m_adv:.4f})")
+
+        if all_x_vals:
+            ax.set_xlim(min(all_x_vals) / 2.2, max(all_x_vals) * 2.4)
+
+        # Smart non-overlapping annotation offsets sorted descending by y, keeping high labels above and low labels below
+        sorted_ann = sorted(all_pts_to_annotate, key=lambda t: (-t[1], t[0]))
+        placed_boxes = []
+        y_mid = float(np.median([t[1] for t in sorted_ann])) if sorted_ann else 0.5
+        for x_val, y_val, name, c in sorted_ann:
+            if "Vine MC" in name:
+                candidates = (
+                    [(0, -16, "top", "center"), (-10, -16, "top", "right"), (0, 14, "bottom", "center")]
+                    if "K=2" in name
+                    else [(0, 14, "bottom", "center"), (10, 14, "bottom", "left"), (0, -16, "top", "center")]
+                )
+            elif y_val >= y_mid:
+                candidates = [
+                    (0, 14, "bottom", "center"),
+                    (-14, 12, "bottom", "right"),
+                    (14, 12, "bottom", "left"),
+                    (0, 34, "bottom", "center"),
+                    (0, -16, "top", "center"),
+                    (0, -34, "top", "center"),
+                ]
+            else:
+                candidates = [
+                    (0, -16, "top", "center"),
+                    (-14, -14, "top", "right"),
+                    (14, -14, "top", "left"),
+                    (0, -34, "top", "center"),
+                    (0, 14, "bottom", "center"),
+                    (0, 34, "bottom", "center"),
+                ]
+
+            lx = np.log10(max(1.0, x_val))
+            half_w = max(0.24, 0.018 * len(name))
+            best = candidates[0]
+            for cand in candidates:
+                dx_p, dy_p, va_s, ha_s = cand
+                ha_shift = {"center": 0.0, "left": half_w * 0.8, "right": -half_w * 0.8}[ha_s]
+                va_shift = {"center": 0.0, "bottom": 0.055, "top": -0.055}[va_s]
+                cx = lx + dx_p * 0.01 + ha_shift
+                cy = y_val + dy_p * 0.004 + va_shift
+                collision = any(abs(cx - px) < (half_w + pw) and abs(cy - py) < 0.115 for px, py, pw in placed_boxes)
+                if not collision:
+                    best = cand
+                    break
+            dx_p, dy_p, va_s, ha_s = best
+            ha_shift = {"center": 0.0, "left": half_w * 0.8, "right": -half_w * 0.8}[ha_s]
+            va_shift = {"center": 0.0, "bottom": 0.055, "top": -0.055}[va_s]
+            placed_boxes.append((lx + dx_p * 0.01 + ha_shift, y_val + dy_p * 0.004 + va_shift, half_w))
+
             ax.annotate(
                 f"{name}\n({y_val:.4f})",
                 xy=(x_val, y_val),
-                xytext=(0, 10),
+                xytext=(dx_p, dy_p),
                 textcoords="offset points",
-                ha="center",
-                fontsize=8.5,
-                bbox=dict(boxstyle="round,pad=0.25", facecolor="#ffffff", edgecolor=c, alpha=0.90, lw=1.2),
+                ha=ha_s,
+                va=va_s,
+                fontsize=8.0,
+                arrowprops=dict(arrowstyle="-", color=c, lw=0.7, alpha=0.6) if abs(dy_p) > 20 or abs(dx_p) > 10 else None,
+                bbox=dict(boxstyle="round,pad=0.22", facecolor="#ffffff", edgecolor=c, alpha=0.92, lw=1.1),
+                zorder=7,
             )
 
         if ref_baselines:

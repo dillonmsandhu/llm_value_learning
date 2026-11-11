@@ -434,6 +434,65 @@ def evaluate_vine_mc_baseline(
     }
 
 
+def estimate_vine_mc_ppo_budget(
+    env: Any,
+    num_steps: int,
+    trajectories_per_update: int,
+    k_branches: int,
+    n_batches: int = 8,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Measures the exact per-update rollout transition cost S_vine(K) and LLM inference FLOPs
+    F_vine(K) = 2N * S_vine(K) that critic-free Vine MC PPO pays at every PPO policy update.
+    """
+    is_dag = isinstance(env, ReasoningDAGEnv)
+
+    @jax.jit
+    def _measure_one_batch(rng):
+        rng, reset_rng, fork_rng = jax.random.split(rng, 3)
+        reset_keys = jax.random.split(reset_rng, trajectories_per_update)
+        _, env_state = jax.vmap(env.reset)(reset_keys)
+
+        def _trunk_step(carry, _):
+            st, k = carry
+            k, act_k, step_k = jax.random.split(k, 3)
+            a = jax.vmap(env.sample_base_action)(jax.random.split(act_k, trajectories_per_update), st)
+            _, next_st, _, _, _ = jax.vmap(env.step)(jax.random.split(step_k, trajectories_per_update), st, a)
+            return (next_st, k), st
+
+        _, visited_states = jax.lax.scan(_trunk_step, (env_state, rng), None, length=num_steps)
+        trunk_active_steps = jnp.sum(~visited_states.done).astype(jnp.float32)
+
+        def _count_fork_steps(state, r_key):
+            def _fork_step(carry, _):
+                st, k = carry
+                k, ak, sk = jax.random.split(k, 3)
+                a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), st)
+                _, n_st, _, _, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), st, a)
+                active_f = jnp.sum(~st.done).astype(jnp.float32)
+                return (n_st, k), active_f
+
+            fork_st = _repeat_state(state, k_branches, is_dag)
+            _, f_active_seq = jax.lax.scan(_fork_step, (fork_st, r_key), None, length=num_steps)
+            return jnp.sum(f_active_seq)
+
+        v_keys = jax.random.split(fork_rng, num_steps * trajectories_per_update).reshape(num_steps, trajectories_per_update, 2)
+        fork_active_counts = jax.vmap(jax.vmap(_count_fork_steps))(visited_states, v_keys)
+        total_infer_steps = trunk_active_steps + jnp.sum(fork_active_counts)
+        return trunk_active_steps, total_infer_steps
+
+    batch_keys = jax.random.split(jax.random.PRNGKey(seed + 1337 + k_branches), n_batches)
+    trunks, totals = jax.vmap(_measure_one_batch)(batch_keys)
+    samples_per_update = float(jnp.mean(totals))
+    trunk_per_update = float(jnp.mean(trunks))
+    return {
+        "trunk_samples_per_update": trunk_per_update,
+        "samples_per_update": samples_per_update,
+        "flops_per_update": 2.0 * samples_per_update,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Training Functions for Algorithms
 # -----------------------------------------------------------------------------
@@ -1100,7 +1159,7 @@ def run_benchmark(
 
     # 4. Evaluate Non-Parametric Pure Vine MC Estimator (no network, no gradient) on all eval_set states
     if "next_states_all" in eval_set:
-        vine_ks = sorted({int(a.split("_k")[1]) for a in algos if a.startswith("vine_k")} | {4})
+        vine_ks = sorted({int(a.split("_k")[1]) for a in algos if a.startswith("vine_k")} | {2, 4})
         for k_ref in vine_ks:
             ref_name = f"Vine MC Estimator (K={k_ref})"
             print(f"\n--- Evaluating Non-Parametric Reference: {ref_name} ({n_seeds} seeds) ---", flush=True)
@@ -1112,10 +1171,26 @@ def run_benchmark(
                 seed=master_seed,
                 gamma=1.0,
             )
+            budget = estimate_vine_mc_ppo_budget(
+                env=env,
+                num_steps=num_steps,
+                trajectories_per_update=trajectories_per_update,
+                k_branches=k_ref,
+                n_batches=8,
+                seed=master_seed,
+            )
+            u_grid = np.arange(1, target_num_updates + 1, dtype=np.float64)
+            ref_res["num_updates"] = int(target_num_updates)
+            ref_res["samples_per_update"] = budget["samples_per_update"]
+            ref_res["flops_per_update"] = budget["flops_per_update"]
+            ref_res["x_samples"] = u_grid * budget["samples_per_update"]
+            ref_res["x_llm_flops"] = u_grid * budget["flops_per_update"]
             results["reference_baselines"][ref_name] = ref_res
             print(
                 f"  MSVE: {np.mean(ref_res['msve']):.3e} ± {np.std(ref_res['msve'])/np.sqrt(n_seeds):.1e} | "
-                f"AdvCos: {np.mean(ref_res['advantage_cosine_sim']):.4f} ± {np.std(ref_res['advantage_cosine_sim'])/np.sqrt(n_seeds):.3f}",
+                f"AdvCos: {np.mean(ref_res['advantage_cosine_sim']):.4f} ± {np.std(ref_res['advantage_cosine_sim'])/np.sqrt(n_seeds):.3f} | "
+                f"PPO Cost: {budget['samples_per_update']:,.0f} samples/upd ({ref_res['x_samples'][-1]:,.0f} total), "
+                f"{budget['flops_per_update']:,.0f} N-FLOPs/upd ({ref_res['x_llm_flops'][-1]:,.0f} total)",
                 flush=True,
             )
 
