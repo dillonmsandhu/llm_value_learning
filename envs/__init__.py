@@ -14,6 +14,9 @@ from envs.reasoning_dag_env import (
     DAGEnvParams,
 )
 
+from envs.quality_dag_env import QualityDAGEnv
+from envs.approach_error_dag_env import ApproachErrorDAGEnv
+
 __all__ = [
     "TabularMatrixEnv",
     "TabularParams",
@@ -22,6 +25,8 @@ __all__ = [
     "TreeMRP",
     "ReasoningDAGEnv",
     "ReasoningDAGExactValue",
+    "QualityDAGEnv",
+    "ApproachErrorDAGEnv",
     "DAGState",
     "DAGEnvParams",
 ]

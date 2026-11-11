@@ -7,12 +7,12 @@ from typing import Tuple, Dict, Any, NamedTuple
 
 class DAGState(NamedTuple):
     """
-    Internal Markov state for the procedural reasoning DAG.
-    Note: Network observations ONLY see `history_tokens`, never privileged (milestone, is_derailed).
+    Internal Markov state shared by the binary and multi-level quality DAGs.
+    Note: Network observations ONLY see `history_tokens`, never privileged (milestone, path_quality).
     """
     prompt_idx: jnp.ndarray      # int32 scalar: problem ID in 0 .. num_problems - 1
     milestone: jnp.ndarray       # int32 scalar: milestones completed in 0 .. num_milestones
-    is_derailed: jnp.ndarray     # int32 scalar: 0 = on track, 1 = in error/blunder detour
+    path_quality: jnp.ndarray    # Binary legacy: 0=on track, 1=derailed. Quality DAG: higher=better.
     step_count: jnp.ndarray      # int32 scalar: current step t in 0 .. max_steps
     history_tokens: jnp.ndarray  # int32 array: (max_seq_len,) full sequence of token IDs
     done: jnp.ndarray            # bool scalar: whether trajectory has terminated
@@ -31,7 +31,7 @@ class DAGEnvParams:
 class ReasoningDAGExactValue:
     """
     Exact analytical dynamic programming solver for the Procedural Reasoning DAG.
-    Computes ground-truth value functions V*(prompt_idx, t, milestone, is_derailed)
+    Computes ground-truth value functions V*(prompt_idx, t, milestone, path_quality)
     via backward induction across all problems and depth layers in milliseconds.
     Supports problem-dependent difficulty spectrum theta in [0, 1] governing:
       - required milestones M(theta)
@@ -136,7 +136,7 @@ class ReasoningDAGExactValue:
 
         # 3. Precompute Exact Backward Induction Table:
         # Table shape: (num_problems, max_steps + 1, num_milestones + 1, 2)
-        # where last dim is is_derailed in {0, 1}
+        # where last dim is path_quality in {0, 1}
         self.V_table = self.solve_backward_induction()
 
     def solve_backward_induction(self) -> jnp.ndarray:
@@ -154,7 +154,7 @@ class ReasoningDAGExactValue:
         v_table = jnp.zeros((P, T + 1, M + 1, 2), dtype=jnp.float32)
 
         # Terminal boundary at t = T (horizon cutoff fallback):
-        # Reward is 1.0 iff milestone >= required_milestones[p] and is_derailed == 0
+        # Reward is 1.0 iff milestone >= required_milestones[p] and path_quality == 0
         terminal_rewards = jnp.zeros((P, M + 1, 2), dtype=jnp.float32)
         for p in range(P):
             terminal_rewards = terminal_rewards.at[p, int(self.required_milestones[p]):, 0].set(1.0)
@@ -216,7 +216,7 @@ class ReasoningDAGExactValue:
 
     def get_exact_value(self, state: DAGState) -> jnp.ndarray:
         """Looks up the exact ground-truth value V*(s) for any state (scalar or batched)."""
-        v = self.V_table[state.prompt_idx, state.step_count, state.milestone, state.is_derailed]
+        v = self.V_table[state.prompt_idx, state.step_count, state.milestone, state.path_quality]
         return jnp.where(state.done, 0.0, v)
 
 
@@ -282,7 +282,7 @@ class ReasoningDAGEnv:
         init_state = DAGState(
             prompt_idx=prompt_idx,
             milestone=jnp.array(0, dtype=jnp.int32),
-            is_derailed=jnp.array(0, dtype=jnp.int32),
+            path_quality=jnp.array(0, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
             history_tokens=history,
             done=jnp.array(False, dtype=jnp.bool_),
@@ -347,7 +347,7 @@ class ReasoningDAGEnv:
         act_on_track = jnp.where(m_reached, act_on_track_reached, act_on_track_not_reached)
         act_derailed = jnp.where(m_reached, act_derailed_reached, act_derailed_not_reached)
 
-        action = jnp.where(state.is_derailed == 0, act_on_track, act_derailed)
+        action = jnp.where(state.path_quality == 0, act_on_track, act_derailed)
         return jnp.where(state.done, pick_eos, action)
 
     def step(
@@ -382,14 +382,14 @@ class ReasoningDAGEnv:
         new_milestone_derailed = state.milestone
         new_derailed_derailed = jnp.where(is_correction, 0, 1)
 
-        step_milestone = jnp.where(state.is_derailed == 0, new_milestone_on_track, new_milestone_derailed)
-        step_derailed = jnp.where(state.is_derailed == 0, new_derailed_on_track, new_derailed_derailed)
+        step_milestone = jnp.where(state.path_quality == 0, new_milestone_on_track, new_milestone_derailed)
+        step_derailed = jnp.where(state.path_quality == 0, new_derailed_on_track, new_derailed_derailed)
         step_count = state.step_count + 1
 
         # 2. EOS termination logic:
         # If EOS emitted, episode terminates immediately.
         # Immediate reward is 1.0 iff required milestones reached and currently on-track!
-        eos_success = (state.milestone >= self.required_milestones[state.prompt_idx]) & (state.is_derailed == 0)
+        eos_success = (state.milestone >= self.required_milestones[state.prompt_idx]) & (state.path_quality == 0)
         eos_reward = jnp.where(eos_success, 1.0, 0.0)
 
         # 3. Horizon termination fallback (reached problem horizon without EOS):
@@ -404,7 +404,7 @@ class ReasoningDAGEnv:
 
         # Final state attributes (frozen if previously done):
         final_milestone = jnp.where(state.done, state.milestone, step_milestone)
-        final_derailed = jnp.where(state.done, state.is_derailed, step_derailed)
+        final_derailed = jnp.where(state.done, state.path_quality, step_derailed)
         final_step_count = jnp.where(state.done, state.step_count, step_count)
 
         # Append emitted action token to sequence observation:
@@ -419,7 +419,7 @@ class ReasoningDAGEnv:
         next_state = DAGState(
             prompt_idx=state.prompt_idx,
             milestone=final_milestone,
-            is_derailed=final_derailed,
+            path_quality=final_derailed,
             step_count=final_step_count,
             history_tokens=new_history,
             done=new_done,
@@ -427,7 +427,7 @@ class ReasoningDAGEnv:
 
         info = {
             "milestone": final_milestone,
-            "is_derailed": final_derailed,
+            "path_quality": final_derailed,
             "step": final_step_count,
             "exact_v": self.evaluator.get_exact_value(next_state),
         }
