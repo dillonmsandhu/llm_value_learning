@@ -62,44 +62,12 @@ if [ "$ENV_TYPE" = "single_dag" ]; then
 else
     DEFAULT_UPDATES=100
 fi
-
-if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
-    NUM_UPDATES="$2"
-    if [ -n "${3:-}" ] && ! [[ "${3:-}" =~ ^[0-9]+$ ]]; then
-        SAVE_DIR="$3"
-        OUT_DIR=$(dirname "$SAVE_DIR")
-        N_SEEDS="${4:-${N_SEEDS:-5}}"
-        ALGOS="${5:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
-        MASTER_SEED="${6:-${MASTER_SEED:-42}}"
-    else
-        N_SEEDS="${3:-${N_SEEDS:-5}}"
-        ALGOS="${4:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
-        OUT_DIR="${5:-${OUT_DIR:-results}}"
-        SAVE_DIR="${6:-${SAVE_DIR:-${OUT_DIR}/${ENV_TYPE}_full}}"
-        MASTER_SEED="${7:-${MASTER_SEED:-42}}"
-    fi
-elif [ -n "${2:-}" ]; then
-    SAVE_DIR="$2"
-    OUT_DIR=$(dirname "$SAVE_DIR")
-    if [[ "${3:-}" =~ ^[0-9]+$ ]]; then
-        NUM_UPDATES="$3"
-        N_SEEDS="${4:-${N_SEEDS:-5}}"
-        ALGOS="${5:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
-        MASTER_SEED="${6:-${MASTER_SEED:-42}}"
-    else
-        NUM_UPDATES="$DEFAULT_UPDATES"
-        N_SEEDS="${3:-${N_SEEDS:-5}}"
-        ALGOS="${4:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
-        MASTER_SEED="${5:-${MASTER_SEED:-42}}"
-    fi
-else
-    NUM_UPDATES="$DEFAULT_UPDATES"
-    N_SEEDS="${3:-${N_SEEDS:-5}}"
-    ALGOS="${4:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
-    OUT_DIR="${5:-${OUT_DIR:-results}}"
-    SAVE_DIR="${6:-${SAVE_DIR:-${OUT_DIR}/${ENV_TYPE}_full}}"
-    MASTER_SEED="${7:-${MASTER_SEED:-42}}"
-fi
+NUM_UPDATES="${2:-${NUM_UPDATES:-$DEFAULT_UPDATES}}"
+N_SEEDS="${3:-${N_SEEDS:-5}}"
+ALGOS="${4:-${ALGOS:-mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8}}"
+OUT_DIR="${5:-${OUT_DIR:-results}}"
+SAVE_DIR="${6:-${SAVE_DIR:-${OUT_DIR}/${ENV_TYPE}_full}}"
+MASTER_SEED="${7:-${MASTER_SEED:-42}}"
 
 # Large Reasoning DAG Hyperparameters (leave empty to use smart per-env defaults in run_benchmark.py:
 # e.g. single_dag -> M=8, T=32, difficulty=0.5; dag spectrum -> P=10, M=6, T=24)
