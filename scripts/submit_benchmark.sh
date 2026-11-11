@@ -34,11 +34,49 @@ if [ "$ENV_TYPE" = "single_dag" ]; then
 else
     DEFAULT_UPDATES=100
 fi
-NUM_UPDATES=${2:-$DEFAULT_UPDATES}
-N_SEEDS=${3:-5}
-OUT_DIR=${4:-"results"}
-ALGOS=${5:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
-MASTER_SEED=${6:-42}
+
+# Robust positional argument parsing:
+# Handles:
+#   bash scripts/submit_benchmark.sh dag results/dag_full
+#   bash scripts/submit_benchmark.sh dag 100 results/dag_full
+#   bash scripts/submit_benchmark.sh dag 100 5 results
+if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+    NUM_UPDATES="$2"
+    if [ -n "${3:-}" ] && ! [[ "${3:-}" =~ ^[0-9]+$ ]]; then
+        TARGET_DIR="$3"
+        OUT_DIR=$(dirname "$TARGET_DIR")
+        N_SEEDS=${4:-5}
+        ALGOS=${5:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
+        MASTER_SEED=${6:-42}
+    else
+        N_SEEDS=${3:-5}
+        OUT_DIR=${4:-"results"}
+        ALGOS=${5:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
+        MASTER_SEED=${6:-42}
+        TARGET_DIR="${OUT_DIR}/${ENV_TYPE}_full"
+    fi
+elif [ -n "${2:-}" ]; then
+    TARGET_DIR="$2"
+    OUT_DIR=$(dirname "$TARGET_DIR")
+    if [[ "${3:-}" =~ ^[0-9]+$ ]]; then
+        NUM_UPDATES="$3"
+        N_SEEDS=${4:-5}
+        ALGOS=${5:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
+        MASTER_SEED=${6:-42}
+    else
+        NUM_UPDATES="$DEFAULT_UPDATES"
+        N_SEEDS=${3:-5}
+        ALGOS=${4:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
+        MASTER_SEED=${5:-42}
+    fi
+else
+    NUM_UPDATES="$DEFAULT_UPDATES"
+    N_SEEDS=${3:-5}
+    OUT_DIR=${4:-"results"}
+    ALGOS=${5:-"mc,td_lam0.0,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8,fbi_staged_lam0.0,fbi_staged_lam0.8"}
+    MASTER_SEED=${6:-42}
+    TARGET_DIR="${OUT_DIR}/${ENV_TYPE}_full"
+fi
 
 export ENV_TYPE NUM_UPDATES N_SEEDS OUT_DIR ALGOS MASTER_SEED
 
