@@ -114,6 +114,17 @@ $PYTHON run_benchmark.py \
     ${MAX_STEPS:+--max_steps "$MAX_STEPS"} \
     --num_actions "$NUM_ACTIONS" \
     --difficulty "$DIFFICULTY" \
+    --program_min_ops "${PROGRAM_MIN_OPS:-2}" \
+    --program_max_ops "${PROGRAM_MAX_OPS:-4}" \
+    --program_degree "${PROGRAM_DEGREE:-3}" \
+    --program_max_inputs "${PROGRAM_MAX_INPUTS:-6}" \
+    --program_registers "${PROGRAM_REGISTERS:-10}" \
+    --program_eval_k "${PROGRAM_EVAL_K:-128}" \
+    --program_eval_actions "${PROGRAM_EVAL_ACTIONS:-4}" \
+    --program_eval_prefixes "${PROGRAM_EVAL_PREFIXES:-2}" \
+    --program_coefficient_limit "${PROGRAM_COEFFICIENT_LIMIT:-1024}" \
+    --program_teacher_probability "${PROGRAM_TEACHER_PROBABILITY:-0.75}" \
+    ${PROGRAM_PROBLEM_FILE:+--program_problem_file "$PROGRAM_PROBLEM_FILE"} \
     --depth "$DEPTH" \
     ${P_CORRECT:+--p_correct "$P_CORRECT"} \
     ${PERCENT_CORRECT:+--percent_correct "$PERCENT_CORRECT"} \

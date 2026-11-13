@@ -2,6 +2,7 @@
 from .reasoning_dag_env import ReasoningDAGEnv
 from .quality_dag_env import QualityDAGEnv
 from .approach_error_dag_env import ApproachErrorDAGEnv
+from .program_synthesis import ProgramSynthesisEnv
 
 
 class DAGMDP:
@@ -36,7 +37,7 @@ class DAGMDP:
 
 def make_dag_mdp(env_type="dag_approach", **kwargs):
     classes = {"dag":ReasoningDAGEnv, "dag_quality":QualityDAGEnv,
-               "dag_approach":ApproachErrorDAGEnv}
+               "dag_approach":ApproachErrorDAGEnv,"program":ProgramSynthesisEnv}
     if env_type not in classes:
         raise ValueError(f"Unsupported DAG MDP: {env_type}")
     return DAGMDP(classes[env_type](**kwargs))

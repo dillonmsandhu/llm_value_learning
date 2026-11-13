@@ -67,7 +67,9 @@ def load(root):
                                  trunk_samples=np.cumsum(a['trunk_transitions']),
                                  total_samples=np.cumsum(a['trunk_transitions']+a['aux_transitions'])))
             runs.append(dict(path=str(folder.relative_to(root)),label=describe(cfg),cfg=cfg,data=data,
-                             auc=np.asarray(aucs),final=np.asarray(final),initial=np.asarray(initial)))
+                             auc=np.asarray(aucs),final=np.asarray(final),initial=np.asarray(initial),
+                             heldout=np.asarray([evaluations[s]['final_heldout_success'] for s in sorted(seeds)])
+                             if all('final_heldout_success' in evaluations[s] for s in seeds) else None))
         except (OSError,ValueError,KeyError,TypeError) as exc:
             skipped.append(dict(path=str(folder),reason=str(exc)))
     return runs,skipped
@@ -107,7 +109,10 @@ def main():
     shared=('num_problems','num_milestones','max_steps','num_actions','master_seed','n_seeds',
             'num_updates','num_envs','bc_updates','bc_lr','actor_lr','actor_epochs',
             'clip_eps','entropy_coef','minibatch_size','d_model','n_heads','n_layers','final_hidden_dim',
-            'gamma','actor_lambda','critic_lr','critic_epochs','value_clip','max_grad_norm','eval_episodes')
+            'gamma','actor_lambda','critic_lr','critic_epochs','value_clip','max_grad_norm','eval_episodes',
+            'program_min_ops','program_max_ops','program_degree','program_max_inputs','program_registers',
+            'program_coefficient_limit','program_teacher_probability','program_problem_file',
+            'task_bank_hash','heldout_task_bank_hash')
     mismatches={k:[dict(path=r['path'],value=r['cfg'].get(k)) for r in runs]
                 for k in shared if len({json.dumps(r['cfg'].get(k)) for r in runs})>1}
     (dest/'config_differences.json').write_text(json.dumps(mismatches,indent=2)+'\n')
@@ -124,6 +129,14 @@ def main():
     ax.set_xticks(range(len(runs)),[r['label'] for r in runs],rotation=35,ha='right')
     ax.set(ylabel='Fresh final evaluation return',ylim=(0,1));ax.grid(alpha=.2)
     save(fig,dest,'final_evaluation')
+    if any(r['heldout'] is not None for r in runs):
+        fig,ax=plt.subplots(figsize=(11,6))
+        for i,run in enumerate(runs):
+            if run['heldout'] is not None:
+                ax.errorbar(i,run['heldout'].mean(),yerr=sem(run['heldout']),fmt='o',capsize=4)
+        ax.set_xticks(range(len(runs)),[r['label'] for r in runs],rotation=35,ha='right')
+        ax.set(ylabel='Held-out problem success',ylim=(0,1));ax.grid(alpha=.2)
+        save(fig,dest,'heldout_evaluation')
     fbi=[r for r in runs if r['cfg']['critic_method']=='fbi']
     for grouping,stem in (('critic_lambda','fbi_by_k'),('k','fbi_by_lambda')):
         groups=sorted({r['cfg'][grouping] for r in fbi})
@@ -147,7 +160,9 @@ def main():
                          critic_lambda=c.get('critic_lambda'),n_seeds=len(run['data']),
                          auc_mean=run['auc'].mean(),auc_sem=sem(run['auc']),
                          final_return_mean=run['final'].mean(),final_return_sem=sem(run['final']),
-                         initial_return_mean=run['initial'].mean()))
+                         initial_return_mean=run['initial'].mean(),
+                         heldout_final_return_mean=float(run['heldout'].mean()) if run['heldout'] is not None else '',
+                         heldout_final_return_sem=float(sem(run['heldout'])) if run['heldout'] is not None else ''))
     for row in rows:
         row['auc_rank']=1+sum(q['auc_mean']>row['auc_mean'] for q in rows)
         row['final_return_rank']=1+sum(q['final_return_mean']>row['final_return_mean'] for q in rows)

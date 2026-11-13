@@ -13,8 +13,9 @@ from flax import serialization
 from flax.training.train_state import TrainState
 from transformer import TransformerCritic, TransformerPolicy
 from envs.dag_mdp import make_dag_mdp
-from vine_mc import prefix_values
+from vine_mc import prefix_values, one_step_branches, batched_apply
 from dirichlet_value import bilinear_double_sampled_loss
+from envs.program_tasks import add_program_arguments, program_kwargs
 
 
 class TrunkBatch(NamedTuple):
@@ -27,6 +28,7 @@ class TrunkBatch(NamedTuple):
     value: jax.Array
     next_value: jax.Array
     next_obs: jax.Array
+    invalid_action: jax.Array
 
 
 def masked_mean(x, mask):
@@ -63,7 +65,7 @@ def actor_loss(params, model, obs, action, old_log_prob, advantage, active,
     return loss, aux
 
 
-def make_train(env, config):
+def make_train(env, config, evaluation_env=None):
     """Jittable, vmappable full-episode PPO, following separate critic/actor phases."""
     cfg = dict(num_updates=100, num_envs=64, actor_epochs=4, critic_epochs=4,
                minibatch_size=64, actor_lr=3e-5, critic_lr=5e-4, gamma=1.,
@@ -98,28 +100,28 @@ def make_train(env, config):
     n_mb = (T*B+mb-1)//mb
     padded_size = n_mb*mb
 
-    def collect(actor_params, critic_params, key, reference=False, count=B):
+    def collect(actor_params, critic_params, key, reference=False, count=B, rollout_env=env):
         key, rk = jax.random.split(key)
-        obs, states = jax.vmap(env.reset)(jax.random.split(rk,count))
+        obs, states = jax.vmap(rollout_env.reset)(jax.random.split(rk,count))
         def step(carry,_):
             obs,states,key = carry
             key,ak,sk = jax.random.split(key,3)
             logits = actor.apply(actor_params,obs)
             if reference:
-                action = jax.vmap(env.sample_reference_action)(jax.random.split(ak,count),states)
+                action = jax.vmap(rollout_env.sample_reference_action)(jax.random.split(ak,count),states)
             else:
                 action = jax.random.categorical(ak,logits).astype(jnp.int32)
             active = ~states.done
             value = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,obs)
-            no,ns,r,d,_ = jax.vmap(env.step)(jax.random.split(sk,count),states,action)
+            no,ns,r,d,info = jax.vmap(rollout_env.step)(jax.random.split(sk,count),states,action)
             nv = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,no)
-            batch = TrunkBatch(obs,action,r,d,active,action_log_prob(logits,action),value,nv,no)
+            batch = TrunkBatch(obs,action,r,d,active,action_log_prob(logits,action),value,nv,no,info.get("invalid_action",jnp.zeros(count,bool)))
             return (no,ns,key),(batch,states)
         _,(batch,states) = jax.lax.scan(step,(obs,states,key),None,length=T)
         return jax.tree_util.tree_map(jax.lax.stop_gradient,(batch,states))
 
-    def evaluate(ap,cp,key):
-        batch,_ = collect(ap,cp,key,count=cfg["eval_episodes"])
+    def evaluate(ap,cp,key,rollout_env=env):
+        batch,_ = collect(ap,cp,key,count=cfg["eval_episodes"],rollout_env=rollout_env)
         return batch.reward.sum()/cfg["eval_episodes"]
 
     def critic_targets(batch, states, ap, cp, key):
@@ -137,49 +139,29 @@ def make_train(env, config):
         if method in ("mc","td") or (method=="fbi" and cfg["include_trunk"] and K==1):
             lam = 1. if method == "mc" else cfg["critic_lambda"]
             return lambda_returns(batch.reward,batch.done,batch.value,batch.next_value,batch.active,cfg["gamma"],lam)[1],jnp.array(0.)
-        fresh = K-int(cfg["include_trunk"]) if method=="fbi" else K
-        flat_states = jax.tree_util.tree_map(lambda x:x.reshape((-1,)+x.shape[2:]),states)
-        fork_states = jax.tree_util.tree_map(lambda x:jnp.repeat(x,fresh,axis=0),flat_states)
-        fork_obs = fork_states.history_tokens
-        n_forks = T*B*fresh
-        def fork_step(carry,_):
-            st,obs,ret,discount,steps,key = carry
-            key,ak,sk = jax.random.split(key,3)
-            action = jax.random.categorical(ak,actor.apply(ap,obs)).astype(jnp.int32)
-            active = ~st.done
-            no,ns,r,d,_ = jax.vmap(env.step)(jax.random.split(sk,n_forks),st,action)
-            ret += discount*r
-            discount *= cfg["gamma"]*(1-d)
-            return (ns,no,ret,discount,steps+active.sum(),key),None
-        length = 1 if method=="fbi" else T
-        (ns,no,ret,discount,steps,_),_ = jax.lax.scan(
-            fork_step,(fork_states,fork_obs,jnp.zeros(n_forks),jnp.ones(n_forks),jnp.array(0),key),None,length=length)
-        if method=="fbi": ret += discount*critic.apply(cp,no)
-        branch = ret.reshape(T,B,fresh)
-        if method=="vine":
-            target = branch.mean(-1)
-        else:
-            if cfg["include_trunk"]:
-                trunk_backup = batch.reward+cfg["gamma"]*(1-batch.done)*batch.next_value
-                branch = jnp.concatenate([trunk_backup[...,None],branch],axis=-1)
-            mean = branch.mean(-1)
-            # Branched residual traces are critic targets, never action advantages.
-            residual = mean-batch.value
-            def backward(next_adv,data):
-                delta,done,active = data
-                adv = jnp.where(active,delta+cfg["gamma"]*cfg["critic_lambda"]*(1-done)*next_adv,0.)
-                return adv,adv
-            _,adv = jax.lax.scan(backward,jnp.zeros(B),(residual,batch.done,batch.active),reverse=True)
-            target = batch.value+adv
+        if method == "vine":
+            return prefix_values(env,actor,ap,states,key,K,cfg["vine_batch_size"],cfg["gamma"])
+        fresh = K-int(cfg["include_trunk"])
+        no,reward,done = one_step_branches(env,actor,ap,states,key,fresh,cfg["vine_batch_size"])
+        nv = batched_apply(critic,cp,no.reshape((-1,no.shape[-1])),cfg["vine_batch_size"]).reshape(T,B,fresh)
+        branch = reward+cfg["gamma"]*(1-done)*nv
+        steps = batch.active.sum()*fresh
+        if cfg["include_trunk"]:
+            trunk_backup = batch.reward+cfg["gamma"]*(1-batch.done)*batch.next_value
+            branch = jnp.concatenate([trunk_backup[...,None],branch],axis=-1)
+        mean = branch.mean(-1)
+        residual = mean-batch.value
+        def backward(next_adv,data):
+            delta,done,active = data
+            adv = jnp.where(active,delta+cfg["gamma"]*cfg["critic_lambda"]*(1-done)*next_adv,0.)
+            return adv,adv
+        _,adv = jax.lax.scan(backward,jnp.zeros(B),(residual,batch.done,batch.active),reverse=True)
+        target = batch.value+adv
         return jax.lax.stop_gradient(target),steps.astype(float)
 
     def sample_probe(ap, states, key):
-        # Sampling is under the frozen actor, independently of the trunk suffix.
-        flat = jax.tree_util.tree_map(lambda x:x.reshape((-1,)+x.shape[2:]),states)
-        ak,sk = jax.random.split(key)
-        action = jax.random.categorical(ak,actor.apply(ap,flat.history_tokens)).astype(jnp.int32)
-        no,_,reward,done,_ = jax.vmap(env.step)(jax.random.split(sk,T*B),flat,action)
-        return jax.tree_util.tree_map(jax.lax.stop_gradient,(no,reward,done))
+        obs,reward,done = one_step_branches(env,actor,ap,states,key,1,cfg["vine_batch_size"])
+        return obs.reshape(T*B,-1),reward.reshape(-1),done.reshape(-1)
 
     def flatten(x): return x.reshape((-1,)+x.shape[2:])
 
@@ -223,6 +205,10 @@ def make_train(env, config):
         initial_actor_params = actor_state.params
         key,ek = jax.random.split(key)
         initial_success = evaluate(actor_state.params,critic_state.params,ek)
+
+        if evaluation_env is not None:
+            initial_heldout_success = evaluate(actor_state.params,critic_state.params,
+                                              jax.random.fold_in(ek,334),evaluation_env)
 
         def update(carry,idx):
             ac,cr,key = carry
@@ -280,20 +266,26 @@ def make_train(env, config):
             metrics = dict(**cmetrics,**ametrics,success_rate=batch.reward.sum()/B,
                            trunk_transitions=batch.active.sum(),aux_transitions=aux_steps,
                            actor_data_transitions=batch.active.sum(),
+                           invalid_action_fraction=masked_mean(batch.invalid_action.astype(float),batch.active),
                            critic_target_mean=masked_mean(target,batch.active),
                            raw_advantage_mean=mean)
             return (ac,cr,key),metrics
         (actor_state,critic_state,key),metrics = jax.lax.scan(update,(actor_state,critic_state,key),jnp.arange(cfg["num_updates"]))
         final_success = evaluate(actor_state.params,critic_state.params,jax.random.fold_in(key,777))
-        return dict(metrics=metrics,initial_success=initial_success,final_success=final_success,
-                    initial_actor_params=initial_actor_params,actor_params=actor_state.params,
-                    critic_params=critic_state.params)
+        result = dict(metrics=metrics,initial_success=initial_success,final_success=final_success,
+                      initial_actor_params=initial_actor_params,actor_params=actor_state.params,
+                      critic_params=critic_state.params)
+        if evaluation_env is not None:
+            result.update(initial_heldout_success=initial_heldout_success,
+                          final_heldout_success=evaluate(actor_state.params,critic_state.params,
+                                                        jax.random.fold_in(key,778),evaluation_env))
+        return result
     return train
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--env_type",choices=("dag","dag_quality","dag_approach"),default="dag_approach")
+    p.add_argument("--env_type",choices=("dag","dag_quality","dag_approach","program"),default="dag_approach")
     p.add_argument("--num_problems",type=int,default=20)
     p.add_argument("--num_milestones",type=int,default=12)
     p.add_argument("--max_steps",type=int,default=40)
@@ -320,29 +312,43 @@ def main():
     p.add_argument("--quality_jump",type=int,default=1)
     p.add_argument("--absorbing_dead",action="store_true")
     p.add_argument("--save_dir",default="results/dag_ppo")
+    add_program_arguments(p)
     args = p.parse_args()
     if args.n_seeds < 1: p.error("n_seeds must be positive")
     env_keys = {"dag": (), "dag_quality": ("quality_levels", "quality_change_rate", "quality_up_bias", "quality_jump", "absorbing_dead"),
-                "dag_approach": ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight")}[args.env_type]
+                "dag_approach": ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"), "program": ()}[args.env_type]
     env_kwargs = {k:getattr(args,k) for k in env_keys}
+    if args.env_type == "program": env_kwargs.update(program_kwargs(args))
     env = make_dag_mdp(args.env_type,num_problems=args.num_problems,num_milestones=args.num_milestones,
                        max_steps=args.max_steps,num_actions=args.num_actions,seed=args.master_seed,
                        variable_depth=args.num_problems>1,**env_kwargs)
+    evaluation_env = None
+    if args.env_type == "program":
+        args.num_actions = env.num_actions
+        evaluation_env = make_dag_mdp('program',num_problems=args.num_problems,max_steps=args.max_steps,
+                                      seed=args.master_seed,split='test',**env_kwargs)
     if args.critic_method == "vine_mc": args.actor_lambda = 0.
     if args.critic_method == "e_min": args.k = 2
     config = vars(args).copy();config["include_trunk"] = not args.fresh_branches
+    if args.env_type == 'program':
+        config['task_bank_hash'] = env.base_env.config['task_bank_hash']
+        config['heldout_task_bank_hash'] = evaluation_env.base_env.config['task_bank_hash']
     if args.critic_method == "e_min":
         config["critic_estimator"] = "bilinear_double_sampled_trunk_probe_v1"
         config["critic_objective"] = "0.5 * <V-v, (I-gamma*P)(V-v)>_D"
         config["critic_loss_is_surrogate"] = True
         config["critic_value_clipping_applied"] = False
-    train = jax.jit(make_train(env,config))
+    train = jax.jit(make_train(env,config,evaluation_env))
     outdir = Path(args.save_dir);outdir.mkdir(parents=True,exist_ok=True)
     with (outdir/"config.json").open("w") as f:json.dump(config,f,indent=2)
     with (outdir/"environment.json").open("w") as f:
         json.dump(dict(version="dag_mdp_v1",family=args.env_type,
                        base_environment=getattr(env.base_env,"config",{}),
                        exact_base_values_used=False,actor_observation="history_tokens_only"),f,indent=2)
+    if args.env_type == "program":
+        env.base_env.export_tasks(outdir/'tasks_train.jsonl')
+        evaluation_env.base_env.export_tasks(outdir/'tasks_heldout.jsonl')
+        (outdir/'heldout_environment.json').write_text(json.dumps(evaluation_env.base_env.config,indent=2)+'\n')
     summaries, all_metrics = [],[]
     for seed in range(args.n_seeds):
         print(f"PPO seed {seed+1}/{args.n_seeds}: {args.env_type}, critic={args.critic_method}",flush=True)
@@ -355,6 +361,9 @@ def main():
         for name in (("actor_params",) if args.critic_method == "vine_mc" else ("actor_params","critic_params")):
             (outdir/f"{name}_seed{seed}.msgpack").write_bytes(serialization.to_bytes(result[name]))
         summaries.append(dict(seed=seed,initial_success=float(result["initial_success"]),final_success=float(result["final_success"])))
+        if evaluation_env is not None:
+            summaries[-1].update(initial_heldout_success=float(result['initial_heldout_success']),
+                                 final_heldout_success=float(result['final_heldout_success']))
         print(summaries[-1],flush=True)
     with (outdir/"summary.json").open("w") as f:json.dump(summaries,f,indent=2)
     import matplotlib.pyplot as plt

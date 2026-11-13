@@ -33,6 +33,12 @@ Examples:
     bash scripts/submit_ppo_comparison.sh dag_quality
   DRY_RUN=1 bash scripts/submit_ppo_comparison.sh
 
+For program tasks, NUM_ACTIONS is derived automatically from register capacity.
+Program controls: PROGRAM_MIN_OPS (2), PROGRAM_MAX_OPS (4), PROGRAM_DEGREE (3),
+PROGRAM_MAX_INPUTS (6), PROGRAM_REGISTERS (10), PROGRAM_COEFFICIENT_LIMIT (1024),
+PROGRAM_TEACHER_PROBABILITY (.75), PROGRAM_PROBLEM_FILE (optional JSONL),
+VINE_BATCH_SIZE (128). Program runs also report held-out problem success.
+
 Activate the cluster JAX environment first, or set PYTHON_BIN.
 Results go into OUTPUT_BASE/{vine_k2,vine_k4,mc,td_lam08,fbi_lam08_k2,e_min}/.
 HELP
@@ -46,8 +52,8 @@ cd "$(dirname "$0")/.."
 COMPARE_ENV=${1:-dag_approach}
 COMPARE_OUT=${2:-results/ppo_comparison/${COMPARE_ENV}}
 case "$COMPARE_ENV" in
-    dag|dag_quality|dag_approach) ;;
-    *) echo "DAG_TYPE must be dag, dag_quality, or dag_approach" >&2; exit 2 ;;
+    dag|dag_quality|dag_approach|program) ;;
+    *) echo "DAG_TYPE must be dag, dag_quality, dag_approach, or program" >&2; exit 2 ;;
 esac
 
 # Keep every setting in one shared array: no per-estimator PPO overrides.
@@ -73,10 +79,20 @@ COMMON_ARGS=(
     --n_heads "${N_HEADS:-4}"
     --n_layers "${N_LAYERS:-2}"
     --final_hidden_dim "${FINAL_HIDDEN_DIM:-32}"
+    --program_min_ops "${PROGRAM_MIN_OPS:-2}"
+    --program_max_ops "${PROGRAM_MAX_OPS:-4}"
+    --program_degree "${PROGRAM_DEGREE:-3}"
+    --program_max_inputs "${PROGRAM_MAX_INPUTS:-6}"
+    --program_registers "${PROGRAM_REGISTERS:-10}"
+    --program_coefficient_limit "${PROGRAM_COEFFICIENT_LIMIT:-1024}"
+    --program_teacher_probability "${PROGRAM_TEACHER_PROBABILITY:-0.75}"
+    --vine_batch_size "${VINE_BATCH_SIZE:-128}"
     --actor_lambda 1.0 --critic_lambda 0.8
     --gamma 1.0 --clip_eps "${CLIP_EPS:-0.2}" --value_clip 0.2
     --entropy_coef "${ENTROPY_COEF:-0}" --max_grad_norm 1.0
 )
+
+if [[ -n "${PROGRAM_PROBLEM_FILE:-}" ]]; then COMMON_ARGS+=(--program_problem_file "$PROGRAM_PROBLEM_FILE"); fi
 
 for variant in vine_k2 vine_k4 mc td fbi e_min; do
     k=2

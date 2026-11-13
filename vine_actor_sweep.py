@@ -43,6 +43,13 @@ def plan(args):
     if any(x <= 0 for k in ('actor_lr','clip_eps','actor_epochs') for x in grid[k]):
         raise SystemExit('Learning rates, clipping and epochs must be positive')
     if any(x < 0 for x in grid['entropy_coef']): raise SystemExit('Entropy must be nonnegative')
+    if args.env == 'program':
+        # Do not import envs here: planning must stay standard-library only.
+        for name,default in dict(program_min_ops=2,program_max_ops=4,program_degree=3,
+                                  program_max_inputs=6,program_registers=10,program_coefficient_limit=1024,
+                                  program_teacher_probability=.75).items():
+            common[name]=type(default)(os.environ.get(name.upper(),default))
+        if os.environ.get('PROGRAM_PROBLEM_FILE'):common['program_problem_file']=os.environ['PROGRAM_PROBLEM_FILE']
     common.update(env_type=args.env, critic_method=args.method, gamma=1.)
     if args.method == 'mc':
         # Full trunk MC returns train the critic; GAE(1) = return - old V.
@@ -92,6 +99,7 @@ def collect(args):
         try:
             config = json.loads((directory/'config.json').read_text())
             expected = dict(common, **setting['parameters'])
+            if common['env_type']=='program':expected.pop('num_actions',None)
             if any(config.get(k) != v for k,v in expected.items()): raise ValueError('configuration mismatch')
             summary = json.loads((directory/'summary.json').read_text())
             if sorted(s['seed'] for s in summary) != list(range(n)): raise ValueError('incomplete evaluation seeds')
@@ -171,7 +179,7 @@ def collect(args):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='mode',required=True)
-    p=sub.add_parser('plan');p.add_argument('--env',choices=['dag','dag_quality','dag_approach'],default='dag_approach')
+    p=sub.add_parser('plan');p.add_argument('--env',choices=['dag','dag_quality','dag_approach','program'],default='dag_approach')
     p.add_argument('--method',choices=['vine_mc','mc'],default='vine_mc')
     p.add_argument('--output',required=True);p.set_defaults(func=plan)
     p=sub.add_parser('run');p.add_argument('--output',required=True);p.add_argument('--index',type=int);p.set_defaults(func=run)

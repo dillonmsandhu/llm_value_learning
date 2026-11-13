@@ -7,7 +7,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Usage: bash scripts/submit_k_sweep.sh [DAG_TYPE] [UPDATES] [SEEDS] [LAMBDA] [OUT_DIR] [MASTER_SEED]
 
 Defaults: dag_approach, 100 updates, 8 seeds, lambda=0.8, results/k_sweep_lam0.8, master seed 42.
-DAG_TYPE: dag (binary), dag_quality, or dag_approach.
+DAG_TYPE: dag (binary), dag_quality, dag_approach, or program.
 
 Compares TD(lambda) with FBI(lambda), K=1,2,4,8, for both trunk-included
 and fresh-branch estimators. Submits one GPU job and its dependent plotting job.
@@ -34,8 +34,8 @@ SWEEP_OUT=${5:-results/k_sweep_lam${SWEEP_LAMBDA}}
 SWEEP_MASTER_SEED=${6:-42}
 
 case "$SWEEP_ENV" in
-    dag|dag_quality|dag_approach) ;;
-    *) echo "DAG_TYPE must be dag, dag_quality, or dag_approach" >&2; exit 2 ;;
+    dag|dag_quality|dag_approach|program) ;;
+    *) echo "DAG_TYPE must be dag, dag_quality, dag_approach, or program" >&2; exit 2 ;;
 esac
 if [[ ! "$SWEEP_LAMBDA" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]]; then
     echo "LAMBDA must be between 0 and 1 (for example, 0.8)" >&2

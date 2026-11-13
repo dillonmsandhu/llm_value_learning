@@ -17,6 +17,7 @@ from envs.reasoning_dag_env import (
 from envs.quality_dag_env import QualityDAGEnv
 from envs.approach_error_dag_env import ApproachErrorDAGEnv
 from envs.dag_mdp import DAGMDP, make_dag_mdp
+from envs.program_synthesis import ProgramSynthesisEnv, ProgramState
 
 __all__ = [
     "TabularMatrixEnv",
@@ -28,6 +29,8 @@ __all__ = [
     "ReasoningDAGExactValue",
     "QualityDAGEnv",
     "ApproachErrorDAGEnv",
+    "ProgramSynthesisEnv",
+    "ProgramState",
     "DAGMDP",
     "make_dag_mdp",
     "DAGState",

@@ -2,7 +2,7 @@
 # Submit PPO on the cluster. Remaining arguments are passed directly to Python.
 set -euo pipefail
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    echo 'Usage: bash scripts/submit_dag_ppo.sh [dag|dag_quality|dag_approach] [td|mc|fbi|vine|vine_mc|e_min] [additional train_dag_ppo.py arguments...]'
+    echo 'Usage: bash scripts/submit_dag_ppo.sh [dag|dag_quality|dag_approach|program] [td|mc|fbi|vine|vine_mc|e_min] [additional train_dag_ppo.py arguments...]'
     echo 'Example: bash scripts/submit_dag_ppo.sh dag_approach fbi --k 4 --bc_updates 100 --save_dir results/ppo_fbi4'
     exit 0
 fi
@@ -11,7 +11,7 @@ PPO_ENV=${1:-dag_approach}
 PPO_CRITIC=${2:-td}
 if [[ $# -gt 0 ]]; then shift; fi
 if [[ $# -gt 0 ]]; then shift; fi
-case "$PPO_ENV" in dag|dag_quality|dag_approach) ;; *) echo 'Invalid DAG type' >&2; exit 2 ;; esac
+case "$PPO_ENV" in dag|dag_quality|dag_approach|program) ;; *) echo 'Invalid DAG type' >&2; exit 2 ;; esac
 case "$PPO_CRITIC" in td|mc|fbi|vine|vine_mc|e_min) ;; *) echo 'Invalid critic method' >&2; exit 2 ;; esac
 mkdir -p slurm
 # %q preserves each argument when SLURM runs the wrapped shell command.

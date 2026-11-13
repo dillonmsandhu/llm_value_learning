@@ -1034,6 +1034,13 @@ def main():
     with open(args.data_path, "rb") as f:
         results = pickle.load(f)
 
+    if not results.get('evaluation_reference_is_exact',True):
+        from program_evaluation import plot_program_critic_results
+        if args.methods:
+            results=filter_methods(results,include_methods=[m.strip() for m in args.methods.split(',')],exclude_compute_matched=not args.include_compute_matched)
+        plot_program_critic_results(results,save_dir,prefix=args.prefix)
+        return
+
     include_list = [m.strip() for m in args.methods.split(",") if m.strip()] if args.methods else None
     results = filter_methods(results, include_methods=include_list, exclude_compute_matched=not args.include_compute_matched)
 

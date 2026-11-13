@@ -20,6 +20,9 @@ from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
 from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTreeEnv, ProceduralTreeExactValue, TreeState
 from envs.quality_dag_env import QualityDAGEnv
 from envs.approach_error_dag_env import ApproachErrorDAGEnv
+from envs.program_synthesis import ProgramSynthesisEnv
+from envs.program_tasks import add_program_arguments, program_kwargs, PROGRAM_DEFAULTS, PROGRAM_EVAL_DEFAULTS
+from vine_mc import batched_apply
 import plot_results
 
 
@@ -277,7 +280,8 @@ def evaluate_dag_metrics(network: TransformerCritic, params: Any, eval_set: Dict
     P = eval_set.get("num_problems", 1)
 
     # Single unified forward pass for both current and next state observations
-    all_v = network.apply(params, all_eval_tokens, method=network.value)
+    all_v = (batched_apply(network,params,all_eval_tokens,128) if not eval_set.get('reference_is_exact',True)
+             else network.apply(params, all_eval_tokens, method=network.value))
     v_pred = all_v[:N]
     v_next_pred = all_v[N:].reshape(num_actions, N)
 
@@ -344,23 +348,8 @@ def evaluate_tree_metrics(network: TransformerCritic, params: Any, eval_set: Dic
 
 
 def _repeat_state(state: Any, k_branches: int, is_dag: bool) -> Any:
-    """Replicates a scalar DAGState or TreeState k_branches times along axis 0."""
-    if is_dag:
-        return DAGState(
-            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-            milestone=jnp.repeat(state.milestone, k_branches),
-            path_quality=jnp.repeat(state.path_quality, k_branches),
-            step_count=jnp.repeat(state.step_count, k_branches),
-            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-            done=jnp.repeat(state.done, k_branches),
-        )
-    return TreeState(
-        prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-        node_idx=jnp.repeat(state.node_idx, k_branches),
-        depth_count=jnp.repeat(state.depth_count, k_branches),
-        history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-        done=jnp.repeat(state.done, k_branches),
-    )
+    """Replicates any functional scalar environment state along a new branch axis."""
+    return jax.tree_util.tree_map(lambda x:jnp.repeat(x[None,...],k_branches,axis=0),state)
 
 
 def evaluate_vine_mc_baseline(
@@ -673,7 +662,7 @@ def make_train_loop(
                 flat_trunk_obs = traj_batch.obs.reshape(n_trunk, -1)
                 all_td_obs = jnp.concatenate([flat_trunk_obs, last_obs], axis=0)
                 all_td_v = jax.lax.stop_gradient(
-                    network.apply(train_state.params, all_td_obs, method=network.value)
+                    batched_apply(network,train_state.params,all_td_obs,128)
                 )
                 v_base = all_td_v[:n_trunk].reshape(num_steps, num_envs)
                 v_last = all_td_v[n_trunk:]
@@ -728,23 +717,7 @@ def make_train_loop(
 
                 def _sample_branch_1step(state, r_key):
                     ak, sk = jax.random.split(r_key)
-                    if is_dag:
-                        fork_st = DAGState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, n_fresh),
-                            milestone=jnp.repeat(state.milestone, n_fresh),
-                            path_quality=jnp.repeat(state.path_quality, n_fresh),
-                            step_count=jnp.repeat(state.step_count, n_fresh),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], n_fresh, axis=0),
-                            done=jnp.repeat(state.done, n_fresh),
-                        )
-                    else:
-                        fork_st = TreeState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, n_fresh),
-                            node_idx=jnp.repeat(state.node_idx, n_fresh),
-                            depth_count=jnp.repeat(state.depth_count, n_fresh),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], n_fresh, axis=0),
-                            done=jnp.repeat(state.done, n_fresh),
-                        )
+                    fork_st = _repeat_state(state, n_fresh, is_dag)
                     a = jax.vmap(env.sample_base_action)(jax.random.split(ak, n_fresh), fork_st)
                     next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, n_fresh), fork_st, a)
                     return next_o, r, d
@@ -756,11 +729,11 @@ def make_train_loop(
                 # 2. Single fused forward pass over all T * B trunk observations + T * B * K branch observations
                 n_trunk = num_steps * num_envs
                 flat_trunk_obs = traj_batch.obs.reshape(n_trunk, -1)
-                flat_b_next_obs = b_next_obs.reshape(n_trunk * n_fresh, -1)
+                flat_b_next_obs = b_next_obs.reshape(n_trunk * n_fresh, env.max_seq_len)
                 all_fbi_obs = jnp.concatenate([flat_trunk_obs, flat_b_next_obs, last_obs], axis=0)
 
                 all_fbi_v = jax.lax.stop_gradient(
-                    network.apply(train_state.params, all_fbi_obs, method=network.value)
+                    batched_apply(network,train_state.params,all_fbi_obs,128)
                 )
                 v_base = all_fbi_v[:n_trunk].reshape(num_steps, num_envs)
                 v_next = all_fbi_v[n_trunk:n_trunk * (1 + n_fresh)].reshape(num_steps, num_envs, n_fresh)
@@ -793,23 +766,7 @@ def make_train_loop(
                 # 1. Sample K 1-step branches from all visited states in parallel
                 def _sample_branch_env_step(state, r_key):
                     ak, sk = jax.random.split(r_key)
-                    if is_dag:
-                        fork_st = DAGState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            milestone=jnp.repeat(state.milestone, k_branches),
-                            path_quality=jnp.repeat(state.path_quality, k_branches),
-                            step_count=jnp.repeat(state.step_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
-                        )
-                    else:
-                        fork_st = TreeState(
-                            prompt_idx=jnp.repeat(state.prompt_idx, k_branches),
-                            node_idx=jnp.repeat(state.node_idx, k_branches),
-                            depth_count=jnp.repeat(state.depth_count, k_branches),
-                            history_tokens=jnp.repeat(state.history_tokens[None, :], k_branches, axis=0),
-                            done=jnp.repeat(state.done, k_branches),
-                        )
+                    fork_st = _repeat_state(state, k_branches, is_dag)
                     a = jax.vmap(env.sample_base_action)(jax.random.split(ak, k_branches), fork_st)
                     next_o, _, r, d, _ = jax.vmap(env.step)(jax.random.split(sk, k_branches), fork_st, a)
                     return next_o, r, d
@@ -1040,7 +997,18 @@ def run_benchmark(
 
     # 1. Initialize Environment & Precompute Exact Evaluator
     is_dag_family = (env_type in ("dag", "single_dag", "dag_spectrum", "dag_quality", "dag_approach"))
-    if is_dag_family:
+    if env_type == "program":
+        from program_evaluation import build_program_eval_set
+        parameters = dict(dag_params or {})
+        program_parameters = {k:v for k,v in parameters.items() if k in PROGRAM_DEFAULTS}
+        env = ProgramSynthesisEnv(num_problems=parameters.get('num_problems',20),
+                                   max_steps=parameters.get('max_steps',24),seed=master_seed,**program_parameters)
+        env_title = 'Integer-polynomial program synthesis (MC evaluation references)'
+        eval_set = build_program_eval_set(env,samples_per_problem=parameters.get('program_eval_prefixes',2),
+                                           reference_k=parameters.get('program_eval_k',128),
+                                           action_samples=parameters.get('program_eval_actions',4))
+        num_steps = env.max_steps
+    elif is_dag_family:
         if env_type == "single_dag":
             dag_params = dag_params or {"num_problems": 1, "num_milestones": 8, "max_steps": 32, "num_actions": 8, "difficulty": 0.5}
             diff_val = dag_params.get("difficulty", 0.5)
@@ -1147,7 +1115,12 @@ def run_benchmark(
         "evaluation_latent_code": np.asarray(eval_set["eval_state"].path_quality) if env_type == "dag_approach" else None,
         "evaluation_path_quality": np.asarray(eval_set["eval_state"].path_quality) if is_dag_family and env_type != "dag_approach" else None,
         "evaluation_remaining_horizon": np.asarray(env.problem_max_steps[eval_set["eval_state"].prompt_idx] - eval_set["eval_state"].step_count) if is_dag_family else None,
-        "eval_true_values": np.asarray(eval_set["exact_v"]),
+        "eval_true_values": np.asarray(eval_set["exact_v"]),  # Legacy key; read evaluation_reference_is_exact.
+        "evaluation_reference_is_exact": eval_set.get('reference_is_exact',True),
+        "evaluation_reference_description": eval_set.get('reference_description','Exact fixed-policy dynamic programming'),
+        "evaluation_reference_standard_errors": np.asarray(eval_set.get('reference_standard_errors',[])),
+        "evaluation_reference_k": eval_set.get('reference_k'),
+        "evaluation_actions": np.asarray(eval_set.get('evaluation_actions',[])),
         "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
         "base_total_grad_steps": base_total_grad_steps,
         "flop_assumptions": flop_assumptions,
@@ -1290,7 +1263,7 @@ def run_benchmark(
             )
 
     # 4. Evaluate Non-Parametric Pure Vine MC Estimator (no network, no gradient) on all eval_set states
-    if "next_states_all" in eval_set:
+    if "next_states_all" in eval_set and env_type != "program":
         vine_ks = [2]
         for k_ref in vine_ks:
             ref_name = f"Vine MC Estimator (K={k_ref})"
@@ -1327,6 +1300,9 @@ def run_benchmark(
                 flush=True,
             )
 
+    if env_type == "program":
+        env.export_tasks(os.path.join(save_dir,'tasks_train.jsonl'))
+
     # 5. Save Benchmark Data
     pkl_path = os.path.join(save_dir, "benchmark_results.pkl")
     with open(pkl_path, "wb") as f:
@@ -1336,6 +1312,11 @@ def run_benchmark(
     with open(os.path.join(save_dir, "environment.json"), "w") as f:
         json.dump({"config": results["environment_config"], "diagnostics": results["environment_diagnostics"]}, f, indent=2)
     plot_results.plot_quality_breakdown(results, save_dir)
+
+    if env_type == "program":
+        from program_evaluation import plot_program_critic_results
+        plot_program_critic_results(results,save_dir)
+        return results
 
     # 6. Generate Publication Figures & AUC Summary
     plot_results.plot_comparison_curves(results, save_dir, prefix="benchmark")
@@ -1349,7 +1330,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
-    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "dag_quality", "dag_approach", "single_tree", "tree"], help="Environment family, including dag_quality and dag_approach")
+    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "dag_quality", "dag_approach", "program", "single_tree", "tree"], help="Environment family, including dag_quality and dag_approach")
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
@@ -1400,6 +1381,7 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm clipping (default: 1.0)")
     parser.add_argument("--minibatch_size", type=int, default=64, help="Minibatch size for gradient steps (default: 64)")
 
+    add_program_arguments(parser)
     args = parser.parse_args()
 
     if args.save_dir:
@@ -1413,7 +1395,7 @@ def main():
 
     # Set smart defaults based on env_type
     is_single = args.env_type in ("single_dag", "single_tree")
-    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum", "dag_quality", "dag_approach")
+    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum", "dag_quality", "dag_approach", "program")
     num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else (20 if is_dag_cli else 10))
     num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 12)
     max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 40)
@@ -1429,6 +1411,9 @@ def main():
         dag_params[key] = getattr(args, key)
     for key in ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"):
         dag_params[key] = getattr(args, key)
+    if args.env_type == "program":
+        dag_params.update(program_kwargs(args))
+        dag_params.update({k:getattr(args,k) for k in PROGRAM_EVAL_DEFAULTS})
     tree_params = {
         "num_problems": num_prob,
         "depth": args.depth,

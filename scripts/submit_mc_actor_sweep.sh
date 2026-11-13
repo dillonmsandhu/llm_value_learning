@@ -3,7 +3,7 @@
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     cat <<'HELP'
-Usage: bash scripts/submit_mc_actor_sweep.sh [dag|dag_quality|dag_approach] [OUTPUT]
+Usage: bash scripts/submit_mc_actor_sweep.sh [dag|dag_quality|dag_approach|program] [OUTPUT]
 Default: dag_approach; timestamped results/mc_actor_sweep/... directory.
 
 Runs the existing MC PPO method: critic targets are full trunk Monte Carlo
