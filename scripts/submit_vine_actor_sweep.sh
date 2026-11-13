@@ -24,11 +24,17 @@ HELP
 fi
 if [[ $# -gt 2 ]]; then echo 'Too many arguments; see --help' >&2; exit 2; fi
 cd "$(dirname "$0")/.."
+SWEEP_METHOD=${PPO_SWEEP_METHOD:-vine_mc}
+case "$SWEEP_METHOD" in
+    vine_mc) SWEEP_NAME=vine_actor ;;
+    mc) SWEEP_NAME=mc_actor ;;
+    *) echo 'PPO_SWEEP_METHOD must be vine_mc or mc' >&2; exit 2 ;;
+esac
 SWEEP_ENV=${1:-dag_approach}
-SWEEP_OUT=${2:-results/vine_actor_sweep/${SWEEP_ENV}_$(date +%Y%m%d_%H%M%S)}
+SWEEP_OUT=${2:-results/${SWEEP_NAME}_sweep/${SWEEP_ENV}_$(date +%Y%m%d_%H%M%S)}
 SWEEP_PYTHON=$(command -v "${PYTHON_BIN:-python3}")
 export PYTHON_BIN="$SWEEP_PYTHON"
-"$SWEEP_PYTHON" vine_actor_sweep.py plan --env "$SWEEP_ENV" --output "$SWEEP_OUT"
+"$SWEEP_PYTHON" vine_actor_sweep.py plan --method "$SWEEP_METHOD" --env "$SWEEP_ENV" --output "$SWEEP_OUT"
 SWEEP_OUT=$(cd "$SWEEP_OUT" && pwd)
 SWEEP_COUNT=$("$SWEEP_PYTHON" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["settings"]))' "$SWEEP_OUT/manifest.json")
 mkdir -p "$SWEEP_OUT/logs"
@@ -37,19 +43,19 @@ printf -v COLLECT_COMMAND '%q ' "$SWEEP_PYTHON" -u "$PWD/vine_actor_sweep.py" co
 SUBMIT=(sbatch --parsable --chdir="$PWD" --partition="${PARTITION:-compsci-gpu}"
     --gres="gpu:${GPU:-a5000:1}" --cpus-per-task="${CPUS:-2}" --mem="${MEMORY:-24G}"
     --export=ALL,XLA_PYTHON_CLIENT_PREALLOCATE=false,MPLBACKEND=Agg)
-ARRAY=("${SUBMIT[@]}" --job-name=vine_actor_sweep --time="${TIME_LIMIT:-24:00:00}"
+ARRAY=("${SUBMIT[@]}" --job-name="${SWEEP_NAME}_sweep" --time="${TIME_LIMIT:-24:00:00}"
     --array="0-$((SWEEP_COUNT-1))%${MAX_PARALLEL:-4}"
     --output="$SWEEP_OUT/logs/%A_%a.out" --error="$SWEEP_OUT/logs/%A_%a.err" --wrap="$RUN_COMMAND")
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
     printf '%q ' "${ARRAY[@]}"; printf '\n'
-    printf '%q ' "${SUBMIT[@]}" '--dependency=afterany:ARRAY_JOB_ID' --job-name=vine_report \
+    printf '%q ' "${SUBMIT[@]}" '--dependency=afterany:ARRAY_JOB_ID' --job-name="${SWEEP_NAME}_report" \
         --time=00:20:00 --output="$SWEEP_OUT/logs/report_%j.out" --wrap="$COLLECT_COMMAND"; printf '\n'
     exit 0
 fi
 SWEEP_JOB=$("${ARRAY[@]}")
 SWEEP_JOB=${SWEEP_JOB%%;*}
 printf '%s\n' "$SWEEP_JOB" > "$SWEEP_OUT/array_job_id.txt"
-REPORT_JOB=$("${SUBMIT[@]}" --dependency="afterany:$SWEEP_JOB" --job-name=vine_report \
+REPORT_JOB=$("${SUBMIT[@]}" --dependency="afterany:$SWEEP_JOB" --job-name="${SWEEP_NAME}_report" \
     --time=00:20:00 --output="$SWEEP_OUT/logs/report_%j.out" --error="$SWEEP_OUT/logs/report_%j.err" \
     --wrap="$COLLECT_COMMAND")
 printf '%s\n' "$REPORT_JOB" > "$SWEEP_OUT/report_job_id.txt"

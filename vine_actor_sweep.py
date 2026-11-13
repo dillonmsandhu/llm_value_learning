@@ -1,4 +1,4 @@
-"""Plan, execute one cluster array task, or summarize a pure MC VinePPO sweep.
+"""Plan, execute one cluster array task, or summarize an MC PPO or pure MC VinePPO sweep.
 
 Planning uses only the Python standard library. Execution is never implicit.
 """
@@ -43,7 +43,15 @@ def plan(args):
     if any(x <= 0 for k in ('actor_lr','clip_eps','actor_epochs') for x in grid[k]):
         raise SystemExit('Learning rates, clipping and epochs must be positive')
     if any(x < 0 for x in grid['entropy_coef']): raise SystemExit('Entropy must be nonnegative')
-    common.update(env_type=args.env, critic_method='vine_mc', k=128, actor_lambda=0., gamma=1.)
+    common.update(env_type=args.env, critic_method=args.method, gamma=1.)
+    if args.method == 'mc':
+        # Full trunk MC returns train the critic; GAE(1) = return - old V.
+        # No bootstrapped targets or auxiliary continuation samples.
+        common.update(k=1, actor_lambda=1., critic_lambda=1.,
+                      critic_lr=float(os.environ.get('CRITIC_LR',5e-4)),
+                      critic_epochs=int(os.environ.get('CRITIC_EPOCHS',4)))
+    else:
+        common.update(k=128, actor_lambda=0.)
     settings = [dict(id=f'setting_{i:03d}', parameters=dict(zip(grid, values)))
                 for i,values in enumerate(itertools.product(*grid.values()))]
     manifest = dict(version=1, output=str(out), python=os.environ.get('PYTHON_BIN',sys.executable),
@@ -51,7 +59,7 @@ def plan(args):
     out.mkdir(parents=True, exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     (out/'commands.txt').write_text('\n'.join(shlex.join(command(manifest,s)) for s in settings)+'\n')
-    print(f'Planned {len(settings)} settings × {common["n_seeds"]} matched seeds; K=128. {out}')
+    print(f'Planned {len(settings)} settings × {common["n_seeds"]} matched seeds; {args.method}, K={common["k"]}. {out}')
 
 
 def run(args):
@@ -76,6 +84,7 @@ def collect(args):
     rows, curves, missing, seeds = [], [], [], []
     common = manifest['common']
     n = common['n_seeds']
+    method_label = 'MC PPO (trunk returns)' if common['critic_method'] == 'mc' else 'Pure MC VinePPO, K=128'
     def sem(values):
         return float(np.std(values,ddof=1)/np.sqrt(len(values))) if len(values)>1 else 0.
     for setting in manifest['settings']:
@@ -137,13 +146,13 @@ def collect(args):
         ax.plot(x,mean,color=colors(i%20),linestyle=['-','--',':','-.'][(i//20)%4],label=label)
         ax.fill_between(x,mean-error,mean+error,color=colors(i%20),alpha=.08)
     ax.set(xlabel='PPO update',ylabel='Mean trunk return (success rate)',ylim=(0,1),
-           title=f'Pure MC VinePPO, K=128 — {common["env_type"]} ({n} seeds per setting)')
+           title=f'{method_label} — {common["env_type"]} ({n} seeds per setting)')
     ax.grid(alpha=.2);ax.legend(loc='upper left',bbox_to_anchor=(1.01,1),fontsize=8)
     fig.tight_layout()
     for ext in ('png','pdf'):fig.savefig(out/f'learning_curves.{ext}',dpi=180,bbox_inches='tight')
     plt.close(fig)
-    lines=['# Pure MC VinePPO actor sweep','',
-           f'{len(rows)}/{len(manifest["settings"])} complete settings; {n} seeds each. K=128.',
+    lines=[f'# {method_label} actor sweep','',
+           f'{len(rows)}/{len(manifest["settings"])} complete settings; {n} seeds each.',
            '', 'AUC is the trapezoidal mean training return over updates 1 through N (normalized by N−1).',
            'Final return is a fresh stochastic evaluation of the last policy, not the last training batch.',
            'Uncertainty is the standard error across seeds; one seed has no uncertainty estimate.',
@@ -163,6 +172,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='mode',required=True)
     p=sub.add_parser('plan');p.add_argument('--env',choices=['dag','dag_quality','dag_approach'],default='dag_approach')
+    p.add_argument('--method',choices=['vine_mc','mc'],default='vine_mc')
     p.add_argument('--output',required=True);p.set_defaults(func=plan)
     p=sub.add_parser('run');p.add_argument('--output',required=True);p.add_argument('--index',type=int);p.set_defaults(func=run)
     p=sub.add_parser('collect');p.add_argument('--output',required=True);p.set_defaults(func=collect)
