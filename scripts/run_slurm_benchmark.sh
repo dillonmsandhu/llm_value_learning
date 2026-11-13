@@ -114,6 +114,12 @@ $PYTHON run_benchmark.py \
     ${MAX_STEPS:+--max_steps "$MAX_STEPS"} \
     --num_actions "$NUM_ACTIONS" \
     --difficulty "$DIFFICULTY" \
+    --number_min_value "${NUMBER_MIN_VALUE:-0}" \
+    --number_max_value "${NUMBER_MAX_VALUE:-999}" \
+    --number_min_distance "${NUMBER_MIN_DISTANCE:-2}" \
+    --number_max_distance "${NUMBER_MAX_DISTANCE:-5}" \
+    --number_teacher_probability "${NUMBER_TEACHER_PROBABILITY:-0.75}" \
+    --number_split_mode "${NUMBER_SPLIT_MODE:-pair}" \
     --program_min_ops "${PROGRAM_MIN_OPS:-2}" \
     --program_max_ops "${PROGRAM_MAX_OPS:-4}" \
     --program_degree "${PROGRAM_DEGREE:-3}" \

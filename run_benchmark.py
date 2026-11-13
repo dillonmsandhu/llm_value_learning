@@ -21,6 +21,7 @@ from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTr
 from envs.quality_dag_env import QualityDAGEnv
 from envs.approach_error_dag_env import ApproachErrorDAGEnv
 from envs.program_synthesis import ProgramSynthesisEnv
+from envs.number_transform import NumberTransformEnv, add_number_arguments, number_kwargs, NUMBER_DEFAULTS
 from envs.program_tasks import add_program_arguments, program_kwargs, PROGRAM_DEFAULTS, PROGRAM_EVAL_DEFAULTS
 from vine_mc import batched_apply
 import plot_results
@@ -997,13 +998,15 @@ def run_benchmark(
 
     # 1. Initialize Environment & Precompute Exact Evaluator
     is_dag_family = (env_type in ("dag", "single_dag", "dag_spectrum", "dag_quality", "dag_approach"))
-    if env_type == "program":
+    if env_type in ("program","numbers"):
         from program_evaluation import build_program_eval_set
         parameters = dict(dag_params or {})
-        program_parameters = {k:v for k,v in parameters.items() if k in PROGRAM_DEFAULTS}
-        env = ProgramSynthesisEnv(num_problems=parameters.get('num_problems',20),
-                                   max_steps=parameters.get('max_steps',24),seed=master_seed,**program_parameters)
-        env_title = 'Integer-polynomial program synthesis (MC evaluation references)'
+        keys=NUMBER_DEFAULTS if env_type=='numbers' else PROGRAM_DEFAULTS
+        program_parameters = {k:v for k,v in parameters.items() if k in keys}
+        environment_class=NumberTransformEnv if env_type=='numbers' else ProgramSynthesisEnv
+        env = environment_class(num_problems=parameters.get('num_problems',20),
+                                   max_steps=parameters.get('max_steps',8 if env_type=='numbers' else 24),seed=master_seed,**program_parameters)
+        env_title = ('Number transformation' if env_type=='numbers' else 'Integer-polynomial program synthesis')+' (MC evaluation references)'
         eval_set = build_program_eval_set(env,samples_per_problem=parameters.get('program_eval_prefixes',2),
                                            reference_k=parameters.get('program_eval_k',128),
                                            action_samples=parameters.get('program_eval_actions',4))
@@ -1263,7 +1266,7 @@ def run_benchmark(
             )
 
     # 4. Evaluate Non-Parametric Pure Vine MC Estimator (no network, no gradient) on all eval_set states
-    if "next_states_all" in eval_set and env_type != "program":
+    if "next_states_all" in eval_set and env_type not in ("program","numbers"):
         vine_ks = [2]
         for k_ref in vine_ks:
             ref_name = f"Vine MC Estimator (K={k_ref})"
@@ -1300,8 +1303,8 @@ def run_benchmark(
                 flush=True,
             )
 
-    if env_type == "program":
-        env.export_tasks(os.path.join(save_dir,'tasks_train.jsonl'))
+    if env_type in ("program","numbers"):
+        env.export_tasks(os.path.join(save_dir,'tasks_train.npz' if env_type=='numbers' else 'tasks_train.jsonl'))
 
     # 5. Save Benchmark Data
     pkl_path = os.path.join(save_dir, "benchmark_results.pkl")
@@ -1313,7 +1316,7 @@ def run_benchmark(
         json.dump({"config": results["environment_config"], "diagnostics": results["environment_diagnostics"]}, f, indent=2)
     plot_results.plot_quality_breakdown(results, save_dir)
 
-    if env_type == "program":
+    if env_type in ("program","numbers"):
         from program_evaluation import plot_program_critic_results
         plot_program_critic_results(results,save_dir)
         return results
@@ -1330,7 +1333,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Value Benchmark Suite (GPU Cluster & Local)")
-    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "dag_quality", "dag_approach", "program", "single_tree", "tree"], help="Environment family, including dag_quality and dag_approach")
+    parser.add_argument("--env_type", type=str, default="single_dag", choices=["single_dag", "dag", "dag_quality", "dag_approach", "program", "numbers", "single_tree", "tree"], help="Environment family, including dag_quality and dag_approach")
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
@@ -1382,6 +1385,7 @@ def main():
     parser.add_argument("--minibatch_size", type=int, default=64, help="Minibatch size for gradient steps (default: 64)")
 
     add_program_arguments(parser)
+    add_number_arguments(parser)
     args = parser.parse_args()
 
     if args.save_dir:
@@ -1395,10 +1399,10 @@ def main():
 
     # Set smart defaults based on env_type
     is_single = args.env_type in ("single_dag", "single_tree")
-    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum", "dag_quality", "dag_approach", "program")
+    is_dag_cli = args.env_type in ("single_dag", "dag", "dag_spectrum", "dag_quality", "dag_approach", "program", "numbers")
     num_prob = args.num_problems if args.num_problems is not None else (1 if is_single else (20 if is_dag_cli else 10))
     num_mile = args.num_milestones if args.num_milestones is not None else (8 if is_single else 12)
-    max_st = args.max_steps if args.max_steps is not None else (32 if is_single else 40)
+    max_st = args.max_steps if args.max_steps is not None else (32 if is_single else (8 if args.env_type=="numbers" else 40))
 
     dag_params = {
         "num_problems": num_prob,
@@ -1411,8 +1415,8 @@ def main():
         dag_params[key] = getattr(args, key)
     for key in ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"):
         dag_params[key] = getattr(args, key)
-    if args.env_type == "program":
-        dag_params.update(program_kwargs(args))
+    if args.env_type in ("program","numbers"):
+        dag_params.update(number_kwargs(args) if args.env_type=='numbers' else program_kwargs(args))
         dag_params.update({k:getattr(args,k) for k in PROGRAM_EVAL_DEFAULTS})
     tree_params = {
         "num_problems": num_prob,

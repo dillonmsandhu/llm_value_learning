@@ -18,6 +18,7 @@ from envs.quality_dag_env import QualityDAGEnv
 from envs.approach_error_dag_env import ApproachErrorDAGEnv
 from envs.dag_mdp import DAGMDP, make_dag_mdp
 from envs.program_synthesis import ProgramSynthesisEnv, ProgramState
+from envs.number_transform import NumberTransformEnv, NumberState
 
 __all__ = [
     "TabularMatrixEnv",
@@ -31,6 +32,8 @@ __all__ = [
     "ApproachErrorDAGEnv",
     "ProgramSynthesisEnv",
     "ProgramState",
+    "NumberTransformEnv",
+    "NumberState",
     "DAGMDP",
     "make_dag_mdp",
     "DAGState",

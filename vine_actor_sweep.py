@@ -50,6 +50,12 @@ def plan(args):
                                   program_teacher_probability=.75).items():
             common[name]=type(default)(os.environ.get(name.upper(),default))
         if os.environ.get('PROGRAM_PROBLEM_FILE'):common['program_problem_file']=os.environ['PROGRAM_PROBLEM_FILE']
+    if args.env == 'numbers':
+        for name,default in dict(number_min_value=0,number_max_value=999,number_min_distance=2,
+                                  number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair').items():
+            common[name]=type(default)(os.environ.get(name.upper(),default))
+    if args.env=='numbers':common['num_actions']=36
+    if args.env=='program':common['num_actions']=4*common['program_registers']**2+common['program_registers']+2
     common.update(env_type=args.env, critic_method=args.method, gamma=1.)
     if args.method == 'mc':
         # Full trunk MC returns train the critic; GAE(1) = return - old V.
@@ -99,7 +105,7 @@ def collect(args):
         try:
             config = json.loads((directory/'config.json').read_text())
             expected = dict(common, **setting['parameters'])
-            if common['env_type']=='program':expected.pop('num_actions',None)
+            if common['env_type'] in ('program','numbers'):expected.pop('num_actions',None)
             if any(config.get(k) != v for k,v in expected.items()): raise ValueError('configuration mismatch')
             summary = json.loads((directory/'summary.json').read_text())
             if sorted(s['seed'] for s in summary) != list(range(n)): raise ValueError('incomplete evaluation seeds')
@@ -179,7 +185,7 @@ def collect(args):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='mode',required=True)
-    p=sub.add_parser('plan');p.add_argument('--env',choices=['dag','dag_quality','dag_approach','program'],default='dag_approach')
+    p=sub.add_parser('plan');p.add_argument('--env',choices=['dag','dag_quality','dag_approach','program','numbers'],default='dag_approach')
     p.add_argument('--method',choices=['vine_mc','mc'],default='vine_mc')
     p.add_argument('--output',required=True);p.set_defaults(func=plan)
     p=sub.add_parser('run');p.add_argument('--output',required=True);p.add_argument('--index',type=int);p.set_defaults(func=run)

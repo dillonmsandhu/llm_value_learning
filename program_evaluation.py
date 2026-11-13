@@ -25,10 +25,15 @@ def reference_values(env,states,key,k=128,batch_size=128):
     return returns.mean(-1),returns.std(-1,ddof=1)/jnp.sqrt(k)
 
 
-def build_program_eval_set(env,samples_per_problem=2,reference_k=128,action_samples=4,seed=12345):
+def build_program_eval_set(env,samples_per_problem=2,reference_k=128,action_samples=4,seed=12345,max_eval_problems=32):
     if samples_per_problem<1 or reference_k<2 or action_samples<1:raise ValueError('positive sample counts and reference_k >=2 required')
     count=max(4,samples_per_problem)
-    problem_ids=jnp.repeat(jnp.arange(env.num_problems),count)
+    # Number tasks can expose almost a million pairs. Evaluation uses a fixed,
+    # representative-size subset, rather than constructing one rollout per pair.
+    rng=np.random.default_rng(seed)
+    selected_problems=(env.evaluation_problem_ids(max_eval_problems,seed) if hasattr(env,'evaluation_problem_ids')
+                       else np.sort(rng.choice(env.num_problems,size=min(max_eval_problems,env.num_problems),replace=False)))
+    problem_ids=jnp.repeat(jnp.asarray(selected_problems,jnp.int32),count)
     _,states=jax.vmap(env.reset_problem)(problem_ids)
     def step(carry,_):
         st,key=carry;key,ak,sk=jax.random.split(key,3)
@@ -38,7 +43,7 @@ def build_program_eval_set(env,samples_per_problem=2,reference_k=128,action_samp
     _,pool=jax.jit(lambda key:jax.lax.scan(step,(states,key),None,length=env.max_steps))(jax.random.PRNGKey(seed))
     pool=jax.tree_util.tree_map(lambda x:x.reshape((-1,)+x.shape[2:]),pool)
     rng=np.random.default_rng(seed);selected=[]
-    for p in range(env.num_problems):
+    for p in selected_problems:
         choices=np.flatnonzero((np.asarray(pool.prompt_idx)==p)&~np.asarray(pool.done))
         selected.extend(rng.choice(choices,size=min(samples_per_problem,len(choices)),replace=False).tolist())
     states=jax.tree_util.tree_map(lambda x:x[jnp.asarray(selected)],pool)
@@ -56,7 +61,8 @@ def build_program_eval_set(env,samples_per_problem=2,reference_k=128,action_samp
     return dict(eval_obs=states.history_tokens,eval_state=states,exact_v=v,true_adv=advantage,
                 all_eval_tokens=combined.history_tokens,r_all=reward,d_all=done,
                 next_obs_all=next_obs,next_states_all=next_state,num_actions=action_samples,
-                prompts=states.prompt_idx,num_problems=env.num_problems,
+                prompts=jnp.searchsorted(jnp.asarray(selected_problems),states.prompt_idx),num_problems=len(selected_problems),
+                evaluation_problem_ids=jnp.asarray(selected_problems),
                 reference_is_exact=False,reference_standard_errors=error,
                 reference_k=reference_k,evaluation_actions=actions,
                 reference_description='Independent MC continuation estimates under the frozen reference policy; sampled policy actions')

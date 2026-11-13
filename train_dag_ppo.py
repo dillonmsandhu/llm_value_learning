@@ -16,6 +16,7 @@ from envs.dag_mdp import make_dag_mdp
 from vine_mc import prefix_values, one_step_branches, batched_apply
 from dirichlet_value import bilinear_double_sampled_loss
 from envs.program_tasks import add_program_arguments, program_kwargs
+from envs.number_transform import add_number_arguments, number_kwargs
 
 
 class TrunkBatch(NamedTuple):
@@ -74,6 +75,10 @@ def make_train(env, config, evaluation_env=None):
                include_trunk=True, bc_updates=0, bc_lr=3e-4, vine_batch_size=256, eval_episodes=128,
                d_model=64, n_heads=4, n_layers=2, final_hidden_dim=32)
     cfg.update(config)
+    if evaluation_env is not None:
+        for name in ('num_actions','vocab_size','max_seq_len','max_steps'):
+            if getattr(env,name)!=getattr(evaluation_env,name):
+                raise ValueError('training and evaluation environments must share model shapes and step budget')
     for name in ("num_updates","num_envs","actor_epochs","critic_epochs","minibatch_size","k","eval_episodes","vine_batch_size"):
         if cfg[name] < 1: raise ValueError(f"{name} must be positive")
     for name in ("gamma","actor_lambda","critic_lambda"):
@@ -121,8 +126,18 @@ def make_train(env, config, evaluation_env=None):
         return jax.tree_util.tree_map(jax.lax.stop_gradient,(batch,states))
 
     def evaluate(ap,cp,key,rollout_env=env):
-        batch,_ = collect(ap,cp,key,count=cfg["eval_episodes"],rollout_env=rollout_env)
-        return batch.reward.sum()/cfg["eval_episodes"]
+        batch,states = collect(ap,cp,key,count=cfg["eval_episodes"],rollout_env=rollout_env)
+        stats = dict(success=batch.reward.sum()/cfg["eval_episodes"])
+        base=getattr(rollout_env,'base_env',rollout_env)
+        if hasattr(base,'initial_distance'):
+            initial=jax.tree_util.tree_map(lambda x:x[0],states)
+            distance=base.initial_distance(initial)
+            levels=base.levels
+            mask=distance[None,:]==levels[:,None]
+            counts=mask.sum(-1)
+            stats.update(distance_levels=levels,distance_counts=counts,
+                         distance_success=(mask*batch.reward.sum(0)[None,:]).sum(-1)/jnp.maximum(counts,1))
+        return stats
 
     def critic_targets(batch, states, ap, cp, key):
         method = cfg["critic_method"]
@@ -204,11 +219,13 @@ def make_train(env, config, evaluation_env=None):
         actor_state = TrainState.create(apply_fn=actor.apply,params=actor_state.params,tx=adam(cfg["actor_lr"]))
         initial_actor_params = actor_state.params
         key,ek = jax.random.split(key)
-        initial_success = evaluate(actor_state.params,critic_state.params,ek)
+        initial_eval = evaluate(actor_state.params,critic_state.params,ek)
+        initial_success = initial_eval['success']
 
         if evaluation_env is not None:
-            initial_heldout_success = evaluate(actor_state.params,critic_state.params,
-                                              jax.random.fold_in(ek,334),evaluation_env)
+            initial_heldout_eval = evaluate(actor_state.params,critic_state.params,
+                                           jax.random.fold_in(ek,334),evaluation_env)
+            initial_heldout_success = initial_heldout_eval['success']
 
         def update(carry,idx):
             ac,cr,key = carry
@@ -271,24 +288,28 @@ def make_train(env, config, evaluation_env=None):
                            raw_advantage_mean=mean)
             return (ac,cr,key),metrics
         (actor_state,critic_state,key),metrics = jax.lax.scan(update,(actor_state,critic_state,key),jnp.arange(cfg["num_updates"]))
-        final_success = evaluate(actor_state.params,critic_state.params,jax.random.fold_in(key,777))
+        final_eval = evaluate(actor_state.params,critic_state.params,jax.random.fold_in(key,777))
+        final_success = final_eval['success']
         result = dict(metrics=metrics,initial_success=initial_success,final_success=final_success,
                       initial_actor_params=initial_actor_params,actor_params=actor_state.params,
                       critic_params=critic_state.params)
         if evaluation_env is not None:
-            result.update(initial_heldout_success=initial_heldout_success,
-                          final_heldout_success=evaluate(actor_state.params,critic_state.params,
-                                                        jax.random.fold_in(key,778),evaluation_env))
+            final_heldout_eval=evaluate(actor_state.params,critic_state.params,jax.random.fold_in(key,778),evaluation_env)
+            result.update(initial_heldout_success=initial_heldout_success,final_heldout_success=final_heldout_eval['success'])
+        if 'distance_levels' in initial_eval:
+            result['evaluation_by_distance']=dict(initial_training=initial_eval,final_training=final_eval)
+            if evaluation_env is not None:
+                result['evaluation_by_distance'].update(initial_heldout=initial_heldout_eval,final_heldout=final_heldout_eval)
         return result
     return train
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--env_type",choices=("dag","dag_quality","dag_approach","program"),default="dag_approach")
+    p.add_argument("--env_type",choices=("dag","dag_quality","dag_approach","program","numbers"),default="dag_approach")
     p.add_argument("--num_problems",type=int,default=20)
     p.add_argument("--num_milestones",type=int,default=12)
-    p.add_argument("--max_steps",type=int,default=40)
+    p.add_argument("--max_steps",type=int,default=None)
     p.add_argument("--num_actions",type=int,default=8)
     p.add_argument("--n_seeds",type=int,default=5)
     p.add_argument("--master_seed",type=int,default=42)
@@ -313,26 +334,32 @@ def main():
     p.add_argument("--absorbing_dead",action="store_true")
     p.add_argument("--save_dir",default="results/dag_ppo")
     add_program_arguments(p)
+    add_number_arguments(p)
     args = p.parse_args()
+    if args.max_steps is None: args.max_steps=8 if args.env_type=="numbers" else 40
     if args.n_seeds < 1: p.error("n_seeds must be positive")
     env_keys = {"dag": (), "dag_quality": ("quality_levels", "quality_change_rate", "quality_up_bias", "quality_jump", "absorbing_dead"),
-                "dag_approach": ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"), "program": ()}[args.env_type]
+                "dag_approach": ("num_approaches", "error_rate", "recovery_rate", "shortcut_weight", "wait_weight"), "program": (), "numbers": ()}[args.env_type]
     env_kwargs = {k:getattr(args,k) for k in env_keys}
     if args.env_type == "program": env_kwargs.update(program_kwargs(args))
+    if args.env_type == "numbers": env_kwargs.update(number_kwargs(args))
     env = make_dag_mdp(args.env_type,num_problems=args.num_problems,num_milestones=args.num_milestones,
                        max_steps=args.max_steps,num_actions=args.num_actions,seed=args.master_seed,
                        variable_depth=args.num_problems>1,**env_kwargs)
     evaluation_env = None
-    if args.env_type == "program":
+    if args.env_type in ("program","numbers"):
         args.num_actions = env.num_actions
-        evaluation_env = make_dag_mdp('program',num_problems=args.num_problems,max_steps=args.max_steps,
+        evaluation_env = make_dag_mdp(args.env_type,num_problems=args.num_problems,max_steps=args.max_steps,
                                       seed=args.master_seed,split='test',**env_kwargs)
     if args.critic_method == "vine_mc": args.actor_lambda = 0.
     if args.critic_method == "e_min": args.k = 2
     config = vars(args).copy();config["include_trunk"] = not args.fresh_branches
-    if args.env_type == 'program':
+    if args.env_type in ('program','numbers'):
         config['task_bank_hash'] = env.base_env.config['task_bank_hash']
         config['heldout_task_bank_hash'] = evaluation_env.base_env.config['task_bank_hash']
+        if args.env_type=='numbers':
+            config['number_train_pair_count']=env.num_problems
+            config['number_heldout_pair_count']=evaluation_env.num_problems
     if args.critic_method == "e_min":
         config["critic_estimator"] = "bilinear_double_sampled_trunk_probe_v1"
         config["critic_objective"] = "0.5 * <V-v, (I-gamma*P)(V-v)>_D"
@@ -345,9 +372,10 @@ def main():
         json.dump(dict(version="dag_mdp_v1",family=args.env_type,
                        base_environment=getattr(env.base_env,"config",{}),
                        exact_base_values_used=False,actor_observation="history_tokens_only"),f,indent=2)
-    if args.env_type == "program":
-        env.base_env.export_tasks(outdir/'tasks_train.jsonl')
-        evaluation_env.base_env.export_tasks(outdir/'tasks_heldout.jsonl')
+    if args.env_type in ("program","numbers"):
+        suffix='npz' if args.env_type=='numbers' else 'jsonl'
+        env.base_env.export_tasks(outdir/('tasks_train.'+suffix))
+        evaluation_env.base_env.export_tasks(outdir/('tasks_heldout.'+suffix))
         (outdir/'heldout_environment.json').write_text(json.dumps(evaluation_env.base_env.config,indent=2)+'\n')
     summaries, all_metrics = [],[]
     for seed in range(args.n_seeds):
@@ -364,6 +392,8 @@ def main():
         if evaluation_env is not None:
             summaries[-1].update(initial_heldout_success=float(result['initial_heldout_success']),
                                  final_heldout_success=float(result['final_heldout_success']))
+        if 'evaluation_by_distance' in result:
+            summaries[-1]['evaluation_by_distance']=jax.tree_util.tree_map(lambda x:np.asarray(x).tolist(),result['evaluation_by_distance'])
         print(summaries[-1],flush=True)
     with (outdir/"summary.json").open("w") as f:json.dump(summaries,f,indent=2)
     import matplotlib.pyplot as plt

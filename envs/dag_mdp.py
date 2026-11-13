@@ -3,12 +3,13 @@ from .reasoning_dag_env import ReasoningDAGEnv
 from .quality_dag_env import QualityDAGEnv
 from .approach_error_dag_env import ApproachErrorDAGEnv
 from .program_synthesis import ProgramSynthesisEnv
+from .number_transform import NumberTransformEnv
 
 
 class DAGMDP:
     """Preserve DAG dynamics while separating the fixed reference policy from control.
 
-    No auto-reset: EOS and the task horizon are true terminals. The trainer resets
+    No auto-reset: explicit submission (where supported) and task horizons are true terminals. The trainer resets
     complete episodes and masks padded transitions. Privileged state is available
     for diagnostics/branching, never passed to the actor or critic networks.
     """
@@ -37,7 +38,7 @@ class DAGMDP:
 
 def make_dag_mdp(env_type="dag_approach", **kwargs):
     classes = {"dag":ReasoningDAGEnv, "dag_quality":QualityDAGEnv,
-               "dag_approach":ApproachErrorDAGEnv,"program":ProgramSynthesisEnv}
+               "dag_approach":ApproachErrorDAGEnv,"program":ProgramSynthesisEnv,"numbers":NumberTransformEnv}
     if env_type not in classes:
         raise ValueError(f"Unsupported DAG MDP: {env_type}")
     return DAGMDP(classes[env_type](**kwargs))

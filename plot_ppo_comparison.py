@@ -69,7 +69,8 @@ def load(root):
             runs.append(dict(path=str(folder.relative_to(root)),label=describe(cfg),cfg=cfg,data=data,
                              auc=np.asarray(aucs),final=np.asarray(final),initial=np.asarray(initial),
                              heldout=np.asarray([evaluations[s]['final_heldout_success'] for s in sorted(seeds)])
-                             if all('final_heldout_success' in evaluations[s] for s in seeds) else None))
+                             if all('final_heldout_success' in evaluations[s] for s in seeds) else None,
+                             by_distance=[evaluations[s].get('evaluation_by_distance',{}) for s in sorted(seeds)]))
         except (OSError,ValueError,KeyError,TypeError) as exc:
             skipped.append(dict(path=str(folder),reason=str(exc)))
     return runs,skipped
@@ -112,7 +113,8 @@ def main():
             'gamma','actor_lambda','critic_lr','critic_epochs','value_clip','max_grad_norm','eval_episodes',
             'program_min_ops','program_max_ops','program_degree','program_max_inputs','program_registers',
             'program_coefficient_limit','program_teacher_probability','program_problem_file',
-            'task_bank_hash','heldout_task_bank_hash')
+            'task_bank_hash','heldout_task_bank_hash','number_min_value','number_max_value',
+            'number_min_distance','number_max_distance','number_teacher_probability','number_split_mode')
     mismatches={k:[dict(path=r['path'],value=r['cfg'].get(k)) for r in runs]
                 for k in shared if len({json.dumps(r['cfg'].get(k)) for r in runs})>1}
     (dest/'config_differences.json').write_text(json.dumps(mismatches,indent=2)+'\n')
@@ -137,6 +139,35 @@ def main():
         ax.set_xticks(range(len(runs)),[r['label'] for r in runs],rotation=35,ha='right')
         ax.set(ylabel='Held-out problem success',ylim=(0,1));ax.grid(alpha=.2)
         save(fig,dest,'heldout_evaluation')
+    if any(any(seed for seed in r['by_distance']) for r in runs):
+        fig,axes=plt.subplots(1,2,figsize=(13,5))
+        distance_rows=[]
+        for ax,phase,title in zip(axes,('final_training','final_heldout'),('Training pairs','Held-out pairs')):
+            for run in runs:
+                levels=sorted({int(level) for seed in run['by_distance'] if phase in seed
+                               for level in seed[phase]['distance_levels']})
+                xs=[];ys=[];errors=[]
+                for level in levels:
+                    values=[];episodes=0
+                    for seed in run['by_distance']:
+                        if phase not in seed:continue
+                        data=seed[phase]
+                        if level not in data['distance_levels']:continue
+                        i=data['distance_levels'].index(level)
+                        if data['distance_counts'][i]>0:
+                            values.append(data['distance_success'][i]);episodes+=data['distance_counts'][i]
+                    if not values:continue
+                    mean=float(np.mean(values));error=float(sem(np.asarray(values)))
+                    xs.append(level);ys.append(mean);errors.append(error)
+                    distance_rows.append(dict(run=run['path'],phase=phase,shortest_steps=level,
+                                              success_mean=mean,success_sem=error,n_seeds=len(values),evaluation_episodes=episodes))
+                if xs:ax.errorbar(xs,ys,yerr=errors,marker='o',capsize=3,label=run['label'])
+            ax.set(title=title,xlabel='Shortest path distance at reset',ylabel='Success at fixed deadline',ylim=(0,1))
+            ax.grid(alpha=.2);ax.legend(fontsize=8)
+        save(fig,dest,'success_by_distance')
+        if distance_rows:
+            with (dest/'success_by_distance.csv').open('w',newline='') as f:
+                writer=csv.DictWriter(f,fieldnames=list(distance_rows[0]));writer.writeheader();writer.writerows(distance_rows)
     fbi=[r for r in runs if r['cfg']['critic_method']=='fbi']
     for grouping,stem in (('critic_lambda','fbi_by_k'),('k','fbi_by_lambda')):
         groups=sorted({r['cfg'][grouping] for r in fbi})

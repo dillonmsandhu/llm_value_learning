@@ -52,8 +52,8 @@ cd "$(dirname "$0")/.."
 COMPARE_ENV=${1:-dag_approach}
 COMPARE_OUT=${2:-results/ppo_comparison/${COMPARE_ENV}}
 case "$COMPARE_ENV" in
-    dag|dag_quality|dag_approach|program) ;;
-    *) echo "DAG_TYPE must be dag, dag_quality, dag_approach, or program" >&2; exit 2 ;;
+    dag|dag_quality|dag_approach|program|numbers) ;;
+    *) echo "DAG_TYPE must be dag, dag_quality, dag_approach, program, or numbers" >&2; exit 2 ;;
 esac
 
 # Keep every setting in one shared array: no per-estimator PPO overrides.
@@ -79,6 +79,12 @@ COMMON_ARGS=(
     --n_heads "${N_HEADS:-4}"
     --n_layers "${N_LAYERS:-2}"
     --final_hidden_dim "${FINAL_HIDDEN_DIM:-32}"
+    --number_min_value "${NUMBER_MIN_VALUE:-0}"
+    --number_max_value "${NUMBER_MAX_VALUE:-999}"
+    --number_min_distance "${NUMBER_MIN_DISTANCE:-2}"
+    --number_max_distance "${NUMBER_MAX_DISTANCE:-5}"
+    --number_teacher_probability "${NUMBER_TEACHER_PROBABILITY:-0.75}"
+    --number_split_mode "${NUMBER_SPLIT_MODE:-pair}"
     --program_min_ops "${PROGRAM_MIN_OPS:-2}"
     --program_max_ops "${PROGRAM_MAX_OPS:-4}"
     --program_degree "${PROGRAM_DEGREE:-3}"

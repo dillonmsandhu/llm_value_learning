@@ -3,7 +3,7 @@
 set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     cat <<'HELP'
-Usage: bash scripts/submit_vine_actor_sweep.sh [dag|dag_quality|dag_approach|program] [OUTPUT]
+Usage: bash scripts/submit_vine_actor_sweep.sh [dag|dag_quality|dag_approach|program|numbers] [OUTPUT]
 Default: dag_approach; timestamped results/vine_actor_sweep/... directory.
 Pure MC VinePPO K=128, trunk-only PPO; no learned critic.
 16 settings: LR={.0001,.0003}, clip={.1,.2}, entropy={0,.001}, epochs={1,4}.
