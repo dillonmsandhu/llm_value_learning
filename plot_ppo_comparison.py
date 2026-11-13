@@ -33,7 +33,7 @@ def describe(cfg):
     if method=='td': return f'TD λ={lam:g}'
     if method=='vine': return f'Vine-target K={k}'
     if method=='vine_mc': return f'MC VinePPO K={k}'
-    return {'mc':'MC'}.get(method,method)
+    return {'mc':'MC','e_min':'E_min (bilinear double-sampled)'}.get(method,method)
 
 
 def load(root):

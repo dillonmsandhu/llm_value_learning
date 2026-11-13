@@ -15,7 +15,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from transformer import TransformerCritic
-from dirichlet_value import double_sampled_dirichlet_loss
+from dirichlet_value import bilinear_double_sampled_loss
 from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
 from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTreeEnv, ProceduralTreeExactValue, TreeState
 from envs.quality_dag_env import QualityDAGEnv
@@ -538,7 +538,9 @@ def make_train_loop(
     # Explicit K variants: fbi_kK_lamL (fresh branches), or
     # fbi_trunk_kK_lamL (trunk transition plus K-1 fresh branches).
     includes_trunk = algo.startswith("fbi_trunk_k")
-    is_dirichlet = (algo == "dirichlet")
+    is_dirichlet = algo in ("dirichlet", "e_min")
+    if is_dirichlet and num_steps < env.max_steps:
+        raise ValueError("E_min requires complete trunk returns: NUM_STEPS must cover env.max_steps")
     is_mc = (algo == "mc")
     is_td = algo.startswith("td")
     is_vine = algo.startswith("vine")
@@ -664,6 +666,7 @@ def make_train_loop(
                     keys = jax.random.split(branch_key, num_steps*num_envs).reshape(num_steps,num_envs,2)
                     dir_next_obs, dir_reward, dir_done = jax.vmap(jax.vmap(_independent_branch))(visited_states, keys)
                     active_infer_steps = 2.0 * trunk_active_steps
+                    critic_eval_steps = jnp.array(float(grad_steps_per_update*minibatch_size),dtype=jnp.float32)
             elif is_td:
                 # Standard On-Policy TD(lambda) / GAE(lambda) along the single trunk trajectory (no extra branching)
                 n_trunk = num_steps * num_envs
@@ -884,6 +887,10 @@ def make_train_loop(
                     # Uniform fixed slots: D is expected occupancy / max horizon.
                     # No random-length-dependent normalization of sampled G.
                     obs_active, targets_active = obs_flat, targets_flat
+                    dir_trunk_next = jnp.concatenate([traj_batch.obs[1:],last_obs[None]],axis=0)
+                    dir_trunk_next_flat = dir_trunk_next.reshape(-1,*traj_batch.obs.shape[2:])
+                    dir_trunk_r_flat = traj_batch.reward.reshape(-1)
+                    dir_trunk_d_flat = traj_batch.done.reshape(-1)
                     dir_next_flat = dir_next_obs.reshape(-1, *dir_next_obs.shape[2:])
                     dir_r_flat = dir_reward.reshape(-1)
                     dir_d_flat = dir_done.reshape(-1)
@@ -897,11 +904,13 @@ def make_train_loop(
 
                     def _loss(p):
                         if is_dirichlet:
-                            pair_obs = jnp.concatenate([m_obs, dir_next_flat[mb_idx]], axis=0)
-                            pair_v = network.apply(p, pair_obs, method=network.value)
-                            return double_sampled_dirichlet_loss(
-                                pair_v[:minibatch_size], pair_v[minibatch_size:], m_targ,
-                                dir_r_flat[mb_idx], dir_d_flat[mb_idx], active_mask_flat[mb_idx], gamma)
+                            observations = jnp.concatenate([m_obs,dir_trunk_next_flat[mb_idx],dir_next_flat[mb_idx]],axis=0)
+                            values = network.apply(p,observations,method=network.value)
+                            value,trunk_next,probe_next = jnp.split(values,3)
+                            return bilinear_double_sampled_loss(
+                                value,trunk_next,probe_next,m_targ,
+                                dir_trunk_r_flat[mb_idx],dir_trunk_d_flat[mb_idx],
+                                dir_r_flat[mb_idx],dir_d_flat[mb_idx],active_mask_flat[mb_idx],gamma)
                         preds = network.apply(p, m_obs, method=network.value)
                         return 0.5 * jnp.mean(jnp.square(preds - m_targ))
 
@@ -1142,17 +1151,21 @@ def run_benchmark(
         "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
         "base_total_grad_steps": base_total_grad_steps,
         "flop_assumptions": flop_assumptions,
-        "dirichlet_assumptions": {"loss": "(G-v(s))*(r_branch+gamma*(1-done)*v(next)-v(s))",
+        "dirichlet_assumptions": {"objective": "0.5 * <V-v, (I-gamma*P)(V-v)>_D",
+                                  "estimator": "bilinear_double_sampled_trunk_probe_v1",
+                                  "loss": "-0.5*sg((delta_trunk+delta_probe)/2+G-v)*v + 0.5*gamma*sg(G-v)*(1-done_probe)*v_probe",
+                                  "loss_is_surrogate": True,
                                   "sampling": "independent branch conditional on trunk prefix",
                                   "weighting": "expected nonterminal occupancy divided by fixed horizon",
-                                  "terminal_continuation": 0, "gradient_value_passes": 2},
+                                  "terminal_continuation": 0, "gradient_value_passes": 2,
+                                  "detached_value_passes": 1},
         "environment_diagnostics": env.diagnostics() if hasattr(env, "diagnostics") else None,
         "methods": {},
         "reference_baselines": {},
     }
 
     def _format_algo_name(a: str) -> str:
-        if a == "dirichlet":
+        if a in ("dirichlet", "e_min"):
             return "Dirichlet (double-sampled)"
         if a == "mc":
             return "Standard MC (K=1)"
@@ -1248,7 +1261,7 @@ def run_benchmark(
             },
         }
 
-        if algo_key == "dirichlet":
+        if algo_key in ("dirichlet", "e_min"):
             results["methods"][display_name]["dirichlet_loss"] = np.asarray(out["metrics"]["dirichlet_loss"])
 
         if hasattr(env, "quality_levels"):

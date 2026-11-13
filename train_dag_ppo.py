@@ -14,6 +14,7 @@ from flax.training.train_state import TrainState
 from transformer import TransformerCritic, TransformerPolicy
 from envs.dag_mdp import make_dag_mdp
 from vine_mc import prefix_values
+from dirichlet_value import bilinear_double_sampled_loss
 
 
 class TrunkBatch(NamedTuple):
@@ -25,6 +26,7 @@ class TrunkBatch(NamedTuple):
     log_prob: jax.Array
     value: jax.Array
     next_value: jax.Array
+    next_obs: jax.Array
 
 
 def masked_mean(x, mask):
@@ -75,14 +77,16 @@ def make_train(env, config):
     for name in ("gamma","actor_lambda","critic_lambda"):
         if not 0 <= cfg[name] <= 1: raise ValueError(f"{name} must be in [0,1]")
     if cfg["bc_updates"] < 0: raise ValueError("bc_updates must be nonnegative")
-    if cfg["critic_method"] not in ("mc","td","fbi","vine","vine_mc"):
-        raise ValueError("critic_method must be mc, td, fbi, vine, or vine_mc")
+    if cfg["critic_method"] not in ("mc","td","fbi","vine","vine_mc","e_min"):
+        raise ValueError("critic_method must be mc, td, fbi, vine, vine_mc, or e_min")
     for name in ("actor_lr", "bc_lr", "critic_lr", "max_grad_norm", "clip_eps"):
         if not np.isfinite(cfg[name]) or cfg[name] <= 0: raise ValueError(f"{name} must be finite and positive")
     if cfg["value_clip"] < 0 or cfg["entropy_coef"] < 0:
         raise ValueError("value_clip and entropy_coef must be nonnegative")
     if cfg["critic_method"] == "vine_mc":
         cfg["actor_lambda"] = 0.
+    if cfg["critic_method"] == "e_min":
+        cfg["k"] = 2  # One trunk transition and one independent probe.
     T, B, K = env.max_steps, cfg["num_envs"], cfg["k"]
     net = dict(vocab_size=env.vocab_size,max_len=env.max_seq_len,
                d_model=cfg["d_model"],n_heads=cfg["n_heads"],n_layers=cfg["n_layers"],
@@ -109,7 +113,7 @@ def make_train(env, config):
             value = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,obs)
             no,ns,r,d,_ = jax.vmap(env.step)(jax.random.split(sk,count),states,action)
             nv = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,no)
-            batch = TrunkBatch(obs,action,r,d,active,action_log_prob(logits,action),value,nv)
+            batch = TrunkBatch(obs,action,r,d,active,action_log_prob(logits,action),value,nv,no)
             return (no,ns,key),(batch,states)
         _,(batch,states) = jax.lax.scan(step,(obs,states,key),None,length=T)
         return jax.tree_util.tree_map(jax.lax.stop_gradient,(batch,states))
@@ -120,8 +124,18 @@ def make_train(env, config):
 
     def critic_targets(batch, states, ap, cp, key):
         method = cfg["critic_method"]
+        if method == "e_min":
+            # Actual full suffix returns, without value cancellation or a
+            # bootstrapped horizon. The terminal continuation is exactly zero.
+            def backward(next_return,data):
+                reward,done,active = data
+                ret = jnp.where(active,reward+cfg["gamma"]*(1-done)*next_return,0.)
+                return ret,ret
+            _,target = jax.lax.scan(backward,jnp.zeros(B),
+                                   (batch.reward,batch.done,batch.active),reverse=True)
+            return jax.lax.stop_gradient(target),jnp.array(0.)
         if method in ("mc","td") or (method=="fbi" and cfg["include_trunk"] and K==1):
-            lam = 1. if method=="mc" else cfg["critic_lambda"]
+            lam = 1. if method == "mc" else cfg["critic_lambda"]
             return lambda_returns(batch.reward,batch.done,batch.value,batch.next_value,batch.active,cfg["gamma"],lam)[1],jnp.array(0.)
         fresh = K-int(cfg["include_trunk"]) if method=="fbi" else K
         flat_states = jax.tree_util.tree_map(lambda x:x.reshape((-1,)+x.shape[2:]),states)
@@ -158,6 +172,14 @@ def make_train(env, config):
             _,adv = jax.lax.scan(backward,jnp.zeros(B),(residual,batch.done,batch.active),reverse=True)
             target = batch.value+adv
         return jax.lax.stop_gradient(target),steps.astype(float)
+
+    def sample_probe(ap, states, key):
+        # Sampling is under the frozen actor, independently of the trunk suffix.
+        flat = jax.tree_util.tree_map(lambda x:x.reshape((-1,)+x.shape[2:]),states)
+        ak,sk = jax.random.split(key)
+        action = jax.random.categorical(ak,actor.apply(ap,flat.history_tokens)).astype(jnp.int32)
+        no,_,reward,done,_ = jax.vmap(env.step)(jax.random.split(sk,T*B),flat,action)
+        return jax.tree_util.tree_map(jax.lax.stop_gradient,(no,reward,done))
 
     def flatten(x): return x.reshape((-1,)+x.shape[2:])
 
@@ -230,6 +252,24 @@ def make_train(env, config):
                 return loss,dict(critic_loss=loss)
             if cfg["critic_method"] == "vine_mc":
                 cmetrics = dict(critic_loss=jnp.array(0.))
+            elif cfg["critic_method"] == "e_min":
+                probe_obs,probe_reward,probe_done = sample_probe(ac.params,states,bk)
+                aux_steps = batch.active.sum().astype(float)
+                energy_data = (flatten(batch.obs),flatten(batch.next_obs),probe_obs,
+                               flatten(target),flatten(batch.reward),flatten(batch.done),
+                               probe_reward,probe_done,flatten(batch.active))
+                def eloss(params,sample):
+                    obs,trunk_obs,probe_obs,G,reward,done,pr,pd,active = sample
+                    # All predictions use current critic parameters. Coefficients
+                    # are detached inside the exact product-rule surrogate.
+                    values = critic.apply(params,jnp.concatenate([obs,trunk_obs,probe_obs],axis=0))
+                    v,v1,v2 = jnp.split(values,3)
+                    loss = bilinear_double_sampled_loss(v,v1,v2,G,reward,done,pr,pd,active,cfg["gamma"])
+                    # optimize pads TB to a full minibatch multiple; undo that
+                    # fixed dilution, never divide by random active occupancy.
+                    loss *= padded_size/(T*B)
+                    return loss,dict(critic_loss=loss)
+                cr,cmetrics = optimize(cr,energy_data,cfg["critic_epochs"],ck,eloss)
             else:
                 cr,cmetrics = optimize(cr,critic_data,cfg["critic_epochs"],ck,closs)
             actor_data = tuple(map(flatten,(batch.obs,batch.action,batch.log_prob,normalized_adv,batch.active)))
@@ -260,7 +300,7 @@ def main():
     p.add_argument("--num_actions",type=int,default=8)
     p.add_argument("--n_seeds",type=int,default=5)
     p.add_argument("--master_seed",type=int,default=42)
-    p.add_argument("--critic_method",choices=("mc","td","fbi","vine","vine_mc"),default="td")
+    p.add_argument("--critic_method",choices=("mc","td","fbi","vine","vine_mc","e_min"),default="td")
     p.add_argument("--fresh_branches",action="store_true",help="FBI uses K fresh transitions instead of trunk + K-1")
     for name,default in (("num_updates",100),("num_envs",64),("actor_epochs",4),("critic_epochs",4),
                          ("minibatch_size",64),("vine_batch_size",256),("k",4),("bc_updates",0),("eval_episodes",128),
@@ -289,7 +329,13 @@ def main():
                        max_steps=args.max_steps,num_actions=args.num_actions,seed=args.master_seed,
                        variable_depth=args.num_problems>1,**env_kwargs)
     if args.critic_method == "vine_mc": args.actor_lambda = 0.
+    if args.critic_method == "e_min": args.k = 2
     config = vars(args).copy();config["include_trunk"] = not args.fresh_branches
+    if args.critic_method == "e_min":
+        config["critic_estimator"] = "bilinear_double_sampled_trunk_probe_v1"
+        config["critic_objective"] = "0.5 * <V-v, (I-gamma*P)(V-v)>_D"
+        config["critic_loss_is_surrogate"] = True
+        config["critic_value_clipping_applied"] = False
     train = jax.jit(make_train(env,config))
     outdir = Path(args.save_dir);outdir.mkdir(parents=True,exist_ok=True)
     with (outdir/"config.json").open("w") as f:json.dump(config,f,indent=2)

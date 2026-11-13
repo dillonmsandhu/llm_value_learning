@@ -886,8 +886,9 @@ def plot_dag_comparisons(root, save_dir=None):
     envs = ('dag','dag_quality','dag_approach')
     titles = ('Binary DAG','Quality DAG','Approach-and-error DAG')
     names = {'mc':'MC','td_lam08':'TD λ=0.8','fbi_lam08_k2':'FBI λ=0.8, K=2',
-             'vine_k2':'Vine-target K=2','vine_k4':'Vine-target K=4'}
-    colors = dict(zip(names, ('#1f77b4','#6366f1','#2ca02c','#ff7f0e','#d62728')))
+             'vine_k2':'Vine-target K=2','vine_k4':'Vine-target K=4',
+             'e_min':'E_min (bilinear double-sampled)'}
+    colors = dict(zip(names, ('#1f77b4','#6366f1','#2ca02c','#ff7f0e','#d62728','#9467bd')))
     values, ppos, summary = {}, {}, []
     def sem(a):
         return a.std(0, ddof=1)/np.sqrt(len(a)) if len(a)>1 else np.zeros(a.shape[1:])
@@ -902,6 +903,7 @@ def plot_dag_comparisons(root, save_dir=None):
         ppos[env]={}
         for method in names:
             folder=root/'ppo'/env/method
+            if method == 'e_min' and not (folder/'config.json').exists(): continue
             config=json.load((folder/'config.json').open())
             rows=[list(csv.DictReader(p.open())) for p in sorted(folder.glob('metrics_seed*.csv'))]
             arrays={key:np.array([[float(r[key]) for r in seed] for seed in rows]) for key in rows[0][0]}

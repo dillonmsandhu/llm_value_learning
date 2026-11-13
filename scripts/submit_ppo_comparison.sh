@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Five matched, trunk-only PPO runs; only the critic estimator changes.
+# Six matched, trunk-only PPO runs; only the critic estimator changes.
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -7,7 +7,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Usage: bash scripts/submit_ppo_comparison.sh [DAG_TYPE] [OUTPUT_BASE]
 
 Defaults: dag_approach, results/ppo_comparison/dag_approach.
-Submits five GPU jobs: Vine-target K=2 and K=4, MC, TD(lambda=.8), FBI(lambda=.8,K=2).
+Submits six GPU jobs: E_min, Vine-target K=2 and K=4, MC, TD(lambda=.8), FBI(lambda=.8,K=2).
+E_min uses the bilinear double-sampled energy estimator with one independent
+probe per trunk prefix; no critic value clipping is applied to its surrogate.
 FBI includes the trunk transition plus one fresh branch. Actor GAE lambda=1
 and all other PPO settings are identical across methods.
 
@@ -32,7 +34,7 @@ Examples:
   DRY_RUN=1 bash scripts/submit_ppo_comparison.sh
 
 Activate the cluster JAX environment first, or set PYTHON_BIN.
-Results go into OUTPUT_BASE/{vine_k2,vine_k4,mc,td_lam08,fbi_lam08_k2}/.
+Results go into OUTPUT_BASE/{vine_k2,vine_k4,mc,td_lam08,fbi_lam08_k2,e_min}/.
 HELP
     exit 0
 fi
@@ -76,13 +78,14 @@ COMMON_ARGS=(
     --entropy_coef "${ENTROPY_COEF:-0}" --max_grad_norm 1.0
 )
 
-for variant in vine_k2 vine_k4 mc td fbi; do
+for variant in vine_k2 vine_k4 mc td fbi e_min; do
     k=2
     method=$variant
     case "$variant" in
         vine_k2) method=vine; label=vine_k2 ;;
         vine_k4) method=vine; label=vine_k4; k=4 ;;
         mc) label=mc ;;
+        e_min) label=e_min ;;
         td) label=td_lam08 ;;
         fbi) label=fbi_lam08_k2 ;;
     esac
