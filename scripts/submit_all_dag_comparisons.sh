@@ -18,6 +18,6 @@ export N_LAYERS=${N_LAYERS:-2}
 
 for dag_type in dag dag_quality dag_approach; do
     bash scripts/submit_benchmark.sh "$dag_type" "$NUM_UPDATES" "$N_SEEDS" \
-        "$OUTPUT_BASE/value" "mc,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8" "$MASTER_SEED"
+        "$OUTPUT_BASE/value" "mc,dirichlet,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8" "$MASTER_SEED"
     bash scripts/submit_ppo_comparison.sh "$dag_type" "$OUTPUT_BASE/ppo/$dag_type"
 done

@@ -15,6 +15,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from transformer import TransformerCritic
+from dirichlet_value import double_sampled_dirichlet_loss
 from envs.reasoning_dag_env import ReasoningDAGEnv, DAGState, DAGEnvParams
 from envs.tree_mrp import TreeMRP, TreeMRPExactValue, TabularState, ProceduralTreeEnv, ProceduralTreeExactValue, TreeState
 from envs.quality_dag_env import QualityDAGEnv
@@ -519,7 +520,7 @@ def make_train_loop(
 ):
     """
     Constructs a compiled training function for:
-      - algo in ['mc', 'td_lam0.0', 'td_lam0.8', 'vine_k2', 'vine_k4', 'fbi_lam0.0', 'fbi_lam0.8', ...]
+      - algo in ['mc', 'dirichlet', 'td_lam0.0', 'td_lam0.8', 'vine_k2', 'vine_k4', 'fbi_lam0.0', 'fbi_lam0.8', ...]
       - env_type in ['dag', 'tree']
     """
     gamma = float(cfg.get("GAMMA", 1.0))
@@ -537,6 +538,7 @@ def make_train_loop(
     # Explicit K variants: fbi_kK_lamL (fresh branches), or
     # fbi_trunk_kK_lamL (trunk transition plus K-1 fresh branches).
     includes_trunk = algo.startswith("fbi_trunk_k")
+    is_dirichlet = (algo == "dirichlet")
     is_mc = (algo == "mc")
     is_td = algo.startswith("td")
     is_vine = algo.startswith("vine")
@@ -636,7 +638,7 @@ def make_train_loop(
             trunk_active_steps = jnp.sum(~visited_states.done).astype(jnp.float32)
 
             # --- B. Compute Targets ---
-            if is_mc:
+            if is_mc or is_dirichlet:
                 # Backward Monte Carlo return: G_t = r_t + gamma * (1 - d_{t+1}) * G_{t+1}
                 def _mc_back(next_g, data):
                     r, d = data
@@ -649,6 +651,19 @@ def make_train_loop(
                 )
                 active_infer_steps = trunk_active_steps
                 critic_eval_steps = jnp.array(0.0, dtype=jnp.float32)
+                if is_dirichlet:
+                    # The trunk suffix supplies G(s). The independently keyed
+                    # branch supplies the second sample, not its trunk successor.
+                    def _independent_branch(state, key):
+                        ak, sk = jax.random.split(key)
+                        action = env.sample_base_action(ak, state)
+                        no, _, r, d, _ = env.step(sk, state, action)
+                        return no, r, d
+                    # Keep rollout and minibatch RNG streams paired with MC.
+                    branch_key = jax.random.fold_in(rng, 17321)
+                    keys = jax.random.split(branch_key, num_steps*num_envs).reshape(num_steps,num_envs,2)
+                    dir_next_obs, dir_reward, dir_done = jax.vmap(jax.vmap(_independent_branch))(visited_states, keys)
+                    active_infer_steps = 2.0 * trunk_active_steps
             elif is_td:
                 # Standard On-Policy TD(lambda) / GAE(lambda) along the single trunk trajectory (no extra branching)
                 n_trunk = num_steps * num_envs
@@ -856,7 +871,7 @@ def make_train_loop(
                 active_infer_steps = trunk_active_steps * (1.0 + float(k_branches))
                 critic_eval_steps = trunk_active_steps * (1.0 + float(k_branches))
 
-            # --- C. Critic Network Update (MSE Loss for non-staged methods on active states) ---
+            # --- C. Critic Network Update (regression or double-sampled energy) ---
             if not is_fbi_staged:
                 obs_flat = traj_batch.obs.reshape(-1, *traj_batch.obs.shape[2:])
                 targets_flat = targets.reshape(-1)
@@ -865,15 +880,28 @@ def make_train_loop(
                 active_order = jnp.argsort(~active_mask_flat)
                 obs_active = obs_flat[active_order]
                 targets_active = targets_flat[active_order]
+                if is_dirichlet:
+                    # Uniform fixed slots: D is expected occupancy / max horizon.
+                    # No random-length-dependent normalization of sampled G.
+                    obs_active, targets_active = obs_flat, targets_flat
+                    dir_next_flat = dir_next_obs.reshape(-1, *dir_next_obs.shape[2:])
+                    dir_r_flat = dir_reward.reshape(-1)
+                    dir_d_flat = dir_done.reshape(-1)
 
                 def _step_mb(carry, _):
                     ts, k = carry
                     k, mb_k = jax.random.split(k)
-                    mb_idx = jax.random.randint(mb_k, (minibatch_size,), minval=0, maxval=jnp.maximum(1, num_active))
+                    mb_idx = jax.random.randint(mb_k, (minibatch_size,), minval=0, maxval=(num_steps*num_envs if is_dirichlet else jnp.maximum(1, num_active)))
                     m_obs = obs_active[mb_idx]
                     m_targ = targets_active[mb_idx]
 
                     def _loss(p):
+                        if is_dirichlet:
+                            pair_obs = jnp.concatenate([m_obs, dir_next_flat[mb_idx]], axis=0)
+                            pair_v = network.apply(p, pair_obs, method=network.value)
+                            return double_sampled_dirichlet_loss(
+                                pair_v[:minibatch_size], pair_v[minibatch_size:], m_targ,
+                                dir_r_flat[mb_idx], dir_d_flat[mb_idx], active_mask_flat[mb_idx], gamma)
                         preds = network.apply(p, m_obs, method=network.value)
                         return 0.5 * jnp.mean(jnp.square(preds - m_targ))
 
@@ -881,12 +909,12 @@ def make_train_loop(
                     ts = ts.apply_gradients(grads=grads)
                     return (ts, k), loss
 
-                (train_state, rng), _ = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
+                (train_state, rng), fit_losses = jax.lax.scan(_step_mb, (train_state, rng), None, length=grad_steps_per_update)
 
             # Estimated LLM FLOPs (units of N = model parameters):
             # 2N per inference / target-eval step, 6N per trained state-step (forward + backward)
             actual_step_grads = (stage_steps * num_steps) if is_fbi_staged else grad_steps_per_update
-            trained_steps = jnp.array(float(actual_step_grads * minibatch_size), dtype=jnp.float32)
+            trained_steps = jnp.array(float(actual_step_grads * minibatch_size * (2 if is_dirichlet else 1)), dtype=jnp.float32)
             llm_flops_per_n = 2.0 * (active_infer_steps + critic_eval_steps) + 6.0 * trained_steps
 
             # --- D. Evaluation across Fixed Eval Set ---
@@ -909,6 +937,9 @@ def make_train_loop(
                 "trained_steps": trained_steps,
                 "llm_flops_per_n": llm_flops_per_n,
             }
+
+            if is_dirichlet:
+                metrics_step["dirichlet_loss"] = jnp.mean(fit_losses)
 
             if hasattr(env, "quality_levels"):
                 st = eval_set["eval_state"]
@@ -983,7 +1014,7 @@ def run_benchmark(
     """
     os.makedirs(save_dir, exist_ok=True)
     algos = algos or [
-        "mc", "td_lam0.8", "vine_k2", "vine_k4",
+        "mc", "dirichlet", "td_lam0.8", "vine_k2", "vine_k4",
         "fbi_lam0.0", "fbi_lam0.8",
     ]
     resolved_updates = int(num_updates) if num_updates is not None else (25 if env_type == "single_dag" else 100)
@@ -1111,12 +1142,18 @@ def run_benchmark(
         "thetas": np.asarray(env.thetas) if hasattr(env, "thetas") else np.array([0.5]),
         "base_total_grad_steps": base_total_grad_steps,
         "flop_assumptions": flop_assumptions,
+        "dirichlet_assumptions": {"loss": "(G-v(s))*(r_branch+gamma*(1-done)*v(next)-v(s))",
+                                  "sampling": "independent branch conditional on trunk prefix",
+                                  "weighting": "expected nonterminal occupancy divided by fixed horizon",
+                                  "terminal_continuation": 0, "gradient_value_passes": 2},
         "environment_diagnostics": env.diagnostics() if hasattr(env, "diagnostics") else None,
         "methods": {},
         "reference_baselines": {},
     }
 
     def _format_algo_name(a: str) -> str:
+        if a == "dirichlet":
+            return "Dirichlet (double-sampled)"
         if a == "mc":
             return "Standard MC (K=1)"
         if a.startswith("td_lam"):
@@ -1211,6 +1248,9 @@ def run_benchmark(
             },
         }
 
+        if algo_key == "dirichlet":
+            results["methods"][display_name]["dirichlet_loss"] = np.asarray(out["metrics"]["dirichlet_loss"])
+
         if hasattr(env, "quality_levels"):
             strata_names = ("approach", "error_status", "remaining_horizon") if hasattr(env, "evaluation_groups") else ("quality", "remaining_horizon")
             for key in strata_names:
@@ -1300,7 +1340,7 @@ def main():
     parser.add_argument("--total_transitions", type=int, default=150000, help="(Deprecated/unused: updates are now fixed via --num_updates)")
     parser.add_argument("--n_seeds", type=int, default=5, help="Number of random seeds")
     parser.add_argument("--master_seed", type=int, default=42, help="Master random seed")
-    parser.add_argument("--algos", type=str, default="mc,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8", help="Comma-separated algos")
+    parser.add_argument("--algos", type=str, default="mc,dirichlet,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8", help="Comma-separated algos")
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     parser.add_argument("--save_dir", type=str, default=None, help="Explicit save directory (overrides --out_dir/--sweep_id)")
     parser.add_argument("--sweep_id", type=str, default=None, help="Optional sweep / run identifier")

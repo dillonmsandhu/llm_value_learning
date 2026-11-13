@@ -20,6 +20,7 @@ plt.rcParams.update({
 })
 
 METHOD_COLORS = {
+    "Dirichlet (double-sampled)": "#e377c2",
     "Standard MC (Compute-Matched)": "#0b3c5d",  # Dark Navy (dashed)
     "Standard MC": "#1f77b4",                    # Blue
     "TD (lam=0.0)": "#6b7280",                   # Slate Gray
@@ -874,6 +875,128 @@ def generate_analysis_suite(
     print("\n[Analysis] Full analysis suite successfully generated in:", output_dir)
 
 
+def plot_dag_comparisons(root, save_dir=None):
+    """Unified critic/PPO panels from submit_all_dag_comparisons.sh outputs."""
+    import csv
+    import json
+    from pathlib import Path
+    root = Path(root)
+    dest = Path(save_dir) if save_dir else root/'unified'
+    dest.mkdir(parents=True, exist_ok=True)
+    envs = ('dag','dag_quality','dag_approach')
+    titles = ('Binary DAG','Quality DAG','Approach-and-error DAG')
+    names = {'mc':'MC','td_lam08':'TD λ=0.8','fbi_lam08_k2':'FBI λ=0.8, K=2',
+             'vine_k2':'Vine-target K=2','vine_k4':'Vine-target K=4'}
+    colors = dict(zip(names, ('#1f77b4','#6366f1','#2ca02c','#ff7f0e','#d62728')))
+    values, ppos, summary = {}, {}, []
+    def sem(a):
+        return a.std(0, ddof=1)/np.sqrt(len(a)) if len(a)>1 else np.zeros(a.shape[1:])
+    def smooth(a):
+        return np.array([np.mean(a[max(0,i-4):i+1]) for i in range(len(a))])
+    def band(ax,x,a,label,color):
+        mean=a.mean(0);err=sem(a)
+        ax.plot(x,mean,label=label,color=color)
+        ax.fill_between(x,mean-err,mean+err,alpha=.13,color=color)
+    for env in envs:
+        with (root/'value'/f'{env}_full'/'benchmark_results.pkl').open('rb') as f:values[env]=pickle.load(f)
+        ppos[env]={}
+        for method in names:
+            folder=root/'ppo'/env/method
+            config=json.load((folder/'config.json').open())
+            rows=[list(csv.DictReader(p.open())) for p in sorted(folder.glob('metrics_seed*.csv'))]
+            arrays={key:np.array([[float(r[key]) for r in seed] for seed in rows]) for key in rows[0][0]}
+            evals=json.load((folder/'summary.json').open())
+            arrays['initial']=np.array([e['initial_success'] for e in evals])
+            arrays['final']=np.array([e['final_success'] for e in evals])
+            arrays['total_samples']=np.cumsum(arrays['trunk_transitions']+arrays['aux_transitions'],axis=1)
+            arrays['trunk_samples']=np.cumsum(arrays['trunk_transitions'],axis=1)
+            arrays['episode_length']=arrays['trunk_transitions']/config['num_envs']
+            arrays['config']=config
+            ppos[env][method]=arrays
+            summary.append(dict(environment=env,method=method,seeds=len(rows),
+                                initial_evaluation=arrays['initial'].mean(),final_evaluation=arrays['final'].mean(),
+                                final_evaluation_sem=sem(arrays['final']),last10_training_success=arrays['success_rate'][:,-10:].mean(),
+                                total_samples=arrays['total_samples'][:,-1].mean(),trunk_samples=arrays['trunk_samples'][:,-1].mean(),
+                                final_episode_length=arrays['episode_length'][:,-10:].mean()))
+    def finish(fig,stem,handles):
+        fig.legend(*handles,loc='lower center',ncol=3,fontsize=9)
+        fig.tight_layout(rect=(0,.12,1,.94))
+        for ext in ('png','pdf'):fig.savefig(dest/f'{stem}.{ext}',dpi=170)
+        plt.close(fig)
+    # Critic panels share method colors across task families.
+    for axis,label in (('x_updates','Gradient steps'),('x_samples','Active rollout transitions'),('x_llm_flops','Estimated compute (N-FLOPs)')):
+        fig,axs=plt.subplots(2,3,figsize=(15,8))
+        for col,env in enumerate(envs):
+            for idx,(name,m) in enumerate(values[env]['methods'].items()):
+                for row,key in enumerate(('msve','advantage_cosine_sim')):
+                    band(axs[row,col],m[axis],np.asarray(m[key]),name,get_color(name,idx))
+            axs[0,col].set_title(titles[col])
+            for row in range(2):
+                axs[row,col].set_xlabel(label);axs[row,col].grid(alpha=.2)
+                if axis!='x_updates':axs[row,col].set_xscale('log')
+            axs[0,col].set_yscale('log');axs[0,col].set_ylabel('Value MSE ↓')
+            axs[1,col].set_ylabel('Advantage cosine ↑')
+        fig.suptitle('Fixed-policy critic learning — mean ± SEM across seeds')
+        finish(fig,'critic_'+axis,axs[0,0].get_legend_handles_labels())
+    # Per-seed interpolation inside observed support only; no extrapolation.
+    for axis,label in (('update','PPO update'),('trunk_samples','Trunk transitions'),('total_samples','Trunk + auxiliary transitions')):
+        fig,axs=plt.subplots(1,3,figsize=(15,4.8))
+        for col,env in enumerate(envs):
+            for method,m in ppos[env].items():
+                y=np.array([smooth(a) for a in m['success_rate']]);x=m[axis]
+                lo,hi=x[:,0].max(),x[:,-1].min()
+                grid=np.linspace(lo,hi,200)
+                aligned=np.array([np.interp(grid,xx,yy) for xx,yy in zip(x,y)])
+                band(axs[col],grid,aligned,names[method],colors[method])
+            axs[col].set_title(titles[col]);axs[col].set_xlabel(label);axs[col].set_ylabel('Training success rate')
+            axs[col].set_ylim(-.01,1.01);axs[col].grid(alpha=.2)
+            if axis!='update':axs[col].set_xscale('log')
+        fig.suptitle('PPO training — 5-update trailing average; mean ± SEM across seeds')
+        finish(fig,'ppo_'+axis,axs[0].get_legend_handles_labels())
+    fig,axs=plt.subplots(1,3,figsize=(15,4.8))
+    for col,env in enumerate(envs):
+        for i,(method,m) in enumerate(ppos[env].items()):
+            axs[col].errorbar(i,m['final'].mean(),yerr=sem(m['final']),fmt='o',color=colors[method],capsize=4,label=names[method])
+            axs[col].scatter(i,m['initial'].mean(),marker='x',color=colors[method])
+        axs[col].set_title(titles[col]);axs[col].set_xticks([]);axs[col].set_ylabel('Held-out stochastic evaluation success')
+        axs[col].set_ylim(-.01,1.01);axs[col].grid(alpha=.2)
+    fig.suptitle('PPO evaluations: dots = final ± seed SEM; crosses = initial (after BC)')
+    finish(fig,'ppo_evaluation',axs[0].get_legend_handles_labels())
+    fig,axs=plt.subplots(3,3,figsize=(15,10))
+    for col,env in enumerate(envs):
+        for method,m in ppos[env].items():
+            for row,key in enumerate(('episode_length','entropy','critic_loss')):
+                band(axs[row,col],m['update'][0],np.array([smooth(a) for a in m[key]]),names[method],colors[method])
+        axs[0,col].set_title(titles[col])
+        for row,label in enumerate(('Episode length','Actor entropy','Critic training loss')):
+            axs[row,col].set_ylabel(label);axs[row,col].set_xlabel('PPO update');axs[row,col].grid(alpha=.2)
+    fig.suptitle('PPO diagnostics — 5-update trailing average; mean ± SEM')
+    finish(fig,'ppo_diagnostics',axs[0,0].get_legend_handles_labels())
+    # Common generated-transition budget across all methods/seeds in each task.
+    for env in envs:
+        budget=min(m['total_samples'][:,-1].min() for m in ppos[env].values())
+        for record in (r for r in summary if r['environment']==env):
+            m=ppos[env][record['method']]
+            at_budget=[np.interp(budget,x,smooth(y)) if x[0]<=budget<=x[-1] else np.nan for x,y in zip(m['total_samples'],m['success_rate'])]
+            record['common_sample_budget']=budget
+            record['training_success_at_common_budget']=np.mean(at_budget)
+    with (dest/'ppo_summary.csv').open('w') as f:
+        w=csv.DictWriter(f,fieldnames=list(summary[0]));w.writeheader();w.writerows(summary)
+    critic_rows=[]
+    for env in envs:
+        methods=values[env]['methods'];budget=min(m['x_llm_flops'][-1] for m in methods.values())
+        for name,m in methods.items():
+            mse=np.asarray(m['msve']);adv=np.asarray(m['advantage_cosine_sim'])
+            critic_rows.append(dict(environment=env,method=name,final_msve=mse[:,-1].mean(),final_msve_sem=sem(mse[:,-1]),
+                                     final_advcos=adv[:,-1].mean(),final_advcos_sem=sem(adv[:,-1]),
+                                     total_samples=m['x_samples'][-1],total_compute=m['x_llm_flops'][-1],common_compute_budget=budget,
+                                     msve_at_common_compute=np.interp(budget,m['x_llm_flops'],mse.mean(0)),
+                                     advcos_at_common_compute=np.interp(budget,m['x_llm_flops'],adv.mean(0))))
+    with (dest/'critic_summary.csv').open('w') as f:
+        w=csv.DictWriter(f,fieldnames=list(critic_rows[0]));w.writeheader();w.writerows(critic_rows)
+    print(f'Unified comparison figures and summary CSVs saved to {dest.resolve()}')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Consolidated Plotting and Analysis for Value Benchmark Suite")
     parser.add_argument("--data_path", type=str, default=None, help="Path to benchmark_results.pkl")
@@ -885,7 +1008,11 @@ def main():
     parser.add_argument("--dag_path", type=str, default="results/dag_full/benchmark_results.pkl", help="Path to DAG full results for analysis")
     parser.add_argument("--tree_path", type=str, default="results/tree_full/benchmark_results.pkl", help="Path to Tree full results for analysis")
     parser.add_argument("--analysis_dir", type=str, default="results/analysis", help="Output subdir for analysis suite (default: results/analysis)")
+    parser.add_argument("--comparison_root", default=None, help="Extracted all-DAG value/PPO comparison directory")
     args = parser.parse_args()
+    if args.comparison_root:
+        plot_dag_comparisons(args.comparison_root, args.save_dir)
+        return
 
     if args.analysis:
         generate_analysis_suite(dag_data_path=args.dag_path, tree_data_path=args.tree_path, output_dir=args.analysis_dir)

@@ -37,7 +37,7 @@ fi
 NUM_UPDATES=${2:-$DEFAULT_UPDATES}
 N_SEEDS=${3:-5}
 OUT_DIR=${4:-"results"}
-ALGOS=${5:-"mc,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8"}
+ALGOS=${5:-"mc,dirichlet,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8"}
 MASTER_SEED=${6:-42}
 
 export ENV_TYPE NUM_UPDATES N_SEEDS OUT_DIR ALGOS MASTER_SEED

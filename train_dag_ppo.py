@@ -13,6 +13,7 @@ from flax import serialization
 from flax.training.train_state import TrainState
 from transformer import TransformerCritic, TransformerPolicy
 from envs.dag_mdp import make_dag_mdp
+from vine_mc import prefix_values
 
 
 class TrunkBatch(NamedTuple):
@@ -66,20 +67,22 @@ def make_train(env, config):
                minibatch_size=64, actor_lr=3e-4, critic_lr=5e-4, gamma=1.,
                actor_lambda=1., critic_lambda=0.8, clip_eps=0.2, value_clip=0.2,
                entropy_coef=0.01, max_grad_norm=1., critic_method="td", k=4,
-               include_trunk=True, bc_updates=0, eval_episodes=128,
+               include_trunk=True, bc_updates=0, bc_lr=3e-4, vine_batch_size=256, eval_episodes=128,
                d_model=64, n_heads=4, n_layers=2, final_hidden_dim=32)
     cfg.update(config)
-    for name in ("num_updates","num_envs","actor_epochs","critic_epochs","minibatch_size","k","eval_episodes"):
+    for name in ("num_updates","num_envs","actor_epochs","critic_epochs","minibatch_size","k","eval_episodes","vine_batch_size"):
         if cfg[name] < 1: raise ValueError(f"{name} must be positive")
     for name in ("gamma","actor_lambda","critic_lambda"):
         if not 0 <= cfg[name] <= 1: raise ValueError(f"{name} must be in [0,1]")
     if cfg["bc_updates"] < 0: raise ValueError("bc_updates must be nonnegative")
-    if cfg["critic_method"] not in ("mc","td","fbi","vine"):
-        raise ValueError("critic_method must be mc, td, fbi, or vine")
-    for name in ("actor_lr", "critic_lr", "max_grad_norm", "clip_eps"):
+    if cfg["critic_method"] not in ("mc","td","fbi","vine","vine_mc"):
+        raise ValueError("critic_method must be mc, td, fbi, vine, or vine_mc")
+    for name in ("actor_lr", "bc_lr", "critic_lr", "max_grad_norm", "clip_eps"):
         if not np.isfinite(cfg[name]) or cfg[name] <= 0: raise ValueError(f"{name} must be finite and positive")
     if cfg["value_clip"] < 0 or cfg["entropy_coef"] < 0:
         raise ValueError("value_clip and entropy_coef must be nonnegative")
+    if cfg["critic_method"] == "vine_mc":
+        cfg["actor_lambda"] = 0.
     T, B, K = env.max_steps, cfg["num_envs"], cfg["k"]
     net = dict(vocab_size=env.vocab_size,max_len=env.max_seq_len,
                d_model=cfg["d_model"],n_heads=cfg["n_heads"],n_layers=cfg["n_layers"],
@@ -103,9 +106,9 @@ def make_train(env, config):
             else:
                 action = jax.random.categorical(ak,logits).astype(jnp.int32)
             active = ~states.done
-            value = critic.apply(critic_params,obs)
+            value = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,obs)
             no,ns,r,d,_ = jax.vmap(env.step)(jax.random.split(sk,count),states,action)
-            nv = critic.apply(critic_params,no)
+            nv = jnp.zeros(count) if cfg["critic_method"] == "vine_mc" else critic.apply(critic_params,no)
             batch = TrunkBatch(obs,action,r,d,active,action_log_prob(logits,action),value,nv)
             return (no,ns,key),(batch,states)
         _,(batch,states) = jax.lax.scan(step,(obs,states,key),None,length=T)
@@ -179,7 +182,7 @@ def make_train(env, config):
     def train(key):
         key,ak,ck,rk = jax.random.split(key,4)
         obs,_ = env.reset(rk)
-        actor_state = TrainState.create(apply_fn=actor.apply,params=actor.init(ak,obs[None]),tx=adam(cfg["actor_lr"]))
+        actor_state = TrainState.create(apply_fn=actor.apply,params=actor.init(ak,obs[None]),tx=adam(cfg["bc_lr"]))
         critic_state = TrainState.create(apply_fn=critic.apply,params=critic.init(ck,obs[None]),tx=adam(cfg["critic_lr"]))
         # Optional supervised initialization from fixed-base trunk trajectories.
         def bc_step(carry,_):
@@ -203,8 +206,14 @@ def make_train(env, config):
             ac,cr,key = carry
             key,rk,bk,ck,ak = jax.random.split(key,5)
             batch,states = collect(ac.params,cr.params,rk)
-            advantage,_ = lambda_returns(batch.reward,batch.done,batch.value,batch.next_value,batch.active,cfg["gamma"],cfg["actor_lambda"])
-            target,aux_steps = critic_targets(batch,states,ac.params,cr.params,bk)
+            if cfg["critic_method"] == "vine_mc":
+                target,aux_steps = prefix_values(env,actor,ac.params,states,bk,K,cfg["vine_batch_size"],cfg["gamma"])
+                next_values = jnp.concatenate([target[1:],jnp.zeros_like(target[:1])],axis=0)
+                advantage = jax.lax.stop_gradient(jnp.where(batch.active,
+                    batch.reward+cfg["gamma"]*(1-batch.done)*next_values-target,0.))
+            else:
+                advantage,_ = lambda_returns(batch.reward,batch.done,batch.value,batch.next_value,batch.active,cfg["gamma"],cfg["actor_lambda"])
+                target,aux_steps = critic_targets(batch,states,ac.params,cr.params,bk)
             # Freeze the entire actor batch before any critic optimization.
             mean = masked_mean(advantage,batch.active)
             std = jnp.sqrt(masked_mean((advantage-mean)**2,batch.active)+1e-8)
@@ -219,7 +228,10 @@ def make_train(env, config):
                     error = jnp.maximum(error,(clipped-target)**2)
                 loss = 0.5*masked_mean(error,active)
                 return loss,dict(critic_loss=loss)
-            cr,cmetrics = optimize(cr,critic_data,cfg["critic_epochs"],ck,closs)
+            if cfg["critic_method"] == "vine_mc":
+                cmetrics = dict(critic_loss=jnp.array(0.))
+            else:
+                cr,cmetrics = optimize(cr,critic_data,cfg["critic_epochs"],ck,closs)
             actor_data = tuple(map(flatten,(batch.obs,batch.action,batch.log_prob,normalized_adv,batch.active)))
             def aloss(params,sample):
                 obs,action,old_lp,adv,active = sample
@@ -248,13 +260,13 @@ def main():
     p.add_argument("--num_actions",type=int,default=8)
     p.add_argument("--n_seeds",type=int,default=5)
     p.add_argument("--master_seed",type=int,default=42)
-    p.add_argument("--critic_method",choices=("mc","td","fbi","vine"),default="td")
+    p.add_argument("--critic_method",choices=("mc","td","fbi","vine","vine_mc"),default="td")
     p.add_argument("--fresh_branches",action="store_true",help="FBI uses K fresh transitions instead of trunk + K-1")
     for name,default in (("num_updates",100),("num_envs",64),("actor_epochs",4),("critic_epochs",4),
-                         ("minibatch_size",64),("k",4),("bc_updates",0),("eval_episodes",128),
+                         ("minibatch_size",64),("vine_batch_size",256),("k",4),("bc_updates",0),("eval_episodes",128),
                          ("d_model",64),("n_heads",4),("n_layers",2),("final_hidden_dim",32)):
         p.add_argument("--"+name,type=int,default=default)
-    for name,default in (("actor_lr",3e-4),("critic_lr",5e-4),("gamma",1.),("actor_lambda",1.),
+    for name,default in (("actor_lr",3e-4),("bc_lr",3e-4),("critic_lr",5e-4),("gamma",1.),("actor_lambda",1.),
                          ("critic_lambda",0.8),("clip_eps",0.2),("value_clip",0.2),("entropy_coef",0.01),("max_grad_norm",1.)):
         p.add_argument("--"+name,type=float,default=default)
     p.add_argument("--num_approaches",type=int,default=3)
@@ -276,6 +288,7 @@ def main():
     env = make_dag_mdp(args.env_type,num_problems=args.num_problems,num_milestones=args.num_milestones,
                        max_steps=args.max_steps,num_actions=args.num_actions,seed=args.master_seed,
                        variable_depth=args.num_problems>1,**env_kwargs)
+    if args.critic_method == "vine_mc": args.actor_lambda = 0.
     config = vars(args).copy();config["include_trunk"] = not args.fresh_branches
     train = jax.jit(make_train(env,config))
     outdir = Path(args.save_dir);outdir.mkdir(parents=True,exist_ok=True)
@@ -293,7 +306,7 @@ def main():
         with (outdir/f"metrics_seed{seed}.csv").open("w") as f:
             writer = csv.writer(f);writer.writerow(["update",*metrics])
             for i in range(args.num_updates):writer.writerow([i+1,*[float(v[i]) for v in metrics.values()]])
-        for name in ("actor_params","critic_params"):
+        for name in (("actor_params",) if args.critic_method == "vine_mc" else ("actor_params","critic_params")):
             (outdir/f"{name}_seed{seed}.msgpack").write_bytes(serialization.to_bytes(result[name]))
         summaries.append(dict(seed=seed,initial_success=float(result["initial_success"]),final_success=float(result["final_success"])))
         print(summaries[-1],flush=True)

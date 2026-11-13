@@ -64,7 +64,7 @@ else
 fi
 NUM_UPDATES="${2:-${NUM_UPDATES:-$DEFAULT_UPDATES}}"
 N_SEEDS="${3:-${N_SEEDS:-5}}"
-ALGOS="${4:-${ALGOS:-mc,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8}}"
+ALGOS="${4:-${ALGOS:-mc,dirichlet,td_lam0.8,vine_k2,vine_k4,fbi_lam0.0,fbi_lam0.8}}"
 OUT_DIR="${5:-${OUT_DIR:-results}}"
 SAVE_DIR="${6:-${SAVE_DIR:-${OUT_DIR}/${ENV_TYPE}_full}}"
 MASTER_SEED="${7:-${MASTER_SEED:-42}}"
