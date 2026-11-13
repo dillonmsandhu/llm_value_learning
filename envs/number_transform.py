@@ -9,12 +9,14 @@ import jax.numpy as jnp
 import numpy as np
 
 NUMBER_DEFAULTS=dict(number_min_value=0,number_max_value=999,number_min_distance=2,
-                     number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair')
+                     number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair',number_stop=1)
 
 
 def add_number_arguments(parser):
     for name,default in NUMBER_DEFAULTS.items():
-        parser.add_argument('--'+name,type=type(default),default=default)
+        kwargs=dict(type=type(default),default=default)
+        if name=='number_stop':kwargs.update(choices=(0,1),help='Enable explicit STOP submission (default 1); 0 keeps the fixed-duration control')
+        parser.add_argument('--'+name,**kwargs)
 
 
 def number_kwargs(args):return {name:getattr(args,name) for name in NUMBER_DEFAULTS}
@@ -63,10 +65,10 @@ class NumberState(NamedTuple):
 
 
 class NumberTransformEnv:
-    VERSION='number_transform_deadline_v1'
+    VERSION='number_transform_submit_v2'
     def __init__(self,max_steps=8,seed=42,eval_seed=12345,split='train',gamma=1.,
                  number_min_value=0,number_max_value=999,number_min_distance=2,
-                 number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair',**legacy):
+                 number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair',number_stop=1,**legacy):
         unexpected=set(legacy)-{'num_problems','num_actions','num_milestones','variable_depth','difficulties'}
         if unexpected:raise TypeError(f'Unknown number environment options: {sorted(unexpected)}')
         for name,v in (('max_steps',max_steps),('number_min_value',number_min_value),('number_max_value',number_max_value),
@@ -79,6 +81,9 @@ class NumberTransformEnv:
         if max_steps>99:raise ValueError('max_steps must be <=99')
         if not 0<=number_teacher_probability<=1 or not 0<=gamma<=1:raise ValueError('probabilities and gamma must be in [0,1]')
         if split not in ('train','test') or number_split_mode not in ('pair','target'):raise ValueError('invalid split or split mode')
+        if type(number_stop) not in (bool,int) or number_stop not in (0,1):raise ValueError('number_stop must be 0 or 1')
+        self.stop_enabled=bool(number_stop)
+        self.stop_action=36 if self.stop_enabled else None
         self.max_steps=max_steps;self.gamma=float(gamma);self.eval_seed=eval_seed
         self.minimum=number_min_value;self.maximum=number_max_value
         following,valid,distance=search_graph(self.minimum,self.maximum)
@@ -97,12 +102,12 @@ class NumberTransformEnv:
         self.targets=jnp.asarray(np.concatenate(targets),jnp.int32)
         self.bucket_offsets=jnp.asarray(offsets,jnp.int32);self.bucket_counts=jnp.asarray(counts,jnp.int32)
         self.levels=jnp.asarray(levels,jnp.int32)
-        self.num_problems=int(sum(counts));self.num_actions=36
-        # The shared interface permits families with no explicit end action.
-        self.eos_action=None
+        self.num_problems=int(sum(counts));self.num_actions=36+int(self.stop_enabled)
+        self.eos_action=self.stop_action
         self.PAD_TOKEN=0;self.BOS_TOKEN=1;self.SEP_TOKEN=2
         self.arrow_token=3;self.positive_token=4;self.negative_token=5
-        self.digit_offset=6;self.action_offset=16;self.invalid_token=52;self.vocab_size=53
+        self.digit_offset=6;self.action_offset=16;self.invalid_token=52;self.stop_token=53
+        self.vocab_size=54 if self.stop_enabled else 53
         self.width=max(len(str(abs(self.minimum))),len(str(abs(self.maximum))),len(str(max_steps)))
         self.number_width=self.width+1  # Always sign + decimal digits, never a whole-number token.
         self.prompt_len=2+3*self.number_width+2
@@ -114,12 +119,13 @@ class NumberTransformEnv:
         self.config=dict(version=self.VERSION,seed=seed,eval_seed=eval_seed,split=split,gamma=gamma,
                          max_steps=max_steps,number_min_value=self.minimum,number_max_value=self.maximum,
                          number_min_distance=number_min_distance,number_max_distance=number_max_distance,
-                         number_teacher_probability=number_teacher_probability,number_split_mode=number_split_mode,
-                         num_pairs=self.num_problems,num_actions=36,vocab_size=self.vocab_size,
+                         number_teacher_probability=number_teacher_probability,number_split_mode=number_split_mode,number_stop=int(self.stop_enabled),
+                         num_pairs=self.num_problems,num_actions=self.num_actions,vocab_size=self.vocab_size,stop_action=self.stop_action,
+                         shortest_distance_unit="arithmetic moves; STOP is an additional action when used",
                          operation_names=['add','subtract','multiply','divide_exact'],identity_action=18,
                          distance_counts={str(k):int(v) for k,v in zip(levels,counts)},
                          sampling='uniform distance bucket, then uniform pair within bucket',
-                         reward='1 iff final value equals target at exact deadline; otherwise 0',
+                         reward=('1 iff current value equals target on STOP or deadline' if self.stop_enabled else '1 iff final value equals target at exact deadline; otherwise 0'),
                          invalid_action='consume a step, preserve current value',
                          task_bank_hash=digest.hexdigest())
 
@@ -161,10 +167,13 @@ class NumberTransformEnv:
     def step(self,rng,state,action,params=None):
         del rng,params
         action=jnp.asarray(action,jnp.int32);safe=jnp.clip(action,0,35)
-        valid=(action>=0)&(action<36)&self.valid_actions[state.current_value-self.minimum,safe]
-        value=jnp.where(valid,self.next_values[state.current_value-self.minimum,safe],state.current_value)
-        count=state.step_count+1;done=count>=self.max_steps
-        record=jnp.concatenate([jnp.array([self.action_offset+safe,jnp.where(valid,self.SEP_TOKEN,self.invalid_token)]),
+        arithmetic=(action>=0)&(action<36)&self.valid_actions[state.current_value-self.minimum,safe]
+        stop=self.stop_enabled&(action==36)
+        valid=arithmetic|stop
+        value=jnp.where(arithmetic,self.next_values[state.current_value-self.minimum,safe],state.current_value)
+        count=state.step_count+1;done=(count>=self.max_steps)|stop
+        token=jnp.where(stop,self.stop_token,self.action_offset+safe)
+        record=jnp.concatenate([jnp.array([token,jnp.where(valid,self.SEP_TOKEN,self.invalid_token)]),
                                 self.encode_number(value),self.encode_number(jnp.maximum(self.max_steps-count,0))])
         offset=self.prompt_len+jnp.minimum(state.step_count,self.max_steps-1)*self.record_width
         history=jax.lax.dynamic_update_slice(state.history_tokens,record,(offset,))
@@ -179,11 +188,11 @@ class NumberTransformEnv:
         # Exact search is used only for demonstrations/reference-policy actions.
         # It is not a value oracle for a history-dependent learned policy.
         best=jnp.argmin(jnp.where(self.valid_actions[state.current_value-self.minimum],d,65535))
-        return jnp.where(state.current_value==state.target_value,18,best).astype(jnp.int32)
+        return jnp.where(state.current_value==state.target_value,36 if self.stop_enabled else 18,best).astype(jnp.int32)
 
     def action_probabilities(self,state):
-        teacher=jax.nn.one_hot(self.reference_action(state),36)
-        return self.teacher_probability*teacher+(1-self.teacher_probability)*jnp.ones(36)/36
+        teacher=jax.nn.one_hot(self.reference_action(state),self.num_actions)
+        return self.teacher_probability*teacher+(1-self.teacher_probability)*jnp.ones(self.num_actions)/self.num_actions
 
     def sample_base_action(self,rng,state,params=None):
         return jax.random.categorical(rng,jnp.log(self.action_probabilities(state))).astype(jnp.int32)

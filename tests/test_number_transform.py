@@ -14,7 +14,7 @@ from envs.number_transform import NumberTransformEnv,search_graph,test_membershi
 class NumberTaskTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        kwargs=dict(number_max_value=99,number_min_distance=2,number_max_distance=3,max_steps=4)
+        kwargs=dict(number_max_value=99,number_min_distance=2,number_max_distance=3,max_steps=4,number_stop=0)
         cls.env=NumberTransformEnv(**kwargs);cls.test=NumberTransformEnv(**kwargs,split='test')
 
     def example(self):
@@ -22,6 +22,38 @@ class NumberTaskTests(unittest.TestCase):
             index=np.flatnonzero((np.asarray(e.starts)==63)&(np.asarray(e.targets)==4))
             if len(index):return e,e.reset_problem(index[0])[1]
         self.fail('63->4 must exist in one partition')
+
+    def test_stop_is_default_and_submits_without_an_arithmetic_move(self):
+        old,initial=self.example()
+        e=NumberTransformEnv(number_max_value=99,number_min_distance=2,number_max_distance=3,
+                              max_steps=4,split=old.config['split'])
+        self.assertEqual((e.num_actions,e.vocab_size,e.stop_action),(37,54,36))
+        _,state=e.reset_problem(initial.prompt_idx)
+        _,failed,reward,done,info=e.step(None,state,jnp.array(36))
+        self.assertTrue(bool(done));self.assertEqual(float(reward),0.)
+        self.assertEqual(int(failed.current_value),63);self.assertFalse(bool(info['invalid_action']))
+        for action in (35,11):
+            _,state,reward,done,_=e.step(None,state,jnp.array(action))
+            self.assertFalse(bool(done));self.assertEqual(float(reward),0.)
+        self.assertEqual(int(state.current_value),4)
+        self.assertEqual(int(e.reference_action(state)),36)
+        self.assertEqual(e.action_probabilities(state).shape,(37,))
+        _,submitted,reward,done,info=e.step(None,state,jnp.array(36))
+        self.assertTrue(bool(done));self.assertEqual(float(reward),1.)
+        self.assertEqual(int(submitted.step_count),3)
+        offset=e.prompt_len+2*e.record_width
+        self.assertEqual(int(submitted.history_tokens[offset]),e.stop_token)
+        _,again,reward,_,_=e.step(None,submitted,jnp.array(0))
+        for x,y in zip(jax.tree_util.tree_leaves(submitted),jax.tree_util.tree_leaves(again)):np.testing.assert_array_equal(x,y)
+        self.assertEqual(float(reward),0.)
+        # Automatic deadline verification still works without explicit STOP.
+        _,state=e.reset_problem(initial.prompt_idx)
+        for action in (35,11,0,9):_,state,reward,done,_=e.step(None,state,jnp.array(action))
+        self.assertTrue(bool(done));self.assertEqual(float(reward),1.)
+        # Disabled STOP remains an invalid no-op, not an accidental submission.
+        _,invalid,reward,done,info=old.step(None,initial,jnp.array(36))
+        self.assertFalse(bool(done));self.assertTrue(bool(info['invalid_action']))
+        self.assertEqual(float(reward),0.)
 
     def test_deadline_no_stop_and_no_early_success(self):
         e,st=self.example();rewards=[]
@@ -88,9 +120,12 @@ class NumberTaskTests(unittest.TestCase):
         from run_benchmark import make_train_loop
         cfg=dict(num_updates=1,num_envs=2,actor_epochs=1,critic_epochs=1,minibatch_size=3,eval_episodes=4,
                  d_model=8,n_heads=2,n_layers=1,final_hidden_dim=8,vine_batch_size=2)
-        for method in ('mc','td','fbi','vine','vine_mc','e_min'):
-            shape=jax.eval_shape(make_train(DAGMDP(self.env),dict(cfg,critic_method=method,k=2),DAGMDP(self.test)),jax.random.PRNGKey(0))
-            self.assertIn('final_heldout',shape['evaluation_by_distance'])
+        stop_env=NumberTransformEnv(number_max_value=99,number_max_distance=3,max_steps=4)
+        stop_test=NumberTransformEnv(number_max_value=99,number_max_distance=3,max_steps=4,split='test')
+        for train_env,test_env in ((self.env,self.test),(stop_env,stop_test)):
+            for method in ('mc','td','fbi','vine','vine_mc','e_min'):
+                shape=jax.eval_shape(make_train(DAGMDP(train_env),dict(cfg,critic_method=method,k=2),DAGMDP(test_env)),jax.random.PRNGKey(0))
+                self.assertIn('final_heldout',shape['evaluation_by_distance'])
         ev=build_program_eval_set(self.env,samples_per_problem=1,reference_k=2,action_samples=2,max_eval_problems=4)
         self.assertEqual(ev['num_problems'],4);self.assertFalse(ev['reference_is_exact'])
         bc=dict(NUM_ENVS=2,NUM_STEPS=4,NUM_UPDATES=2,GRAD_STEPS_PER_UPDATE=2,MINIBATCH_SIZE=2,
@@ -99,12 +134,16 @@ class NumberTaskTests(unittest.TestCase):
             shape=jax.eval_shape(make_train_loop(method,'numbers',self.env,ev,bc),jax.random.PRNGKey(0))
             self.assertEqual(shape['metrics']['msve'].shape,(2,))
 
-    def test_comparison_preview_has_36_action_family_and_fixed_budget(self):
-        env=dict(os.environ,DRY_RUN='1')
+    def test_comparison_preview_defaults_to_stop_and_can_disable_it(self):
+        env=dict(os.environ,DRY_RUN='1',NUMBER_STOP='1',MAX_STEPS='8')
         output=subprocess.check_output(['bash','scripts/submit_number_comparison.sh','results/no_submit'],env=env,text=True)
         lines=[line for line in output.splitlines() if line.startswith('bash ')]
         self.assertEqual(len(lines),6)
-        self.assertTrue(all(' numbers ' in line and '--max_steps 8 ' in line for line in lines))
+        self.assertTrue(all(' numbers ' in line and '--max_steps 8 ' in line and '--num_actions 37 ' in line and '--number_stop 1 ' in line for line in lines))
+        output=subprocess.check_output(['bash','scripts/submit_number_comparison.sh','results/no_submit'],env=dict(env,NUMBER_STOP='0'),text=True)
+        lines=[line for line in output.splitlines() if line.startswith('bash ')]
+        self.assertEqual(len(lines),6)
+        self.assertTrue(all('--num_actions 36 ' in line and '--number_stop 0 ' in line for line in lines))
 
 
 if __name__=='__main__':unittest.main()

@@ -52,9 +52,11 @@ def plan(args):
         if os.environ.get('PROGRAM_PROBLEM_FILE'):common['program_problem_file']=os.environ['PROGRAM_PROBLEM_FILE']
     if args.env == 'numbers':
         for name,default in dict(number_min_value=0,number_max_value=999,number_min_distance=2,
-                                  number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair').items():
+                                  number_max_distance=5,number_teacher_probability=.75,number_split_mode='pair',number_stop=1).items():
             common[name]=type(default)(os.environ.get(name.upper(),default))
-    if args.env=='numbers':common['num_actions']=36
+    if args.env=='numbers':
+        if common['number_stop'] not in (0,1):raise SystemExit('NUMBER_STOP must be 0 or 1')
+        common['num_actions']=36+common['number_stop']
     if args.env=='program':common['num_actions']=4*common['program_registers']**2+common['program_registers']+2
     common.update(env_type=args.env, critic_method=args.method, gamma=1.)
     if args.method == 'mc':

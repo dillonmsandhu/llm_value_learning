@@ -1,15 +1,25 @@
 # Number transformation with a fixed step budget
 
 The `numbers` environment presents a start and a target integer, such as
-`63 -> 4`. Each move selects one of `+,-,multiply,divide_exact` and an operand
-from 1 through 9. There are **36 policy actions**, with no STOP action.
+`63 -> 4`. Each arithmetic move selects one of `+,-,multiply,divide_exact` and an
+operand from 1 through 9. By default there are **37 policy actions**: these 36
+arithmetic choices plus **STOP**.
 
-Episodes last exactly `max_steps` moves. Reaching the target early gives no
-reward and does not terminate. Only the final value is checked: reward is 1
-if it equals the target at the deadline, otherwise 0. `multiply 1` can preserve
-an early solution; leaving and returning is also allowed. For example, with
-budget four: `63 /9 -> 7 -3 -> 4 *1 -> 4 *1 -> 4` succeeds. Finishing at 5 fails
-even if 4 was visited earlier.
+STOP submits the current value and terminates immediately, with reward 1 iff it
+equals the target, otherwise 0. Reaching the target alone gives no reward and does
+not terminate. At the maximum action budget the environment also terminates and
+checks the current value, even if STOP was not selected. Thus the agent can finish
+early or solve on its last arithmetic move. STOP consumes one action slot; search
+distances count arithmetic moves only.
+
+For a budget of four, `63 /9 -> 7 -3 -> 4 STOP` succeeds after three actions.
+`63 /9 -> 7 -3 -> 4 *1 -> 4 *1 -> 4` also succeeds at the deadline. Finishing at 5
+fails even if 4 was visited earlier. With gamma=1 and no step penalty these
+successful trajectories are equally rewarded: STOP does not impose a shortest-
+solution objective.
+
+Set `NUMBER_STOP=0` (CLI `--number_stop 0`) for the original fixed-duration,
+36-action control. It checks reward only at the deadline and has no STOP token.
 
 ## Arithmetic and observations
 
@@ -20,10 +30,11 @@ and consumes a move, with a visible invalid-action marker. No action masking,
 step penalty, intermediate reward, or extra KL rule is added.
 
 Action encoding is `operation*9 + digit-1`, with operation order add, subtract,
-multiply, divide. Thus action 18 is multiply-by-one, and 35 is divide-by-nine.
+multiply, divide. Thus action 18 is multiply-by-one, 35 is divide-by-nine, and 36 is STOP when enabled.
 
-Observations use **53 token IDs**: decimal digits, sign and separator markers,
-36 action IDs, and an invalid-action marker. Numbers are sign plus fixed-width
+Default observations use **54 token IDs**: decimal digits, sign and separator
+markers, 36 arithmetic action IDs, an invalid-action marker, and a distinct STOP
+token. The no-STOP control uses 53 token IDs. Numbers are sign plus fixed-width
 zero-padded decimal digits, not separate embeddings for each integer. The prompt
 contains start, target and budget; each history record contains the action,
 result and remaining budget. There is no pair ID, shortest distance, solution,
@@ -34,7 +45,7 @@ arithmetic results itself.
 ## Search and large problem pools
 
 At environment construction, CPU graph search computes shortest distances for
-every bounded integer pair. Search uses the actual 36 actions and the same
+every bounded integer pair. Search uses the 36 arithmetic actions and the same
 bounds/division rules as rollouts. This is an optimal-distance classification,
 **not the value function of the current Transformer policy**.
 
@@ -66,7 +77,7 @@ implied by success on either split.
 The search solution policy is used only for optional BC warmup and the fixed-policy
 critic benchmark. PPO trunks and branches use the learned actor. By default the
 reference policy mixes shortest-path actions with uniform exploration (teacher
-weight .75); at the target its teacher action is multiply-by-one.
+weight .75); at the target its teacher action is STOP when enabled, otherwise multiply-by-one.
 
 ## Cluster comparison
 
@@ -92,6 +103,7 @@ Useful overrides:
 | `NUMBER_MAX_DISTANCE` | 5 |
 | `NUMBER_TEACHER_PROBABILITY` | .75 |
 | `NUMBER_SPLIT_MODE` | pair |
+| `NUMBER_STOP` | 1 (enabled) |
 | `MAX_STEPS` | 8 in the number launcher |
 
 Constraints: `1 <= min_distance <= max_distance <= max_steps <=99`, at most 4096
@@ -103,6 +115,7 @@ For example:
 
 ```sh
 NUMBER_SPLIT_MODE=target bash scripts/submit_number_comparison.sh results/numbers_new_targets
+NUMBER_STOP=0 bash scripts/submit_number_comparison.sh results/numbers_fixed_duration
 NUMBER_MIN_DISTANCE=4 NUMBER_MAX_DISTANCE=5 MAX_STEPS=6 \
   bash scripts/submit_number_comparison.sh results/numbers_harder
 ```
@@ -132,3 +145,7 @@ Critic evaluation uses a capped, distance-balanced subset of pairs and independe
 MC continuations under the frozen reference policy, with uncertainty recorded.
 It does not enumerate neural-network predictions for the entire pair pool or use
 optimal search distances as critic training labels.
+
+STOP changes the policy output size and observation vocabulary. Use a new result
+directory and freshly initialized model for comparisons with earlier no-STOP runs.
+The task-pair pools and their arithmetic-distance classifications are unchanged.

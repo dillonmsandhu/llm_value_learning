@@ -85,6 +85,7 @@ COMMON_ARGS=(
     --number_max_distance "${NUMBER_MAX_DISTANCE:-5}"
     --number_teacher_probability "${NUMBER_TEACHER_PROBABILITY:-0.75}"
     --number_split_mode "${NUMBER_SPLIT_MODE:-pair}"
+    --number_stop "${NUMBER_STOP:-1}"
     --program_min_ops "${PROGRAM_MIN_OPS:-2}"
     --program_max_ops "${PROGRAM_MAX_OPS:-4}"
     --program_degree "${PROGRAM_DEGREE:-3}"

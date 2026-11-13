@@ -114,7 +114,7 @@ def main():
             'program_min_ops','program_max_ops','program_degree','program_max_inputs','program_registers',
             'program_coefficient_limit','program_teacher_probability','program_problem_file',
             'task_bank_hash','heldout_task_bank_hash','number_min_value','number_max_value',
-            'number_min_distance','number_max_distance','number_teacher_probability','number_split_mode')
+            'number_min_distance','number_max_distance','number_teacher_probability','number_split_mode','number_stop')
     mismatches={k:[dict(path=r['path'],value=r['cfg'].get(k)) for r in runs]
                 for k in shared if len({json.dumps(r['cfg'].get(k)) for r in runs})>1}
     (dest/'config_differences.json').write_text(json.dumps(mismatches,indent=2)+'\n')
