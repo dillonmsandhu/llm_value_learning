@@ -47,7 +47,7 @@ def lambda_returns(reward, done, value, next_value, active, gamma, lmbda):
 
 
 def actor_loss(params, model, obs, action, old_log_prob, advantage, active,
-               clip_eps=0.2, entropy_coef=0.01):
+               clip_eps=0.2, entropy_coef=0.):
     logits = model.apply(params, obs)
     log_prob = action_log_prob(logits, action)
     ratio = jnp.exp(log_prob-old_log_prob)
@@ -64,9 +64,9 @@ def actor_loss(params, model, obs, action, old_log_prob, advantage, active,
 def make_train(env, config):
     """Jittable, vmappable full-episode PPO, following separate critic/actor phases."""
     cfg = dict(num_updates=100, num_envs=64, actor_epochs=4, critic_epochs=4,
-               minibatch_size=64, actor_lr=3e-4, critic_lr=5e-4, gamma=1.,
+               minibatch_size=64, actor_lr=3e-5, critic_lr=5e-4, gamma=1.,
                actor_lambda=1., critic_lambda=0.8, clip_eps=0.2, value_clip=0.2,
-               entropy_coef=0.01, max_grad_norm=1., critic_method="td", k=4,
+               entropy_coef=0., max_grad_norm=1., critic_method="td", k=4,
                include_trunk=True, bc_updates=0, bc_lr=3e-4, vine_batch_size=256, eval_episodes=128,
                d_model=64, n_heads=4, n_layers=2, final_hidden_dim=32)
     cfg.update(config)
@@ -266,8 +266,8 @@ def main():
                          ("minibatch_size",64),("vine_batch_size",256),("k",4),("bc_updates",0),("eval_episodes",128),
                          ("d_model",64),("n_heads",4),("n_layers",2),("final_hidden_dim",32)):
         p.add_argument("--"+name,type=int,default=default)
-    for name,default in (("actor_lr",3e-4),("bc_lr",3e-4),("critic_lr",5e-4),("gamma",1.),("actor_lambda",1.),
-                         ("critic_lambda",0.8),("clip_eps",0.2),("value_clip",0.2),("entropy_coef",0.01),("max_grad_norm",1.)):
+    for name,default in (("actor_lr",3e-5),("bc_lr",3e-4),("critic_lr",5e-4),("gamma",1.),("actor_lambda",1.),
+                         ("critic_lambda",0.8),("clip_eps",0.2),("value_clip",0.2),("entropy_coef",0.),("max_grad_norm",1.)):
         p.add_argument("--"+name,type=float,default=default)
     p.add_argument("--num_approaches",type=int,default=3)
     p.add_argument("--error_rate",type=float,default=1.)
